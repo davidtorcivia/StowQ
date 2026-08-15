@@ -408,9 +408,10 @@ impl Queue {
     }
 
     /// Advances the watermark monotonically (spec time.md): If-Match CAS;
-    /// a lost race means someone advanced it further. Regression (a
-    /// lower bucket than stored) is refused loudly — that is a
-    /// store-time-regression quarantine condition.
+    /// a lost race means someone advanced it further — the stored value
+    /// then already covers our bucket and the call proceeds. A bucket at
+    /// or below the stored one is a no-op. Genuine regression (a fresh
+    /// floor below the watermark) is detected by fail-closed promotion.
     pub fn advance_watermark(&self, bucket: u64, budget: &mut OpBudget) -> Result<(), Error> {
         loop {
             let current = self.watermark(budget)?;

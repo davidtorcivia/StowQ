@@ -483,7 +483,7 @@ fn floor_and_watermark_lifecycle() {
     assert!(f1 > 0);
     let f2 = q.establish_floor(&mut budget).unwrap();
     assert_eq!(f1, f2, "cached floor is reused until stale");
-    // Watermark: absent -> create; advance; regression refused.
+    // Watermark: absent -> create; advance; lower bucket is a no-op.
     assert!(q.watermark(&mut budget).unwrap().is_none());
     q.advance_watermark(10, &mut budget).unwrap();
     let w = q.watermark(&mut budget).unwrap().unwrap();
