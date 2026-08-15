@@ -527,7 +527,6 @@ fn sweeps_evaluate_and_prune_index_entries() {
         panic!("claim")
     };
     // The lease index entry exists (written at claim).
-    let jhex: String = claim.job_id.iter().map(|b| format!("{b:02x}")).collect();
     let leases = list_all(&q, "q/leases/");
     assert_eq!(leases.len(), 1, "claim writes its lease index entry");
 
@@ -560,7 +559,6 @@ fn sweeps_evaluate_and_prune_index_entries() {
         panic!("takeover after sweep")
     };
     assert_eq!(second.generation, 2);
-    drop(jhex);
 }
 
 #[test]
