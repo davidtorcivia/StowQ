@@ -1,0 +1,26 @@
+; StowQ/1 canonical key grammar
+
+hex        = %x30-39 / %x61-66
+job-id     = 32hex            ; 16 bytes
+generation = 8hex             ; u32, monotonic per job, fencing token
+digest     = 64hex            ; SHA-256
+shard      = 4hex
+bucket     = 16hex            ; floor(store-time-ns / bucket-width-ns)
+nonce      = 32hex
+qid        = 32hex
+reason     = 4hex
+kind       = %x72 / %x64       ; terminal kind: "r" receipt / "d" dead
+
+job-key      = "jobs/" shard "/" job-id
+payload-key  = "payloads/" job-id "/" digest
+claim-key    = "claims/" shard "/" job-id "/" generation
+fail-key     = "fails/" shard "/" job-id "/" generation
+lease-index  = "leases/" bucket "/" shard "/" job-id "." generation
+delay-index  = "delayed/" bucket "/" shard "/" job-id
+receipt-key  = "receipts/" shard "/" job-id
+dead-key     = "dead/" shard "/" job-id
+termidx-key  = "termidx/" bucket "/" kind "/" shard "/" job-id
+qkey         = "quarantine/" bucket "/" qid
+beacon-key   = "meta/clock/" nonce
+format-key   = "meta/FORMAT"
+watermark-key = "meta/watermark"

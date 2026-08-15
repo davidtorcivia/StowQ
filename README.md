@@ -18,8 +18,20 @@ bound sweep work and are never trusted for correctness.
 
 ## Status
 
-Experimental. The protocol is at draft stage; implementation has not
-started. Do not use it for workloads where job loss would cause harm.
+Experimental. The protocol specification is frozen at draft-1; implementation has not started. Do not use it for workloads where job loss would cause harm.
+
+## Specification
+
+The normative specification lives in `spec/`:
+
+- `contract.md` — assumptions, guarantees, terms
+- `store-profiles.md` — store primitive certification
+- `namespace.md` — prefix layout and sharding
+- `keys.abnf` — key grammar
+- `records.md` — record schemas and transitions
+- `time.md` — store time, floors, watermark
+- `recovery.md` — sweeping, repair, GC
+- `reasons.md` — reason registries
 
 ## License
 
