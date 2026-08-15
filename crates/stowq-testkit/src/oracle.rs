@@ -111,6 +111,33 @@ impl Oracle {
 
     /// `base` is the store time of the claim object; expiry is
     /// base + lease, per spec (the store clock, not the driver's).
+    /// The exhaustion transition the core performs as a side effect of
+    /// the claim scan: a job whose next takeover would exceed
+    /// maximum_attempts goes dead with attempts_exhausted. The driver
+    /// calls this in scan order before consulting can_claim.
+    pub fn exhaust_if_due(&mut self, job_id: &[u8; 16]) -> bool {
+        let clock = self.clock;
+        let Some(state) = self.jobs.get_mut(job_id) else {
+            return false;
+        };
+        let maximum_attempts = state.maximum_attempts;
+        let due = match &state.phase {
+            Phase::Claimed {
+                attempt, expiry, ..
+            } => clock >= *expiry && attempt + 1 > maximum_attempts,
+            Phase::Backoff {
+                attempt,
+                not_before,
+                ..
+            } => clock >= *not_before && attempt + 1 > maximum_attempts,
+            _ => false,
+        };
+        if due {
+            state.phase = Phase::Terminal(Terminal::Dead { reason: 0x0004 });
+        }
+        due
+    }
+
     pub fn claim(
         &mut self,
         job_id: &[u8; 16],
@@ -139,7 +166,7 @@ impl Oracle {
             } if clock >= not_before && attempt < maximum_attempts => {
                 let generation = generation + 1;
                 let attempt = attempt + 1;
-                let expiry = clock.saturating_add(lease_duration_ns);
+                let expiry = base.saturating_add(lease_duration_ns);
                 state.phase = Phase::Claimed {
                     generation,
                     attempt,

@@ -51,9 +51,6 @@ pub struct DriverConfig {
     pub ops: usize,
     pub lease_ns: u64,
     pub max_attempts: u64,
-    /// Backoff the driver applies on nack; the oracle receives the same
-    /// value, so this is driver policy, not core policy.
-    pub nack_backoff_ns: u64,
 }
 
 impl Default for DriverConfig {
@@ -63,7 +60,6 @@ impl Default for DriverConfig {
             ops: 200,
             lease_ns: 1_000,
             max_attempts: 3,
-            nack_backoff_ns: 2_000,
         }
     }
 }
@@ -106,8 +102,10 @@ fn gen_ops(rng: &mut Rng, cfg: &DriverConfig) -> Vec<DriveOp> {
             3 => DriveOp::Ack { job },
             4 => DriveOp::Nack { job },
             5 => DriveOp::Bury { job },
+            // Exponential clock: half the draws stay under ~8.4ms, the
+            // tail covers multi-second backoffs.
             _ => DriveOp::AdvanceClock {
-                to: rng.below(8_000),
+                to: (1u64 << rng.below(34)) - 1,
             },
         });
     }
@@ -118,11 +116,18 @@ fn gen_ops(rng: &mut Rng, cfg: &DriverConfig) -> Vec<DriveOp> {
 /// outcome is asserted equal, and the terminal state of every job is
 /// verified against the store at the end. Returns the final clock.
 pub fn run_differential(seed: u64, cfg: &DriverConfig, faults: bool) -> u64 {
+    run_with_stats(seed, cfg, faults).0
+}
+
+/// Returns (final clock, exhaustion-dead transitions observed).
+pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usize) {
     let mut rng = Rng::new(seed);
     let ops = gen_ops(&mut rng, cfg);
 
     let store = MemoryStore::new();
-    // Enqueue-path faults at indexes past init's FORMAT put (call 0).
+    // Faults land on whatever PutIfAbsent call reaches each index
+    // (init, enqueue, claim, dead, receipt, and index writes alike) —
+    // every write path must resolve them internally.
     let queue_store: Box<dyn stowq_store::ObjectStore> = if faults {
         Box::new(Injector::new(
             store.clone(),
@@ -142,6 +147,7 @@ pub fn run_differential(seed: u64, cfg: &DriverConfig, faults: bool) -> u64 {
     // The real handles a worker would hold, from core returns.
     let mut held: Vec<Option<Claim>> = vec![None; cfg.jobs];
     let mut budget = OpBudget::new(4_096);
+    let mut exhausted = 0usize;
 
     for (i, op) in ops.iter().enumerate() {
         match *op {
@@ -164,21 +170,33 @@ pub fn run_differential(seed: u64, cfg: &DriverConfig, faults: bool) -> u64 {
                 assert_eq!(committed, expected, "seed {seed} op {i} enqueue({job})");
             }
             DriveOp::Claim => {
-                // Core first: the scan picks the first claimable job in
-                // lexicographic (index) order.
+                // Replicate the core's scan in index order: exhaustion
+                // writes dead as a side effect, the first claimable job
+                // wins, and the scan stops there.
+                let mut expected_job = None;
+                for j in 0..cfg.jobs {
+                    let id = job_id(j);
+                    if oracle.exhaust_if_due(&id) {
+                        exhausted += 1;
+                        continue;
+                    }
+                    if oracle.can_claim(&id) {
+                        expected_job = Some(j);
+                        break;
+                    }
+                }
                 let opts = ClaimOptions {
                     shard: 0,
                     floor_ns: oracle.clock,
                     lease_duration_ns: cfg.lease_ns,
                 };
                 let out = queue.claim(&opts, &mut budget).expect("claim op");
-                match out {
-                    ClaimOutcome::Claimed(c) => {
-                        let j = job_index(&c.job_id);
-                        assert!(j < cfg.jobs, "seed {seed} op {i} unknown job");
-                        assert!(
-                            oracle.can_claim(&c.job_id),
-                            "seed {seed} op {i}: core claimed job {j} but oracle cannot"
+                match (out, expected_job) {
+                    (ClaimOutcome::Claimed(c), Some(j)) => {
+                        assert_eq!(
+                            job_index(&c.job_id),
+                            j,
+                            "seed {seed} op {i}: core claimed a different job than the scan order predicts"
                         );
                         let expected = oracle
                             .claim(&c.job_id, cfg.lease_ns, c.claim_store_time_ns)
@@ -190,13 +208,15 @@ pub fn run_differential(seed: u64, cfg: &DriverConfig, faults: bool) -> u64 {
                         );
                         held[j] = Some(c);
                     }
-                    ClaimOutcome::Empty => {
-                        for j in 0..cfg.jobs {
-                            assert!(
-                                !oracle.can_claim(&job_id(j)),
-                                "seed {seed} op {i}: core empty but oracle can claim job {j}"
-                            );
-                        }
+                    (ClaimOutcome::Empty, None) => {}
+                    (ClaimOutcome::Claimed(c), None) => {
+                        panic!(
+                            "seed {seed} op {i}: core claimed job {} but oracle scan predicted none",
+                            job_index(&c.job_id)
+                        );
+                    }
+                    (ClaimOutcome::Empty, Some(j)) => {
+                        panic!("seed {seed} op {i}: oracle scan predicted job {j} but core returned empty");
                     }
                 }
             }
@@ -267,12 +287,10 @@ pub fn run_differential(seed: u64, cfg: &DriverConfig, faults: bool) -> u64 {
                             .expect("nack op");
                         assert!(expected, "seed {seed} op {i} nack mismatch");
                     }
-                    None => {
-                        assert!(
-                            !oracle.nack(&id, oracle.clock + cfg.nack_backoff_ns),
-                            "seed {seed} op {i}: driver holds nothing but oracle nacked"
-                        );
-                    }
+                    None => assert!(
+                        !oracle.nack(&id, oracle.clock.saturating_add(1)),
+                        "seed {seed} op {i}: driver holds nothing but oracle nacked"
+                    ),
                 }
             }
             DriveOp::Bury { job } => {
@@ -330,7 +348,7 @@ pub fn run_differential(seed: u64, cfg: &DriverConfig, faults: bool) -> u64 {
         }
     }
 
-    oracle.clock
+    (oracle.clock, exhausted)
 }
 
 #[cfg(test)]
@@ -349,6 +367,16 @@ mod tests {
         for seed in 1..=25u64 {
             run_differential(seed, &DriverConfig::default(), true);
         }
+    }
+
+    #[test]
+    fn exhaustion_transition_is_exercised() {
+        let cfg = DriverConfig::default();
+        let mut total = 0;
+        for seed in 1..=25u64 {
+            total += run_with_stats(seed, &cfg, false).1;
+        }
+        assert!(total > 0, "distribution must reach exhaustion-dead");
     }
 
     #[test]
