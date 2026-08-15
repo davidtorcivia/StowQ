@@ -1,7 +1,8 @@
 //! Fault injector wrapping any `ObjectStore`. Fails calls per a scripted
 //! plan: pre-transmit (safe blind retry), post-transmit-ambiguous (outcome
-//! unknown, caller must resolve), or precondition-rejected, at chosen call
-//! indexes. Deterministic and inspectable so tests can assert exactly which
+//! unknown, caller must resolve), or committed-but-response-lost (outcome
+//! unknown with the key present on re-read), at chosen call indexes.
+//! Deterministic and inspectable so tests can assert exactly which
 //! injections fired.
 
 use crate::{
@@ -19,9 +20,14 @@ pub enum Fault {
     /// Fails before the request is transmitted; retrying the identical
     /// call is safe.
     PreTransmit,
-    /// Fails after transmit; the caller cannot know whether the store
-    /// applied the write.
+    /// Fails after transmit without the store applying the call; the
+    /// target key is absent on re-read.
     PostTransmit,
+    /// The store applies the call and the response is lost; the caller
+    /// sees OutcomeUnknown but the target key is present on re-read.
+    /// This is the committed-but-response-lost branch of outcome
+    /// resolution.
+    PostTransmitAfter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,6 +38,14 @@ pub enum Op {
     Head,
     List,
     Delete,
+}
+
+/// What the injector does with a call.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    Pass,
+    Fail(StoreError),
+    FailAfter,
 }
 
 /// Which calls a fault applies to.
@@ -110,7 +124,11 @@ impl<S: ObjectStore> Injector<S> {
             .collect()
     }
 
-    fn check(&self, op: Op) -> StoreResult<()> {
+    /// Decides this call's fate. At most one fault fires per call: the
+    /// first plan (in construction order) whose op matches and whose
+    /// index is due. Same-op plans count every call that reaches them,
+    /// including calls an earlier plan already faulted.
+    fn check(&self, op: Op) -> Action {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let mut plans = self.plans.lock().unwrap();
         for (plan, state) in plans.iter_mut() {
@@ -122,28 +140,33 @@ impl<S: ObjectStore> Injector<S> {
             if state.remaining.first() == Some(&this_call) {
                 state.remaining.remove(0);
                 state.fired += 1;
-                return Err(match plan.fault {
-                    Fault::PreTransmit => StoreError::Transport(TransportClass::PreTransmit),
-                    Fault::PostTransmit => StoreError::OutcomeUnknown(Ambiguity::ConnectionLost),
-                });
+                return match plan.fault {
+                    Fault::PreTransmit => {
+                        Action::Fail(StoreError::Transport(TransportClass::PreTransmit))
+                    }
+                    Fault::PostTransmit => {
+                        Action::Fail(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
+                    }
+                    Fault::PostTransmitAfter => Action::FailAfter,
+                };
             }
         }
-        Ok(())
+        Action::Pass
     }
 }
 
 impl<S: ObjectStore> ObjectStore for Injector<S> {
     fn put_if_absent(&self, key: &Key, body: Bytes, sha256: Digest) -> StoreResult<PutOutcome> {
-        self.check(Op::PutIfAbsent)?;
-        let outcome = self.store.put_if_absent(key, body.clone(), sha256)?;
-        if outcome == PutOutcome::Rejected {
-            // Losing the race is an expected protocol result, not an
-            // error; still verify the digest path saw no corruption.
-            return Ok(outcome);
+        match self.check(Op::PutIfAbsent) {
+            Action::Fail(e) => Err(e),
+            Action::FailAfter => {
+                // The write may have committed (Committed) or lost the
+                // race (Rejected); either way the response is lost.
+                let _ = self.store.put_if_absent(key, body, sha256)?;
+                Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
+            }
+            Action::Pass => self.store.put_if_absent(key, body, sha256),
         }
-        // Post-transmit ambiguity that resolved to committed still counts
-        // as committed: the underlying store has the object.
-        Ok(outcome)
     }
 
     fn cas(
@@ -153,28 +176,58 @@ impl<S: ObjectStore> ObjectStore for Injector<S> {
         sha256: Digest,
         if_match: &Version,
     ) -> StoreResult<PutOutcome> {
-        self.check(Op::Cas)?;
-        self.store.cas(key, body, sha256, if_match)
+        match self.check(Op::Cas) {
+            Action::Fail(e) => Err(e),
+            Action::FailAfter => {
+                let _ = self.store.cas(key, body, sha256, if_match)?;
+                Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
+            }
+            Action::Pass => self.store.cas(key, body, sha256, if_match),
+        }
     }
 
     fn get(&self, key: &Key, range: Option<Range<u64>>) -> StoreResult<Object> {
-        self.check(Op::Get)?;
-        self.store.get(key, range)
+        match self.check(Op::Get) {
+            Action::Fail(e) => Err(e),
+            Action::FailAfter => {
+                let _ = self.store.get(key, range)?;
+                Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
+            }
+            Action::Pass => self.store.get(key, range),
+        }
     }
 
     fn head(&self, key: &Key) -> StoreResult<Meta> {
-        self.check(Op::Head)?;
-        self.store.head(key)
+        match self.check(Op::Head) {
+            Action::Fail(e) => Err(e),
+            Action::FailAfter => {
+                let _ = self.store.head(key)?;
+                Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
+            }
+            Action::Pass => self.store.head(key),
+        }
     }
 
     fn list(&self, prefix: &str, after: Option<&Key>, limit: usize) -> StoreResult<Page> {
-        self.check(Op::List)?;
-        self.store.list(prefix, after, limit)
+        match self.check(Op::List) {
+            Action::Fail(e) => Err(e),
+            Action::FailAfter => {
+                let _ = self.store.list(prefix, after, limit)?;
+                Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
+            }
+            Action::Pass => self.store.list(prefix, after, limit),
+        }
     }
 
     fn delete(&self, key: &Key) -> StoreResult<()> {
-        self.check(Op::Delete)?;
-        self.store.delete(key)
+        match self.check(Op::Delete) {
+            Action::Fail(e) => Err(e),
+            Action::FailAfter => {
+                self.store.delete(key)?;
+                Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
+            }
+            Action::Pass => self.store.delete(key),
+        }
     }
 }
 
@@ -200,12 +253,10 @@ mod tests {
         let k = Key::new("jobs/0001/a");
         let body = Bytes::from_static(b"one");
         let d = digest(b"one");
-        // First call fails pre-transmit.
         assert_eq!(
             injector.put_if_absent(&k, body.clone(), d).unwrap_err(),
             StoreError::Transport(TransportClass::PreTransmit)
         );
-        // Identical retry succeeds.
         assert!(matches!(
             injector.put_if_absent(&k, body, d).unwrap(),
             PutOutcome::Committed { .. }
@@ -215,29 +266,58 @@ mod tests {
     }
 
     #[test]
-    fn post_transmit_fault_is_outcome_unknown_and_object_exists() {
-        // The wrapped store applies the write before the injector fails
-        // the call: the caller sees OutcomeUnknown but the key is present.
-        // The injector itself does not decide this; the plan only fires
-        // the error. To model "store applied it", the inner store must
-        // receive the call: so inject on the SECOND call after a
-        // successful first.
+    fn post_transmit_fault_is_outcome_unknown_and_absent() {
         let inner = MemoryStore::new();
         let injector = Injector::new(
             inner,
-            vec![FaultPlan::new(Op::Head, Fault::PostTransmit, [0])],
+            vec![FaultPlan::new(Op::PutIfAbsent, Fault::PostTransmit, [0])],
         );
         let k = Key::new("jobs/0001/a");
         let d = digest(b"x");
-        injector
-            .put_if_absent(&k, Bytes::from_static(b"x"), d)
-            .unwrap();
         assert_eq!(
-            injector.head(&k).unwrap_err(),
+            injector
+                .put_if_absent(&k, Bytes::from_static(b"x"), d)
+                .unwrap_err(),
             StoreError::OutcomeUnknown(Ambiguity::ConnectionLost)
         );
-        // Resolution: re-read.
-        assert!(injector.head(&k).is_ok());
+        // Resolution: absent, so a blind retry is safe.
+        assert_eq!(injector.inner().head(&k).unwrap_err(), StoreError::NotFound);
+        assert!(matches!(
+            injector
+                .put_if_absent(&k, Bytes::from_static(b"x"), d)
+                .unwrap(),
+            PutOutcome::Committed { .. }
+        ));
+    }
+
+    #[test]
+    fn post_transmit_after_is_unknown_but_committed() {
+        let inner = MemoryStore::new();
+        let injector = Injector::new(
+            inner,
+            vec![FaultPlan::new(
+                Op::PutIfAbsent,
+                Fault::PostTransmitAfter,
+                [0],
+            )],
+        );
+        let k = Key::new("jobs/0001/a");
+        let d = digest(b"x");
+        assert_eq!(
+            injector
+                .put_if_absent(&k, Bytes::from_static(b"x"), d)
+                .unwrap_err(),
+            StoreError::OutcomeUnknown(Ambiguity::ConnectionLost)
+        );
+        // Resolution: the key IS present; a blind retry would see Rejected.
+        let meta = injector.inner().head(&k).unwrap();
+        assert_eq!(meta.size, 1);
+        assert_eq!(
+            injector
+                .put_if_absent(&k, Bytes::from_static(b"x"), d)
+                .unwrap(),
+            PutOutcome::Rejected
+        );
     }
 
     #[test]
@@ -292,13 +372,36 @@ mod tests {
         injector
             .put_if_absent(&k, Bytes::from_static(b"x"), d)
             .unwrap();
-        // Get and head unaffected.
         assert!(injector.get(&k, None).is_ok());
         assert!(injector.head(&k).is_ok());
-        // Delete fires.
         assert_eq!(
             injector.delete(&k).unwrap_err(),
             StoreError::Transport(TransportClass::PreTransmit)
         );
+    }
+
+    #[test]
+    fn one_fault_per_call_and_same_op_plans_count_survivors() {
+        // Two plans on Get: plan A faults call 0; plan B counts every
+        // call that reaches it and faults its own index 1, which is the
+        // second call to survive plan A (the third Get overall).
+        let inner = MemoryStore::new();
+        let injector = Injector::new(
+            inner,
+            vec![
+                FaultPlan::new(Op::Get, Fault::PreTransmit, [0]),
+                FaultPlan::new(Op::Get, Fault::PostTransmit, [1]),
+            ],
+        );
+        let k = Key::new("jobs/0001/a");
+        let d = digest(b"x");
+        injector
+            .put_if_absent(&k, Bytes::from_static(b"x"), d)
+            .unwrap();
+        assert!(injector.get(&k, None).is_err()); // A fires; B counts 0.
+        assert!(injector.get(&k, None).is_ok()); // B counts 1.
+        assert!(injector.get(&k, None).is_err()); // B's index 1 due; fires.
+        assert!(injector.get(&k, None).is_ok());
+        assert_eq!(injector.fired(), vec![1, 1]);
     }
 }

@@ -31,8 +31,10 @@ impl MemoryStore {
         Self::with_tick_step_ns(1)
     }
 
-    /// Store times advance by `tick_step_ns` per write.
+    /// Store times advance by `tick_step_ns` per write. Panics on zero:
+    /// a zero step cannot satisfy strict monotonicity.
     pub fn with_tick_step_ns(tick_step_ns: u64) -> Self {
+        assert!(tick_step_ns > 0, "tick step must be positive");
         MemoryStore {
             objects: Mutex::new(BTreeMap::new()),
             version_counter: AtomicU64::new(1),
@@ -41,8 +43,9 @@ impl MemoryStore {
         }
     }
 
-    /// Forces the next write's store time. The clock only moves forward:
-    /// a lower value is ignored.
+    /// Raises the logical clock so the next write's store time is at
+    /// least `ns + tick_step_ns`. Lower values are ignored; the clock
+    /// never moves backwards.
     pub fn advance_clock_to(&self, ns: u64) {
         self.clock.fetch_max(ns, Ordering::SeqCst);
     }
@@ -297,19 +300,34 @@ mod tests {
     }
 
     #[test]
-    fn advance_clock_never_moves_backwards() {
+    fn advance_clock_raises_and_never_lowers() {
         let store = MemoryStore::with_tick_step_ns(10);
         let k1 = Key::new("a");
         store
             .put_if_absent(&k1, Bytes::from_static(b"x"), digest(b"x"))
             .unwrap();
         let t1 = store.head(&k1).unwrap().store_time_ns;
-        store.advance_clock_to(t1 - 5);
+        // Advancing above the clock pins the next write past it.
+        store.advance_clock_to(t1 + 1000);
         let k2 = Key::new("b");
         store
             .put_if_absent(&k2, Bytes::from_static(b"x"), digest(b"x"))
             .unwrap();
-        assert!(store.head(&k2).unwrap().store_time_ns > t1);
+        let t2 = store.head(&k2).unwrap().store_time_ns;
+        assert!(t2 > t1 + 1000, "t2 {t2} must exceed the advanced clock");
+        // Advancing below the clock is ignored.
+        store.advance_clock_to(t1);
+        let k3 = Key::new("c");
+        store
+            .put_if_absent(&k3, Bytes::from_static(b"x"), digest(b"x"))
+            .unwrap();
+        assert!(store.head(&k3).unwrap().store_time_ns > t2);
+    }
+
+    #[test]
+    #[should_panic(expected = "tick step must be positive")]
+    fn zero_tick_step_panics() {
+        let _ = MemoryStore::with_tick_step_ns(0);
     }
 
     #[test]
@@ -389,6 +407,43 @@ mod tests {
             store.get(&k, Some(5..12)).unwrap_err(),
             StoreError::NotFound
         );
+    }
+
+    #[test]
+    fn get_range_rejects_bad_bounds() {
+        let store = MemoryStore::new();
+        let k = Key::new("payloads/a/d");
+        store
+            .put_if_absent(
+                &k,
+                Bytes::from_static(b"hello stowq"),
+                digest(b"hello stowq"),
+            )
+            .unwrap();
+        // Empty slice within bounds is fine.
+        assert_eq!(&store.get(&k, Some(5..5)).unwrap().body[..], b"");
+        // start past size.
+        assert_eq!(
+            store.get(&k, Some(12..12)).unwrap_err(),
+            StoreError::NotFound
+        );
+        // inverted range.
+        assert_eq!(
+            store.get(&k, Some(Range { start: 5, end: 2 })).unwrap_err(),
+            StoreError::NotFound
+        );
+    }
+
+    #[test]
+    fn list_with_limit_zero_is_empty_and_terminal() {
+        let store = MemoryStore::new();
+        let k = Key::new("claims/0001/a/1");
+        store
+            .put_if_absent(&k, Bytes::from_static(b"x"), digest(b"x"))
+            .unwrap();
+        let page = store.list("claims/", None, 0).unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.next_after, None);
     }
 
     #[test]
