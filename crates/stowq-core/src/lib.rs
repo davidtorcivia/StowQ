@@ -350,20 +350,35 @@ impl Queue {
                 return Ok(cache.floor_ns);
             }
         }
-        let nonce = fresh_token(b"beacon");
-        let rel = RelKey::Beacon { nonce };
-        let abs = self.absolute(&rel);
         let body = Bytes::from_static(b"");
         let digest: Digest = Sha256::digest([]).into();
-        budget.spend()?;
-        match self.store.put_if_absent(&abs, body, digest)? {
-            PutOutcome::Committed { .. } => {}
-            // Beacons are unique; rejection is a store anomaly.
-            PutOutcome::Rejected => return Err(Error::Internal("beacon collision".into())),
+        let mut floor_ns = 0;
+        for _ in 0..=RETRY_TRANSPORT_MAX {
+            // Beacons are content-free: on a nonce collision or an
+            // unknown outcome, a fresh nonce is always correct.
+            let nonce = fresh_token(b"beacon");
+            let rel = RelKey::Beacon { nonce };
+            let abs = self.absolute(&rel);
+            budget.spend()?;
+            match self.store.put_if_absent(&abs, body.clone(), digest) {
+                Ok(PutOutcome::Committed { .. }) => {
+                    budget.spend()?;
+                    let meta = self.store.head(&abs)?;
+                    floor_ns = meta.store_time_ns;
+                    break;
+                }
+                Ok(PutOutcome::Rejected) => continue,
+                Err(StoreError::Transport(_)) | Err(StoreError::OutcomeUnknown(_)) => {
+                    // A lost beacon write is unobservable either way:
+                    // the nonce is fresh next iteration regardless.
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
-        budget.spend()?;
-        let meta = self.store.head(&abs)?;
-        let floor_ns = meta.store_time_ns;
+        if floor_ns == 0 {
+            return Err(Error::TransportExhausted);
+        }
         *self.floor.lock().unwrap() = FloorCache {
             floor_ns,
             established_at: std::time::Instant::now(),
@@ -406,12 +421,13 @@ impl Queue {
                     sequence: 0,
                 },
                 Some(w) => {
-                    if bucket < w.highest_observed_wall_bucket {
-                        return Err(Error::Store(StoreError::ProfileViolation(
-                            "store time regression".into(),
-                        )));
-                    }
-                    if bucket == w.highest_observed_wall_bucket {
+                    // A stored bucket above ours means someone advanced
+                    // further (a lost race or a stale cached floor): the
+                    // watermark already covers us; proceed. Genuine
+                    // regression is detected where a fresh floor is
+                    // compared against the watermark (fail-closed
+                    // promotion), not here.
+                    if bucket <= w.highest_observed_wall_bucket {
                         return Ok(());
                     }
                     stowq_format::WatermarkRecord {
@@ -438,15 +454,36 @@ impl Queue {
                 // Read the current version and CAS against it.
                 budget.spend()?;
                 let meta = self.store.head(&abs)?;
-                self.store.cas(&abs, body, digest, &meta.version)?
+                self.store.cas(&abs, body.clone(), digest, &meta.version)
             } else {
-                self.store.put_if_absent(&abs, body, digest)?
+                self.store.put_if_absent(&abs, body.clone(), digest)
+            };
+            // Resolve unknown outcomes by re-reading: our record (or any
+            // record covering our bucket) means done; anything else
+            // re-reads the loop.
+            let outcome = match outcome {
+                Ok(o) => o,
+                Err(StoreError::OutcomeUnknown(_)) => {
+                    if self.watermark_covers(bucket, budget)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             };
             match outcome {
                 PutOutcome::Committed { .. } => return Ok(()),
                 PutOutcome::Rejected => continue,
             }
         }
+    }
+
+    /// True when the stored watermark already covers `bucket`.
+    fn watermark_covers(&self, bucket: u64, budget: &mut OpBudget) -> Result<bool, Error> {
+        Ok(match self.watermark(budget)? {
+            Some(w) => w.highest_observed_wall_bucket >= bucket,
+            None => false,
+        })
     }
 
     fn absolute(&self, rel: &RelKey) -> Key {

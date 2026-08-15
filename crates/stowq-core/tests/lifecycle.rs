@@ -497,10 +497,10 @@ fn floor_and_watermark_lifecycle() {
     q.advance_watermark(12, &mut budget).unwrap();
     let w = q.watermark(&mut budget).unwrap().unwrap();
     assert_eq!(w.sequence, 1);
-    // Regression fails loud.
-    let err = q.advance_watermark(5, &mut budget).unwrap_err();
-    assert!(matches!(
-        err,
-        Error::Store(stowq_store::StoreError::ProfileViolation(_))
-    ));
+    // A lower bucket than stored is a lost race or a stale floor: the
+    // watermark already covers it; proceed as a no-op.
+    q.advance_watermark(5, &mut budget).unwrap();
+    let w = q.watermark(&mut budget).unwrap().unwrap();
+    assert_eq!(w.highest_observed_wall_bucket, 12);
+    assert_eq!(w.sequence, 1);
 }
