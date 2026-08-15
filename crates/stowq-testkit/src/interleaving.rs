@@ -337,7 +337,10 @@ mod tests {
         };
         assert_eq!(renewed.generation, 2);
         // ...so the same-generation takeover attempt by B loses.
-        let later = renewed.claim_store_time_ns; // still within renewed lease
+        // ...so the within-lease takeover attempt by B must lose:
+        // floor equals the renewed tail's own store time, strictly
+        // inside its lease.
+        let later = renewed.claim_store_time_ns;
         let raced = qb
             .claim(
                 &ClaimOptions {
@@ -348,14 +351,10 @@ mod tests {
                 &mut b,
             )
             .unwrap();
-        match raced {
-            ClaimOutcome::Claimed(c) => {
-                // Only legal if the renewed lease had already expired
-                // (store time beyond expiry): then generation 3 is fine.
-                assert!(c.generation >= 3, "cannot reuse generation 2");
-            }
-            ClaimOutcome::Empty => {}
-        }
+        assert!(
+            matches!(raced, ClaimOutcome::Empty),
+            "within-lease takeover must be refused"
+        );
         check_invariants(&qa, 1, 0);
     }
 
