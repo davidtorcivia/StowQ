@@ -13,7 +13,7 @@ use stowq_format::{
 };
 use stowq_keys::{compute_shard, key_tag, Key as RelKey};
 use stowq_math::RetryPolicy;
-use stowq_store::{Ambiguity, Digest, Key, Meta, ObjectStore, PutOutcome, StoreError, Version};
+use stowq_store::{Digest, Key, Meta, ObjectStore, PutOutcome, StoreError, Version};
 use thiserror::Error;
 
 // ---------- Options and outcomes ----------
@@ -195,6 +195,8 @@ pub enum Error {
     Key(String),
     #[error("budget exhausted before completion")]
     BudgetExhausted,
+    #[error("transport retries exhausted")]
+    TransportExhausted,
     #[error("queue id mismatch")]
     QueueIdMismatch,
     #[error("payload digest mismatch")]
@@ -393,6 +395,7 @@ impl Queue {
             Resolved::Lost => {
                 // Someone's record holds the key: ours if identical
                 // (idempotent enqueue), theirs otherwise.
+                budget.spend()?;
                 let tag = self.tag_for(&rel);
                 let obj = self.store.get(&abs, None)?;
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
@@ -414,10 +417,11 @@ impl Queue {
         digest: Digest,
         intended: &Record,
         rel: &RelKey,
-        _budget: &mut OpBudget,
+        budget: &mut OpBudget,
     ) -> Result<Resolved, Error> {
         let mut transport_retries = 0;
         loop {
+            budget.spend()?;
             let result = self.store.put_if_absent(abs, body.clone(), digest);
             match result {
                 Ok(PutOutcome::Committed { .. }) => return Ok(Resolved::Committed),
@@ -425,12 +429,12 @@ impl Queue {
                 Err(StoreError::Transport(_)) => {
                     transport_retries += 1;
                     if transport_retries > RETRY_TRANSPORT_MAX {
-                        return Err(Error::BudgetExhausted);
+                        return Err(Error::TransportExhausted);
                     }
                     continue;
                 }
-                Err(StoreError::OutcomeUnknown(amb)) => {
-                    match self.resolve_unknown(abs, intended, rel, amb)? {
+                Err(StoreError::OutcomeUnknown(_)) => {
+                    match self.resolve_unknown(abs, intended, rel, budget)? {
                         Resolved::Committed => return Ok(Resolved::Committed),
                         Resolved::Lost => return Ok(Resolved::Lost),
                         // Absent after an unknown outcome: the write
@@ -438,7 +442,7 @@ impl Queue {
                         Resolved::NotCommitted => {
                             transport_retries += 1;
                             if transport_retries > RETRY_TRANSPORT_MAX {
-                                return Err(Error::BudgetExhausted);
+                                return Err(Error::TransportExhausted);
                             }
                             continue;
                         }
@@ -454,22 +458,34 @@ impl Queue {
         abs: &Key,
         intended: &Record,
         rel: &RelKey,
-        amb: Ambiguity,
+        budget: &mut OpBudget,
     ) -> Result<Resolved, Error> {
-        match self.store.head(abs) {
-            Ok(_) => {
-                // Present: ours if the record decodes to what we meant.
-                let obj = self.store.get(abs, None)?;
-                let tag = self.tag_for(rel);
-                match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
-                    Ok(found) if &found == intended => Ok(Resolved::Committed),
-                    Ok(_) => Ok(Resolved::Lost),
-                    Err(_) => Err(Error::Store(StoreError::OutcomeUnknown(amb))),
+        let mut transport_retries = 0;
+        loop {
+            budget.spend()?;
+            match self.store.head(abs) {
+                Ok(_) => {
+                    budget.spend()?;
+                    let obj = self.store.get(abs, None)?;
+                    let tag = self.tag_for(rel);
+                    // Present but undecodable is not ours: lost (the
+                    // repair scan owns quarantine).
+                    match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
+                        Ok(found) if &found == intended => return Ok(Resolved::Committed),
+                        Ok(_) => return Ok(Resolved::Lost),
+                        Err(_) => return Ok(Resolved::Lost),
+                    }
                 }
+                Err(StoreError::NotFound) => return Ok(Resolved::NotCommitted),
+                Err(StoreError::Transport(_)) => {
+                    transport_retries += 1;
+                    if transport_retries > RETRY_TRANSPORT_MAX {
+                        return Err(Error::TransportExhausted);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(StoreError::NotFound) => Ok(Resolved::NotCommitted),
-            Err(StoreError::Transport(_)) => Err(Error::Store(StoreError::OutcomeUnknown(amb))),
-            Err(e) => Err(e.into()),
         }
     }
 
@@ -485,13 +501,14 @@ impl Queue {
                 return Ok(ClaimOutcome::Empty);
             }
             for listing in &page.items {
-                let rel: RelKey = listing
+                // A key that does not parse is skipped; the repair scan
+                // owns quarantine.
+                let Some(RelKey::Job { shard, job_id }) = listing
                     .key
                     .as_str()
                     .strip_prefix(&self.root)
                     .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| Error::Key(listing.key.to_string()))?;
-                let RelKey::Job { shard, job_id } = rel else {
+                else {
                     continue;
                 };
                 if let Some(claim) = self.try_claim(job_id, shard, opts, budget)? {
@@ -516,14 +533,18 @@ impl Queue {
         opts: &ClaimOptions,
         budget: &mut OpBudget,
     ) -> Result<Option<Claim>, Error> {
-        // Readiness: no terminal record.
+        // Readiness: no terminal record. Only NotFound proves absence;
+        // any other error fails the candidate loudly rather than
+        // delivering past an unknown terminal state.
         for rel in [
             RelKey::Receipt { shard, job_id },
             RelKey::Dead { shard, job_id },
         ] {
             budget.spend()?;
-            if let Ok(_meta) = self.store.head(&self.absolute(&rel)) {
-                return Ok(None);
+            match self.store.head(&self.absolute(&rel)) {
+                Ok(_) => return Ok(None),
+                Err(StoreError::NotFound) => {}
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -533,6 +554,7 @@ impl Queue {
         let mut tail: Option<(u64, Meta)> = None;
         let mut after: Option<Key> = None;
         loop {
+            budget.spend()?;
             let page = self.store.list(&claims_prefix, after.as_ref(), 64)?;
             for item in page.items {
                 // Grammar violations in the chain are skipped; the
@@ -622,7 +644,13 @@ impl Queue {
         let job_rel = RelKey::Job { shard, job_id };
         let job_abs = self.absolute(&job_rel);
         let job_tag = self.tag_for(&job_rel);
-        let job_obj = self.store.get(&job_abs, None)?;
+        let job_obj = match self.store.get(&job_abs, None) {
+            Ok(obj) => obj,
+            // GC may remove a terminal job between listing and read;
+            // the candidate is gone, not errored.
+            Err(StoreError::NotFound) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         let job = match stowq_format::decode(&job_obj.body, &self.opts.queue_id, &job_tag)? {
             Record::Job(j) => j,
             _ => return Err(Error::Record("job key holds a non-job record".into())),
@@ -652,6 +680,9 @@ impl Queue {
             return Ok(None);
         }
 
+        if tail_gen >= u32::MAX as u64 {
+            return Err(Error::Internal("generation space exhausted".into()));
+        }
         let worker_token = fresh_token(&job_id);
         let continuation = false;
         let record = Record::Claim(ClaimRecord {
@@ -726,6 +757,9 @@ impl Queue {
     // ---------- renew ----------
 
     pub fn renew(&self, claim: &Claim, budget: &mut OpBudget) -> Result<RenewOutcome, Error> {
+        if claim.generation >= u32::MAX as u64 {
+            return Err(Error::Internal("generation space exhausted".into()));
+        }
         let record = Record::Claim(ClaimRecord {
             job_id: claim.job_id,
             generation: claim.generation + 1,
@@ -793,7 +827,16 @@ impl Queue {
         let body_digest: Digest = Sha256::digest(&body).into();
         budget.spend()?;
         match self.put_resolving(&abs, body, body_digest, &record, &rel, budget)? {
-            Resolved::Committed => Ok(AckOutcome::Acked),
+            Resolved::Committed => {
+                self.write_termidx(
+                    &rel,
+                    stowq_keys::TermKind::Receipt,
+                    claim.shard,
+                    claim.job_id,
+                    budget,
+                );
+                Ok(AckOutcome::Acked)
+            }
             Resolved::Lost | Resolved::NotCommitted => {
                 // A receipt exists: verify its evidence matches.
                 budget.spend()?;
@@ -891,8 +934,57 @@ impl Queue {
         let digest: Digest = Sha256::digest(&body).into();
         budget.spend()?;
         match self.put_resolving(&abs, body, digest, &record, &rel, budget)? {
-            Resolved::Committed | Resolved::Lost => Ok(()),
+            Resolved::Committed => {
+                self.write_termidx(
+                    &rel,
+                    stowq_keys::TermKind::Dead,
+                    claim.shard,
+                    claim.job_id,
+                    budget,
+                );
+                Ok(())
+            }
+            Resolved::Lost => {
+                // First-wins: an existing dead record for the same job
+                // with consistent evidence is success.
+                budget.spend()?;
+                let obj = self.store.get(&abs, None)?;
+                let tag = self.tag_for(&rel);
+                match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
+                    Record::Dead(d) if d.job_id == claim.job_id => Ok(()),
+                    _ => Err(Error::Record("dead key holds conflicting evidence".into())),
+                }
+            }
             Resolved::NotCommitted => Err(Error::Internal("bury not committed".into())),
+        }
+    }
+
+    /// Best-effort terminal index entry; drives GC ordering only.
+    fn write_termidx(
+        &self,
+        terminal_rel: &RelKey,
+        kind: stowq_keys::TermKind,
+        shard: u16,
+        job_id: [u8; 16],
+        budget: &mut OpBudget,
+    ) {
+        let Ok(meta) = self.store.head(&self.absolute(terminal_rel)) else {
+            return;
+        };
+        if let Some(bucket) =
+            stowq_math::bucket_number(meta.store_time_ns, self.format.terminal_bucket_width_ns)
+        {
+            let idx = self.absolute(&RelKey::TermIndex {
+                bucket,
+                kind,
+                shard,
+                job_id,
+            });
+            if budget.spend().is_ok() {
+                let _ = self
+                    .store
+                    .put_if_absent(&idx, Bytes::new(), Sha256::digest([]).into());
+            }
         }
     }
 }
@@ -913,4 +1005,80 @@ fn parse_generation(key: &Key) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(hexseg, 16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stowq_store::MemoryStore;
+
+    fn format() -> stowq_format::FormatRecord {
+        stowq_format::FormatRecord {
+            shard_count: 1,
+            lease_bucket_width_ns: 1_000,
+            delayed_bucket_width_ns: 1_000,
+            terminal_bucket_width_ns: 1_000,
+            inline_limit: 4_096,
+            required_feature_bits: 0,
+        }
+    }
+
+    // The receipt-evidence-mismatch branch is unreachable through the
+    // public claim path (a foreign receipt makes the job terminal and
+    // unclaimable), so the claim handle is built in-crate.
+    #[test]
+    fn ack_against_conflicting_receipt_evidence_errors() {
+        let q = Queue::init(
+            Box::new(MemoryStore::new()),
+            "q",
+            &OpenOptions::new([1; 16]),
+            &format(),
+        )
+        .unwrap();
+        let mut budget = OpBudget::new(64);
+        let EnqueueOutcome::Committed { job_id } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([7; 16]),
+                    payload: b"x",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut budget,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let _jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+        let rel = RelKey::Receipt { shard: 0, job_id };
+        let tag = q.tag_for(&rel);
+        let receipt = Record::Receipt(ReceiptRecord {
+            job_id,
+            generation: 9,
+            attempt: 9,
+            worker_id: "other".into(),
+            worker_token: [0x99; 16],
+            payload_digest: [0x99; 32],
+            output_digests: vec![],
+        });
+        let body = Bytes::from(stowq_format::encode(&receipt, &[1; 16], &tag));
+        let digest: Digest = Sha256::digest(&body).into();
+        q.store
+            .put_if_absent(&q.absolute(&rel), body, digest)
+            .unwrap();
+        let claim = Claim {
+            job_id,
+            shard: 0,
+            generation: 1,
+            attempt: 1,
+            worker_token: [1; 16],
+            lease_duration_ns: 60_000_000_000,
+            claim_store_time_ns: 0,
+            payload: PayloadRef::Inline(Bytes::from_static(b"x")),
+        };
+        let err = q.ack(&claim, &mut budget).unwrap_err();
+        assert!(matches!(err, Error::ReceiptEvidenceMismatch));
+    }
 }

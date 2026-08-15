@@ -117,41 +117,7 @@ fn unknown_committed_on_enqueue_resolves_to_committed() {
 
 #[test]
 fn unknown_committed_on_claim_resolves_to_claimed() {
-    // Init + enqueue without faults; fault the claim write's put.
-    let injector = Injector::new(
-        MemoryStore::new(),
-        vec![FaultPlan::new(
-            Op::PutIfAbsent,
-            Fault::PostTransmitAfter,
-            [3],
-        )],
-    );
-    let q = Queue::init(
-        Box::new(injector),
-        "q",
-        &OpenOptions::new([1; 16]),
-        &format(),
-    )
-    .unwrap();
-    let mut budget = OpBudget::new(64);
-    q.enqueue(
-        EnqueueInput {
-            job_id: None,
-            payload: b"x",
-            content_type: "text/plain".into(),
-            maximum_attempts: 3,
-            not_before_ns: None,
-        },
-        &mut budget,
-    )
-    .unwrap();
-    // put calls so far: FORMAT(0), job(1); the claim put is index 2.
-    let q2 = queue_with(vec![FaultPlan::new(
-        Op::PutIfAbsent,
-        Fault::PostTransmitAfter,
-        [2],
-    )]);
-    drop(q2);
+    // Put calls so far: FORMAT(0), job(1); the claim put is index 2.
     let injector = Injector::new(
         MemoryStore::new(),
         vec![FaultPlan::new(
@@ -200,4 +166,38 @@ fn put_outcome_helper_types_still_behind_trait() {
             .unwrap(),
         PutOutcome::Committed { .. }
     ));
+}
+
+#[test]
+fn transport_on_resolution_read_retries_to_resolve() {
+    // Job put (call 1) is committed-but-response-lost; the first
+    // resolution HEAD (call 0) fails pre-transmit and is retried.
+    let injector = Injector::new(
+        MemoryStore::new(),
+        vec![
+            FaultPlan::new(Op::PutIfAbsent, Fault::PostTransmitAfter, [1]),
+            FaultPlan::new(Op::Head, Fault::PreTransmit, [0]),
+        ],
+    );
+    let q = Queue::init(
+        Box::new(injector),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .unwrap();
+    let mut budget = OpBudget::new(64);
+    let out = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([4; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap();
+    assert!(matches!(out, EnqueueOutcome::Committed { .. }));
 }
