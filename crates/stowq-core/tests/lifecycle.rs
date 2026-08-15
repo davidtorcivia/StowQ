@@ -473,3 +473,34 @@ fn renew_and_ack_refuse_after_exhaustion_dead() {
     let receipt = q.store().head(&Key::new(format!("q/receipts/0000/{jhex}")));
     assert!(receipt.is_err());
 }
+
+#[test]
+fn floor_and_watermark_lifecycle() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(64);
+    // Floor: beacon write + read-back, monotone across refreshes.
+    let f1 = q.establish_floor(&mut budget).unwrap();
+    assert!(f1 > 0);
+    let f2 = q.establish_floor(&mut budget).unwrap();
+    assert_eq!(f1, f2, "cached floor is reused until stale");
+    // Watermark: absent -> create; advance; lower bucket is a no-op.
+    assert!(q.watermark(&mut budget).unwrap().is_none());
+    q.advance_watermark(10, &mut budget).unwrap();
+    let w = q.watermark(&mut budget).unwrap().unwrap();
+    assert_eq!(w.highest_observed_wall_bucket, 10);
+    assert_eq!(w.sequence, 0);
+    q.advance_watermark(12, &mut budget).unwrap();
+    let w = q.watermark(&mut budget).unwrap().unwrap();
+    assert_eq!(w.highest_observed_wall_bucket, 12);
+    assert_eq!(w.sequence, 1);
+    // Same bucket is a no-op.
+    q.advance_watermark(12, &mut budget).unwrap();
+    let w = q.watermark(&mut budget).unwrap().unwrap();
+    assert_eq!(w.sequence, 1);
+    // A lower bucket than stored is a lost race or a stale floor: the
+    // watermark already covers it; proceed as a no-op.
+    q.advance_watermark(5, &mut budget).unwrap();
+    let w = q.watermark(&mut budget).unwrap().unwrap();
+    assert_eq!(w.highest_observed_wall_bucket, 12);
+    assert_eq!(w.sequence, 1);
+}

@@ -201,3 +201,32 @@ fn transport_on_resolution_read_retries_to_resolve() {
         .unwrap();
     assert!(matches!(out, EnqueueOutcome::Committed { .. }));
 }
+
+#[test]
+fn watermark_unknown_outcome_resolves() {
+    // Fault the watermark's creating put (PostTransmitAfter): the write
+    // commits but the response is lost; the resolver must re-read and
+    // confirm coverage. Call 0 is FORMAT's put; call 1 is the beacon's
+    // in establish_floor; call 2 is the watermark create.
+    let injector = Injector::new(
+        MemoryStore::new(),
+        vec![FaultPlan::new(
+            Op::PutIfAbsent,
+            Fault::PostTransmitAfter,
+            [2],
+        )],
+    );
+    let q = Queue::init(
+        Box::new(injector),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .unwrap();
+    let mut budget = OpBudget::new(64);
+    let floor = q.establish_floor(&mut budget).unwrap();
+    let bucket = floor / 1_000; // terminal width 1000 in the test format
+    q.advance_watermark(bucket, &mut budget).unwrap();
+    let w = q.watermark(&mut budget).unwrap().unwrap();
+    assert_eq!(w.highest_observed_wall_bucket, bucket);
+}

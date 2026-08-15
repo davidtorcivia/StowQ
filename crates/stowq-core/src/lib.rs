@@ -245,7 +245,23 @@ pub struct Queue {
     root: String,
     opts: OpenOptions,
     format: stowq_format::FormatRecord,
+    /// Cached wall floor (store time) and when it was established; see
+    /// establish_floor.
+    floor: std::sync::Mutex<FloorCache>,
 }
+
+#[derive(Debug, Clone)]
+struct FloorCache {
+    floor_ns: u64,
+    /// Local monotonic instant of establishment; local clocks are
+    /// trusted only for this staleness deadline, never for protocol
+    /// decisions.
+    established_at: std::time::Instant,
+}
+
+/// A floor is reused for at most this long before re-establishment;
+/// staleness only delays work, never delivers early.
+const FLOOR_STALENESS: std::time::Duration = std::time::Duration::from_secs(30);
 
 const RETRY_TRANSPORT_MAX: usize = 4;
 
@@ -265,6 +281,10 @@ impl Queue {
                 inline_limit: 0,
                 required_feature_bits: 0,
             },
+            floor: std::sync::Mutex::new(FloorCache {
+                floor_ns: 0,
+                established_at: std::time::Instant::now(),
+            }),
         };
         let key = q.absolute(&RelKey::Format);
         let tag = key_tag(&q.opts.queue_id, "meta/FORMAT");
@@ -317,6 +337,154 @@ impl Queue {
     /// The underlying store, for inspection and audit tooling.
     pub fn store(&self) -> &dyn ObjectStore {
         self.store.as_ref()
+    }
+
+    /// Establishes a wall floor (spec time.md): PUT a beacon, read it
+    /// back, take the store-assigned time. The floor is a proven lower
+    /// bound on store time. Cached until stale; staleness only delays
+    /// work, never delivers early.
+    pub fn establish_floor(&self, budget: &mut OpBudget) -> Result<u64, Error> {
+        {
+            let cache = self.floor.lock().unwrap();
+            if cache.floor_ns > 0 && cache.established_at.elapsed() < FLOOR_STALENESS {
+                return Ok(cache.floor_ns);
+            }
+        }
+        let body = Bytes::from_static(b"");
+        let digest: Digest = Sha256::digest([]).into();
+        let mut floor_ns = 0;
+        for _ in 0..=RETRY_TRANSPORT_MAX {
+            // Beacons are content-free: on a nonce collision or an
+            // unknown outcome, a fresh nonce is always correct.
+            let nonce = fresh_token(b"beacon");
+            let rel = RelKey::Beacon { nonce };
+            let abs = self.absolute(&rel);
+            budget.spend()?;
+            match self.store.put_if_absent(&abs, body.clone(), digest) {
+                Ok(PutOutcome::Committed { .. }) => {
+                    budget.spend()?;
+                    let meta = self.store.head(&abs)?;
+                    floor_ns = meta.store_time_ns;
+                    break;
+                }
+                Ok(PutOutcome::Rejected) => continue,
+                Err(StoreError::Transport(_)) | Err(StoreError::OutcomeUnknown(_)) => {
+                    // A lost beacon write is unobservable either way:
+                    // the nonce is fresh next iteration regardless.
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if floor_ns == 0 {
+            return Err(Error::TransportExhausted);
+        }
+        *self.floor.lock().unwrap() = FloorCache {
+            floor_ns,
+            established_at: std::time::Instant::now(),
+        };
+        Ok(floor_ns)
+    }
+
+    /// Reads and verifies the watermark record, if present.
+    pub fn watermark(
+        &self,
+        budget: &mut OpBudget,
+    ) -> Result<Option<stowq_format::WatermarkRecord>, Error> {
+        budget.spend()?;
+        let rel = RelKey::Watermark;
+        let abs = self.absolute(&rel);
+        let tag = self.tag_for(&rel);
+        match self.store.get(&abs, None) {
+            Ok(obj) => match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
+                Record::Watermark(w) => Ok(Some(w)),
+                _ => Err(Error::Record(
+                    "watermark key holds a non-watermark record".into(),
+                )),
+            },
+            Err(StoreError::NotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Advances the watermark monotonically (spec time.md): If-Match CAS;
+    /// a lost race means someone advanced it further — the stored value
+    /// then already covers our bucket and the call proceeds. A bucket at
+    /// or below the stored one is a no-op. Genuine regression (a fresh
+    /// floor below the watermark) is detected by fail-closed promotion.
+    pub fn advance_watermark(&self, bucket: u64, budget: &mut OpBudget) -> Result<(), Error> {
+        loop {
+            let current = self.watermark(budget)?;
+            let exists = current.is_some();
+            let next = match current {
+                None => stowq_format::WatermarkRecord {
+                    highest_observed_wall_bucket: bucket,
+                    sequence: 0,
+                },
+                Some(w) => {
+                    // A stored bucket above ours means someone advanced
+                    // further (a lost race or a stale cached floor): the
+                    // watermark already covers us; proceed. Genuine
+                    // regression is detected where a fresh floor is
+                    // compared against the watermark (fail-closed
+                    // promotion), not here.
+                    if bucket <= w.highest_observed_wall_bucket {
+                        return Ok(());
+                    }
+                    stowq_format::WatermarkRecord {
+                        highest_observed_wall_bucket: bucket,
+                        sequence: w.sequence + 1,
+                    }
+                }
+            };
+            let rel = RelKey::Watermark;
+            let abs = self.absolute(&rel);
+            let tag = self.tag_for(&rel);
+            let body = Bytes::from(stowq_format::encode(
+                &Record::Watermark(next),
+                &self.opts.queue_id,
+                &tag,
+            ));
+            let digest: Digest = Sha256::digest(&body).into();
+            budget.spend()?;
+            // The watermark is the one CAS'd object in the protocol:
+            // create-if-absent when missing, overwrite-if-unchanged when
+            // present. A lost create race re-reads; a lost version race
+            // also re-reads (someone advanced further).
+            let outcome = if exists {
+                // Read the current version and CAS against it.
+                budget.spend()?;
+                let meta = self.store.head(&abs)?;
+                self.store.cas(&abs, body.clone(), digest, &meta.version)
+            } else {
+                self.store.put_if_absent(&abs, body.clone(), digest)
+            };
+            // Resolve unknown outcomes by re-reading: our record (or any
+            // record covering our bucket) means done; anything else
+            // re-reads the loop.
+            let outcome = match outcome {
+                Ok(o) => o,
+                Err(StoreError::OutcomeUnknown(_)) => {
+                    if self.watermark_covers(bucket, budget)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            match outcome {
+                PutOutcome::Committed { .. } => return Ok(()),
+                PutOutcome::Rejected => continue,
+            }
+        }
+    }
+
+    /// True when the stored watermark already covers `bucket`.
+    fn watermark_covers(&self, bucket: u64, budget: &mut OpBudget) -> Result<bool, Error> {
+        Ok(match self.watermark(budget)? {
+            Some(w) => w.highest_observed_wall_bucket >= bucket,
+            None => false,
+        })
     }
 
     fn absolute(&self, rel: &RelKey) -> Key {
