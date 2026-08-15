@@ -1,0 +1,13 @@
+[package]
+name = "stowq-math"
+description = "Bucket arithmetic, retry backoff, and checked time conversions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+sha2.workspace = true
+thiserror.workspace = true
