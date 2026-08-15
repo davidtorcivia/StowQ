@@ -485,21 +485,22 @@ fn floor_and_watermark_lifecycle() {
     assert_eq!(f1, f2, "cached floor is reused until stale");
     // Watermark: absent -> create; advance; lower bucket is a no-op.
     assert!(q.watermark(&mut budget).unwrap().is_none());
-    q.advance_watermark(10, &mut budget).unwrap();
+    // The method bucketizes with the delayed width (1000 ns here).
+    q.advance_watermark(10_000, &mut budget).unwrap();
     let w = q.watermark(&mut budget).unwrap().unwrap();
     assert_eq!(w.highest_observed_wall_bucket, 10);
     assert_eq!(w.sequence, 0);
-    q.advance_watermark(12, &mut budget).unwrap();
+    q.advance_watermark(12_000, &mut budget).unwrap();
     let w = q.watermark(&mut budget).unwrap().unwrap();
     assert_eq!(w.highest_observed_wall_bucket, 12);
     assert_eq!(w.sequence, 1);
     // Same bucket is a no-op.
-    q.advance_watermark(12, &mut budget).unwrap();
+    q.advance_watermark(12_500, &mut budget).unwrap();
     let w = q.watermark(&mut budget).unwrap().unwrap();
     assert_eq!(w.sequence, 1);
     // A lower bucket than stored is a lost race or a stale floor: the
     // watermark already covers it; proceed as a no-op.
-    q.advance_watermark(5, &mut budget).unwrap();
+    q.advance_watermark(5_000, &mut budget).unwrap();
     let w = q.watermark(&mut budget).unwrap().unwrap();
     assert_eq!(w.highest_observed_wall_bucket, 12);
     assert_eq!(w.sequence, 1);
@@ -685,5 +686,58 @@ fn fresh_floor_below_watermark_fails_closed() {
             assert!(msg.contains("regression"), "unexpected violation: {msg}");
         }
         other => panic!("expected ProfileViolation, got {other:?}"),
+    }
+}
+
+#[test]
+fn gc_interruption_leaves_terminal_record_last() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(1_024);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([9; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(claim) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    q.ack(&claim, &mut budget).unwrap();
+    let jhex: String = claim.job_id.iter().map(|b| format!("{b:02x}")).collect();
+
+    // Starve the graph deletion mid-flight: a tiny budget exhausts
+    // inside delete_terminal_graph. Whatever partial state results,
+    // the terminal record must still exist and the job must be
+    // unclaimable.
+    for trial in 1..=8 {
+        let mut small = OpBudget::new(trial);
+        let _ = q.gc(u64::MAX / 4, 1_000, &mut small);
+        let receipt = q.store().head(&Key::new(format!("q/receipts/0000/{jhex}")));
+        if receipt.is_err() {
+            // Deletion completed on this trial: the terminal record is
+            // gone because it went LAST; the job must be gone too.
+            assert!(
+                q.store()
+                    .head(&Key::new(format!("q/jobs/0000/{jhex}")))
+                    .is_err(),
+                "job record must not outlive the terminal record"
+            );
+            break;
+        }
+        // Still mid-deletion: terminal record present, job unclaimable.
+        let claimed = q
+            .claim(&claim_opts(u64::MAX / 4, 1_000), &mut OpBudget::new(64))
+            .unwrap();
+        assert!(
+            matches!(claimed, stowq_core::ClaimOutcome::Empty),
+            "trial {trial}: mid-GC job must be unclaimable while its terminal record exists"
+        );
     }
 }

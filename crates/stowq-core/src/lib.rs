@@ -428,7 +428,11 @@ impl Queue {
     /// then already covers our bucket and the call proceeds. A bucket at
     /// or below the stored one is a no-op. Genuine regression (a fresh
     /// floor below the watermark) is detected by fail-closed promotion.
-    pub fn advance_watermark(&self, bucket: u64, budget: &mut OpBudget) -> Result<(), Error> {
+    pub fn advance_watermark(&self, floor_ns: u64, budget: &mut OpBudget) -> Result<(), Error> {
+        let width = self.format.delayed_bucket_width_ns;
+        let Some(bucket) = stowq_math::bucket_number(floor_ns, width) else {
+            return Err(Error::Internal("zero delayed width".into()));
+        };
         loop {
             let current = self.watermark(budget)?;
             let exists = current.is_some();
@@ -1235,9 +1239,13 @@ fn parse_generation(key: &Key) -> Option<u64> {
 pub struct SweepReport {
     /// Index entries examined.
     pub entries: usize,
-    /// Expired leases that were re-taken over (or doorbelled).
+    /// Expired leases found by authoritative re-evaluation. The sweep
+    /// prunes their index entries; the jobs become claimable through
+    /// the ordinary shard scan (this is the doorbell-less posture; a
+    /// notification plane would wake workers instead).
     pub reclaimed: usize,
-    /// Due delayed jobs that were promoted (or doorbelled).
+    /// Due delayed jobs found by authoritative re-evaluation, same
+    /// posture as reclaimed.
     pub promoted: usize,
 }
 
@@ -1245,8 +1253,6 @@ pub struct SweepReport {
 pub struct GcReport {
     /// Terminal job graphs fully deleted.
     pub jobs_deleted: usize,
-    /// Orphan payloads deleted.
-    pub orphan_payloads: usize,
     /// Clock beacons deleted.
     pub beacons_deleted: usize,
 }
@@ -1296,12 +1302,6 @@ impl Queue {
                     continue;
                 };
                 if self.lease_reclaimable(shard, job_id, floor_ns, budget)? {
-                    // Re-takeover is the doorbell-free variant: perform
-                    // the takeover claim directly. For the sweep, the
-                    // lighter contract is to leave the job claimable and
-                    // delete the stale index entry; workers scanning the
-                    // shard find it. Sweeps with doorbells notify
-                    // instead. Here: count and move on.
                     report.reclaimed += 1;
                 }
                 budget.spend()?;
@@ -1498,12 +1498,13 @@ impl Queue {
         }
     }
 
-    /// Retention GC (spec recovery.md): iterate `termidx/` oldest-first,
-    /// verify against the authoritative terminal key, delete the graph
-    /// in strict order (indexes, fails, claims, payloads, jobs, terminal
+    /// Retention GC (spec recovery.md): iterate `termidx/`, verify
+    /// against the authoritative terminal key, delete the graph in
+    /// strict order (indexes, fails, claims, payloads, jobs, terminal
     /// last) when the terminal record's store time is older than
-    /// `retention_ns` relative to `now_ns`. Orphan payloads older than
-    /// the enqueue horizon and stale beacons are also collected.
+    /// `retention_ns` relative to `now_ns`. Stale beacons are also
+    /// collected. Orphan-payload collection past the enqueue horizon is
+    /// not yet implemented.
     pub fn gc(
         &self,
         now_ns: u64,
@@ -1560,11 +1561,17 @@ impl Queue {
                 };
                 let terminal_abs = self.absolute(&terminal_rel);
                 budget.spend()?;
-                let Ok(meta) = self.store.head(&terminal_abs) else {
-                    // Missing authoritative record: stale index entry.
-                    budget.spend()?;
-                    let _ = self.store.delete(&item.key);
-                    continue;
+                let meta = match self.store.head(&terminal_abs) {
+                    Ok(meta) => meta,
+                    // Only NotFound proves the authoritative record is
+                    // gone; other errors abort loudly rather than
+                    // pruning a live graph's index entry.
+                    Err(StoreError::NotFound) => {
+                        budget.spend()?;
+                        let _ = self.store.delete(&item.key);
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
                 };
                 if meta.store_time_ns >= cutoff {
                     continue; // still within retention
