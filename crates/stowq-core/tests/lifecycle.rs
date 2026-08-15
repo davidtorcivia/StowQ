@@ -504,3 +504,186 @@ fn floor_and_watermark_lifecycle() {
     assert_eq!(w.highest_observed_wall_bucket, 12);
     assert_eq!(w.sequence, 1);
 }
+
+#[test]
+fn sweeps_evaluate_and_prune_index_entries() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: None,
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(claim) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    // The lease index entry exists (written at claim).
+    let jhex: String = claim.job_id.iter().map(|b| format!("{b:02x}")).collect();
+    let leases = list_all(&q, "q/leases/");
+    assert_eq!(leases.len(), 1, "claim writes its lease index entry");
+
+    // Before expiry: the entry's expiry bucket is ahead of the floor
+    // bucket, so the sweep skips it entirely.
+    let report = q
+        .sweep_expired_leases(claim.claim_store_time_ns, &mut budget)
+        .unwrap();
+    assert_eq!(report.entries, 0);
+    assert_eq!(
+        list_all(&q, "q/leases/").len(),
+        1,
+        "not-yet-due entries are left in place"
+    );
+
+    // After expiry: the entry is due, the tail is genuinely expired, and
+    // the consumed entry is deleted.
+    let after_expiry = claim.claim_store_time_ns + 1_000;
+    let report = q.sweep_expired_leases(after_expiry, &mut budget).unwrap();
+    assert_eq!(report.entries, 1);
+    assert_eq!(report.reclaimed, 1);
+    assert!(
+        list_all(&q, "q/leases/").is_empty(),
+        "sweep deletes consumed entries"
+    );
+    let retake = q
+        .claim(&claim_opts(after_expiry, 1_000), &mut budget)
+        .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(second) = retake else {
+        panic!("takeover after sweep")
+    };
+    assert_eq!(second.generation, 2);
+    drop(jhex);
+}
+
+#[test]
+fn delayed_sweep_promotes_due_jobs() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: None,
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: Some(5_000_000),
+        },
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(list_all(&q, "q/delayed/").len(), 1);
+    // Before due: entry examined, not promoted, deleted.
+    let report = q.sweep_delayed(4_000_000, &mut budget).unwrap();
+    assert_eq!(report.entries, 0, "future bucket entries are skipped");
+    // Due: promoted (the job's not_before has passed).
+    let report = q.sweep_delayed(5_000_000, &mut budget).unwrap();
+    assert!(report.promoted >= 1);
+    // The job is claimable at the due floor.
+    let claimed = q.claim(&claim_opts(5_000_000, 1_000), &mut budget).unwrap();
+    assert!(matches!(claimed, stowq_core::ClaimOutcome::Claimed(_)));
+}
+
+#[test]
+fn gc_deletes_terminal_graphs_and_honors_retention() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(1_024);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([8; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(claim) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    q.ack(&claim, &mut budget).unwrap();
+
+    // Within retention: nothing deleted.
+    let report = q
+        .gc(claim.claim_store_time_ns + 100, 1_000_000, &mut budget)
+        .unwrap();
+    assert_eq!(report.jobs_deleted, 0);
+    let jhex: String = claim.job_id.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(q
+        .store()
+        .head(&Key::new(format!("q/receipts/0000/{jhex}")))
+        .is_ok());
+
+    // Past retention: the whole graph goes, terminal last.
+    let report = q.gc(u64::MAX / 4, 1_000, &mut budget).unwrap();
+    assert_eq!(report.jobs_deleted, 1);
+    assert!(q
+        .store()
+        .head(&Key::new(format!("q/receipts/0000/{jhex}")))
+        .is_err());
+    assert!(q
+        .store()
+        .head(&Key::new(format!("q/jobs/0000/{jhex}")))
+        .is_err());
+    assert!(list_all(&q, "q/termidx/").is_empty());
+    assert!(list_all(&q, "q/claims/").is_empty());
+    assert!(list_all(&q, "q/fails/").is_empty());
+}
+
+fn list_all(q: &Queue, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut after: Option<Key> = None;
+    loop {
+        let page = q.store().list(prefix, after.as_ref(), 100).unwrap();
+        if page.items.is_empty() {
+            break;
+        }
+        for item in &page.items {
+            out.push(item.key.to_string());
+        }
+        match page.next_after {
+            Some(k) => after = Some(k),
+            None => break,
+        }
+    }
+    out
+}
+
+#[test]
+fn fresh_floor_below_watermark_fails_closed() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(64);
+    // A watermark record far in the future, written directly (as a
+    // legitimate earlier participant would have advanced it).
+    let rel = "meta/watermark";
+    let tag = stowq_keys::key_tag(&[1; 16], rel);
+    let wm = stowq_format::Record::Watermark(stowq_format::WatermarkRecord {
+        highest_observed_wall_bucket: 1_000_000_000,
+        sequence: 0,
+    });
+    let body = bytes::Bytes::from(stowq_format::encode(&wm, &[1; 16], &tag));
+    let digest: [u8; 32] = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(&body).into()
+    };
+    q.store()
+        .put_if_absent(&Key::new(format!("q/{rel}")), body, digest)
+        .unwrap();
+    // bucket * delayed_width = 1e9 * 1000 = 1e12 ns ahead of any store
+    // time the fake can produce soon; a fresh floor must fail closed.
+    let result = q.establish_floor(&mut budget);
+    match result {
+        Err(Error::Store(stowq_store::StoreError::ProfileViolation(msg))) => {
+            assert!(msg.contains("regression"), "unexpected violation: {msg}");
+        }
+        other => panic!("expected ProfileViolation, got {other:?}"),
+    }
+}
