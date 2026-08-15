@@ -3,7 +3,7 @@
 Requires nightly and cargo-fuzz:
 
 ```sh
-rustup component add clippy rustfmt --toolchain nightly
+rustup toolchain install nightly
 cargo install cargo-fuzz
 ```
 
