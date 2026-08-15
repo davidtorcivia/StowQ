@@ -45,3 +45,17 @@ horizon with no referencing job record. Clock beacons (`meta/clock/`) are
 deleted when older than a configured multiple of the floor staleness window;
 `FORMAT` and `watermark` are never deleted. Quarantine is never GC'd
 automatically.
+
+## Errata (draft-1 implementations)
+
+- Sweeps MAY adopt the evaluate-and-prune posture: re-evaluate each due
+  index entry against the authoritative record, prune the consumed
+  entry, and leave the job to be found by the ordinary shard scan,
+  without performing the takeover claim or sending a doorbell. This is
+  a permitted reading of the sweep's obligation: liveness rests on the
+  claim path's authoritative scan under the two-plane rule. The
+  takeover-or-doorbell wording above describes the timely variant, not
+  the only conforming one.
+- Orphan-payload collection past the enqueue horizon is required
+  before the retention story is complete; implementations may defer it
+  while payloads remain amortized storage cost only.

@@ -225,8 +225,7 @@ fn watermark_unknown_outcome_resolves() {
     .unwrap();
     let mut budget = OpBudget::new(64);
     let floor = q.establish_floor(&mut budget).unwrap();
-    let bucket = floor / 1_000; // terminal width 1000 in the test format
-    q.advance_watermark(bucket, &mut budget).unwrap();
+    q.advance_watermark(floor, &mut budget).unwrap();
     let w = q.watermark(&mut budget).unwrap().unwrap();
-    assert_eq!(w.highest_observed_wall_bucket, bucket);
+    assert_eq!(w.highest_observed_wall_bucket, floor / 1_000);
 }

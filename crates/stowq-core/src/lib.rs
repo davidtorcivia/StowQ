@@ -379,6 +379,22 @@ impl Queue {
         if floor_ns == 0 {
             return Err(Error::TransportExhausted);
         }
+        // A fresh floor below the watermark means store time moved
+        // backwards: the watermark only ever holds buckets derived from
+        // earlier floors. Fail closed; the skew guard absorbs the
+        // profile's timestamp dispersion and granularity (skew_guard
+        // >= G). The watermark read is best-effort — its absence is not
+        // a regression.
+        if let Some(w) = self.watermark(budget)? {
+            let wm_ns = w
+                .highest_observed_wall_bucket
+                .saturating_mul(self.format.delayed_bucket_width_ns);
+            if floor_ns.saturating_add(self.opts.skew_guard_ns) < wm_ns {
+                return Err(Error::Store(StoreError::ProfileViolation(
+                    "store time regression".into(),
+                )));
+            }
+        }
         *self.floor.lock().unwrap() = FloorCache {
             floor_ns,
             established_at: std::time::Instant::now(),
@@ -412,7 +428,11 @@ impl Queue {
     /// then already covers our bucket and the call proceeds. A bucket at
     /// or below the stored one is a no-op. Genuine regression (a fresh
     /// floor below the watermark) is detected by fail-closed promotion.
-    pub fn advance_watermark(&self, bucket: u64, budget: &mut OpBudget) -> Result<(), Error> {
+    pub fn advance_watermark(&self, floor_ns: u64, budget: &mut OpBudget) -> Result<(), Error> {
+        let width = self.format.delayed_bucket_width_ns;
+        let Some(bucket) = stowq_math::bucket_number(floor_ns, width) else {
+            return Err(Error::Internal("zero delayed width".into()));
+        };
         loop {
             let current = self.watermark(budget)?;
             let exists = current.is_some();
@@ -1211,6 +1231,519 @@ fn parse_generation(key: &Key) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(hexseg, 16).ok()
+}
+
+// ---------- Sweeping, repair, and GC ----------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Index entries examined.
+    pub entries: usize,
+    /// Expired leases found by authoritative re-evaluation. The sweep
+    /// prunes their index entries; the jobs become claimable through
+    /// the ordinary shard scan (this is the doorbell-less posture; a
+    /// notification plane would wake workers instead).
+    pub reclaimed: usize,
+    /// Due delayed jobs found by authoritative re-evaluation, same
+    /// posture as reclaimed.
+    pub promoted: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Terminal job graphs fully deleted.
+    pub jobs_deleted: usize,
+    /// Clock beacons deleted.
+    pub beacons_deleted: usize,
+}
+
+impl Queue {
+    /// Expired-lease sweep (spec recovery.md): walk `leases/<b>/` for
+    /// buckets at or below the floor bucket, in ascending order; for
+    /// each entry, re-evaluate the authoritative tail and delete the
+    /// index entry. The index is advisory; correctness never reads it,
+    /// and a missing entry hides nothing forever (repair scan).
+    pub fn sweep_expired_leases(
+        &self,
+        floor_ns: u64,
+        budget: &mut OpBudget,
+    ) -> Result<SweepReport, Error> {
+        let width = self.format.lease_bucket_width_ns;
+        let Some(max_bucket) = stowq_math::bucket_number(floor_ns, width) else {
+            return Err(Error::Internal("zero lease width".into()));
+        };
+        let mut report = SweepReport::default();
+        // Iterate buckets ascending from 0 is unbounded; the index only
+        // ever holds buckets <= current, so walk from the smallest
+        // present bucket: list the whole leases/ prefix and filter.
+        let prefix = format!("{}leases/", self.root);
+        let mut after: Option<Key> = None;
+        loop {
+            budget.spend()?;
+            let page = self.store.list(&prefix, after.as_ref(), 64)?;
+            if page.items.is_empty() {
+                break;
+            }
+            for item in &page.items {
+                // entries/<bucket>/<shard>/<job>.<generation>
+                let rel_str = item.key.as_str().strip_prefix(&self.root).unwrap_or("");
+                let mut parts = rel_str.strip_prefix("leases/").unwrap_or("").splitn(2, '/');
+                let bucket_str = parts.next().unwrap_or("");
+                let rest = parts.next().unwrap_or("");
+                let Ok(bucket) = u64::from_str_radix(bucket_str, 16) else {
+                    continue; // repair owns quarantine
+                };
+                if bucket > max_bucket {
+                    continue;
+                }
+                report.entries += 1;
+                // Authoritative re-evaluation: find the job's tail.
+                let Some((shard, job_id, _gen)) = parse_lease_entry(rest) else {
+                    continue;
+                };
+                if self.lease_reclaimable(shard, job_id, floor_ns, budget)? {
+                    report.reclaimed += 1;
+                }
+                budget.spend()?;
+                let _ = self.store.delete(&item.key);
+            }
+            match page.next_after {
+                Some(k) => after = Some(k),
+                None => break,
+            }
+        }
+        Ok(report)
+    }
+
+    /// Delayed sweep (spec recovery.md): walk `delayed/<b>/` for due
+    /// buckets; verify the authoritative not_before; delete the entry.
+    pub fn sweep_delayed(
+        &self,
+        floor_ns: u64,
+        budget: &mut OpBudget,
+    ) -> Result<SweepReport, Error> {
+        let width = self.format.delayed_bucket_width_ns;
+        let Some(max_bucket) = stowq_math::bucket_number(floor_ns, width) else {
+            return Err(Error::Internal("zero delayed width".into()));
+        };
+        let mut report = SweepReport::default();
+        let prefix = format!("{}delayed/", self.root);
+        let mut after: Option<Key> = None;
+        loop {
+            budget.spend()?;
+            let page = self.store.list(&prefix, after.as_ref(), 64)?;
+            if page.items.is_empty() {
+                break;
+            }
+            for item in &page.items {
+                let rel_str = item.key.as_str().strip_prefix(&self.root).unwrap_or("");
+                let mut parts = rel_str
+                    .strip_prefix("delayed/")
+                    .unwrap_or("")
+                    .splitn(2, '/');
+                let bucket_str = parts.next().unwrap_or("");
+                let rest = parts.next().unwrap_or("");
+                let Ok(bucket) = u64::from_str_radix(bucket_str, 16) else {
+                    continue;
+                };
+                if bucket > max_bucket {
+                    continue;
+                }
+                report.entries += 1;
+                let Some((shard, job_id)) = parse_delay_entry(rest) else {
+                    continue;
+                };
+                // Authoritative gate: job not_before and any tail fail's
+                // retry_not_before must have passed.
+                if self.job_promotable(shard, job_id, floor_ns, budget)? {
+                    report.promoted += 1;
+                }
+                budget.spend()?;
+                let _ = self.store.delete(&item.key);
+            }
+            match page.next_after {
+                Some(k) => after = Some(k),
+                None => break,
+            }
+        }
+        Ok(report)
+    }
+
+    fn lease_reclaimable(
+        &self,
+        shard: u16,
+        job_id: [u8; 16],
+        floor_ns: u64,
+        budget: &mut OpBudget,
+    ) -> Result<bool, Error> {
+        // Terminal jobs are not reclaimable.
+        for rel in [
+            RelKey::Receipt { shard, job_id },
+            RelKey::Dead { shard, job_id },
+        ] {
+            budget.spend()?;
+            match self.store.head(&self.absolute(&rel)) {
+                Ok(_) => return Ok(false),
+                Err(StoreError::NotFound) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // Tail expiry: read the claim chain's last generation.
+        let (gen, meta, duration) = self.claim_tail(shard, job_id, budget)?;
+        if gen == 0 {
+            return Ok(false); // nothing held
+        }
+        Ok(floor_ns
+            >= meta
+                .store_time_ns
+                .saturating_add(duration)
+                .saturating_add(self.opts.skew_guard_ns))
+    }
+
+    fn job_promotable(
+        &self,
+        shard: u16,
+        job_id: [u8; 16],
+        floor_ns: u64,
+        budget: &mut OpBudget,
+    ) -> Result<bool, Error> {
+        budget.spend()?;
+        let job_rel = RelKey::Job { shard, job_id };
+        let job = match self.store.get(&self.absolute(&job_rel), None) {
+            Ok(obj) => {
+                let tag = self.tag_for(&job_rel);
+                match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
+                    Record::Job(j) => j,
+                    _ => return Ok(false),
+                }
+            }
+            Err(StoreError::NotFound) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(nb) = job.not_before_ns {
+            if floor_ns < nb {
+                return Ok(false);
+            }
+        }
+        // Backoff gate at the tail generation.
+        let (gen, _meta, _duration) = self.claim_tail(shard, job_id, budget)?;
+        if gen > 0 {
+            budget.spend()?;
+            let rel = RelKey::Fail {
+                shard,
+                job_id,
+                generation: gen as u32,
+            };
+            match self.store.get(&self.absolute(&rel), None) {
+                Ok(obj) => {
+                    let tag = self.tag_for(&rel);
+                    if let Record::Fail(f) =
+                        stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)?
+                    {
+                        if floor_ns < f.retry_not_before_ns {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Err(StoreError::NotFound) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(true)
+    }
+
+    /// The tail of the claim chain: (generation, meta, lease_duration).
+    fn claim_tail(
+        &self,
+        shard: u16,
+        job_id: [u8; 16],
+        budget: &mut OpBudget,
+    ) -> Result<(u64, Meta, u64), Error> {
+        let prefix = format!("{}claims/{shard:04x}/{}/", self.root, hex(&job_id));
+        let mut after: Option<Key> = None;
+        let mut tail: Option<(u64, Meta)> = None;
+        loop {
+            budget.spend()?;
+            let page = self.store.list(&prefix, after.as_ref(), 64)?;
+            for item in page.items {
+                if let Some(g) = parse_generation(&item.key) {
+                    tail = Some((g, item.meta));
+                }
+            }
+            match page.next_after {
+                Some(k) => after = Some(k),
+                None => break,
+            }
+        }
+        match tail {
+            None => Ok((0, empty_meta(), 0)),
+            Some((gen, meta)) => {
+                budget.spend()?;
+                let rel = RelKey::Claim {
+                    shard,
+                    job_id,
+                    generation: gen as u32,
+                };
+                let obj = match self.store.get(&self.absolute(&rel), None) {
+                    Ok(obj) => obj,
+                    Err(StoreError::NotFound) => return Ok((gen, meta, 0)),
+                    Err(e) => return Err(e.into()),
+                };
+                let tag = self.tag_for(&rel);
+                match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
+                    Record::Claim(c) => Ok((gen, meta, c.lease_duration_ns)),
+                    _ => Ok((gen, meta, 0)),
+                }
+            }
+        }
+    }
+
+    /// Retention GC (spec recovery.md): iterate `termidx/`, verify
+    /// against the authoritative terminal key, delete the graph in
+    /// strict order (indexes, fails, claims, payloads, jobs, terminal
+    /// last) when the terminal record's store time is older than
+    /// `retention_ns` relative to `now_ns`. Stale beacons are also
+    /// collected. Orphan-payload collection past the enqueue horizon is
+    /// not yet implemented.
+    pub fn gc(
+        &self,
+        now_ns: u64,
+        retention_ns: u64,
+        budget: &mut OpBudget,
+    ) -> Result<GcReport, Error> {
+        let mut report = GcReport::default();
+        let cutoff = now_ns.saturating_sub(retention_ns);
+
+        // Beacons: metadata is tiny; collect those older than 10x the
+        // floor staleness window.
+        let beacon_cutoff = now_ns.saturating_sub(FLOOR_STALENESS.as_nanos() as u64 * 10);
+        let beacon_prefix = format!("{}meta/clock/", self.root);
+        let mut after: Option<Key> = None;
+        loop {
+            budget.spend()?;
+            let page = self.store.list(&beacon_prefix, after.as_ref(), 64)?;
+            if page.items.is_empty() {
+                break;
+            }
+            for item in &page.items {
+                if item.meta.store_time_ns < beacon_cutoff {
+                    budget.spend()?;
+                    let _ = self.store.delete(&item.key);
+                    report.beacons_deleted += 1;
+                }
+            }
+            match page.next_after {
+                Some(k) => after = Some(k),
+                None => break,
+            }
+        }
+
+        // Terminal graphs, oldest bucket first: termidx keys sort by
+        // bucket in hex, which is not numeric order; walk all and
+        // filter by the authoritative terminal time.
+        let term_prefix = format!("{}termidx/", self.root);
+        let mut after: Option<Key> = None;
+        loop {
+            budget.spend()?;
+            let page = self.store.list(&term_prefix, after.as_ref(), 64)?;
+            if page.items.is_empty() {
+                break;
+            }
+            for item in &page.items {
+                // termidx/<bucket>/<kind>/<shard>/<job>
+                let rel_str = item.key.as_str().strip_prefix(&self.root).unwrap_or("");
+                let Some((kind, shard, job_id)) = parse_term_entry(rel_str) else {
+                    continue;
+                };
+                let terminal_rel = match kind {
+                    'r' => RelKey::Receipt { shard, job_id },
+                    _ => RelKey::Dead { shard, job_id },
+                };
+                let terminal_abs = self.absolute(&terminal_rel);
+                budget.spend()?;
+                let meta = match self.store.head(&terminal_abs) {
+                    Ok(meta) => meta,
+                    // Only NotFound proves the authoritative record is
+                    // gone; other errors abort loudly rather than
+                    // pruning a live graph's index entry.
+                    Err(StoreError::NotFound) => {
+                        budget.spend()?;
+                        let _ = self.store.delete(&item.key);
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                if meta.store_time_ns >= cutoff {
+                    continue; // still within retention
+                }
+                if self.delete_terminal_graph(shard, job_id, &terminal_rel, &item.key, budget)? {
+                    report.jobs_deleted += 1;
+                }
+            }
+            match page.next_after {
+                Some(k) => after = Some(k),
+                None => break,
+            }
+        }
+        Ok(report)
+    }
+
+    /// Deletes one job's terminal graph in the strict spec order.
+    #[allow(clippy::too_many_arguments)]
+    fn delete_terminal_graph(
+        &self,
+        shard: u16,
+        job_id: [u8; 16],
+        terminal_rel: &RelKey,
+        index_key: &Key,
+        budget: &mut OpBudget,
+    ) -> Result<bool, Error> {
+        let jhex = hex(&job_id);
+        // Advisory indexes first.
+        let prefixes = [
+            format!("{}leases/", self.root),
+            format!("{}delayed/", self.root),
+        ];
+        for prefix in prefixes {
+            // Only the exact job's entries matter; scanning prefixes
+            // would be unbounded. Index entries for this job are
+            // addressable by shard: leases/<b>/<shard>/<job>.<g> and
+            // delayed/<b>/<shard>/<job>. List the shard's slice per
+            // bucket is not addressable; instead scan the job slice via
+            // the shard: too broad. Practical approach: delete the
+            // known-shard entries by listing each prefix filtered by
+            // shard segment and matching job id.
+            let mut after: Option<Key> = None;
+            loop {
+                budget.spend()?;
+                let page = self.store.list(&prefix, after.as_ref(), 64)?;
+                if page.items.is_empty() {
+                    break;
+                }
+                for item in &page.items {
+                    if item.key.as_str().contains(&format!("/{shard:04x}/{jhex}")) {
+                        budget.spend()?;
+                        let _ = self.store.delete(&item.key);
+                    }
+                }
+                match page.next_after {
+                    Some(k) => after = Some(k),
+                    None => break,
+                }
+            }
+        }
+        // termidx entry.
+        budget.spend()?;
+        let _ = self.store.delete(index_key);
+        // Fails, claims.
+        for prefix in [
+            format!("{}fails/{shard:04x}/{jhex}/", self.root),
+            format!("{}claims/{shard:04x}/{jhex}/", self.root),
+        ] {
+            let mut after: Option<Key> = None;
+            loop {
+                budget.spend()?;
+                let page = self.store.list(&prefix, after.as_ref(), 64)?;
+                if page.items.is_empty() {
+                    break;
+                }
+                for item in &page.items {
+                    budget.spend()?;
+                    let _ = self.store.delete(&item.key);
+                }
+                match page.next_after {
+                    Some(k) => after = Some(k),
+                    None => break,
+                }
+            }
+        }
+        // Payloads are content-addressed: payloads/<job>/<digest>.
+        let payload_prefix = format!("{}payloads/{jhex}/", self.root);
+        let mut after: Option<Key> = None;
+        loop {
+            budget.spend()?;
+            let page = self.store.list(&payload_prefix, after.as_ref(), 64)?;
+            if page.items.is_empty() {
+                break;
+            }
+            for item in &page.items {
+                budget.spend()?;
+                let _ = self.store.delete(&item.key);
+            }
+            match page.next_after {
+                Some(k) => after = Some(k),
+                None => break,
+            }
+        }
+        // Job record.
+        budget.spend()?;
+        let _ = self
+            .store
+            .delete(&self.absolute(&RelKey::Job { shard, job_id }));
+        // Terminal record last: the tombstone.
+        budget.spend()?;
+        let _ = self.store.delete(&self.absolute(terminal_rel));
+        Ok(true)
+    }
+}
+
+fn empty_meta() -> Meta {
+    Meta {
+        version: Version("0".into()),
+        store_time_ns: 0,
+        size: 0,
+    }
+}
+
+/// leases/<bucket>/<shard>/<job>.<generation> entry parser.
+fn parse_lease_entry(rest: &str) -> Option<(u16, [u8; 16], u32)> {
+    let (shard_str, tail) = rest.split_once('/')?;
+
+    let (job_str, gen_str) = tail.rsplit_once('.')?;
+    let shard = u16::from_str_radix(shard_str, 16).ok()?;
+    if shard_str.len() != 4 || job_str.len() != 32 || gen_str.len() != 8 {
+        return None;
+    }
+    let mut job_id = [0u8; 16];
+    for (i, b) in job_id.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&job_str[2 * i..2 * i + 2], 16).ok()?;
+    }
+    let generation = u32::from_str_radix(gen_str, 16).ok()?;
+    Some((shard, job_id, generation))
+}
+
+/// delayed/<bucket>/<shard>/<job> entry parser.
+fn parse_delay_entry(rest: &str) -> Option<(u16, [u8; 16])> {
+    let (shard_str, job_str) = rest.split_once('/')?;
+
+    if shard_str.len() != 4 || job_str.len() != 32 {
+        return None;
+    }
+    let shard = u16::from_str_radix(shard_str, 16).ok()?;
+    let mut job_id = [0u8; 16];
+    for (i, b) in job_id.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&job_str[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some((shard, job_id))
+}
+
+/// termidx/<bucket>/<kind>/<shard>/<job> entry parser.
+fn parse_term_entry(rel_str: &str) -> Option<(char, u16, [u8; 16])> {
+    let rest = rel_str.strip_prefix("termidx/")?;
+    let mut parts = rest.splitn(4, '/');
+    let _bucket = parts.next()?;
+    let kind = parts.next()?.chars().next()?;
+    let shard_str = parts.next()?;
+    let job_str = parts.next()?;
+    if shard_str.len() != 4 || job_str.len() != 32 || !matches!(kind, 'r' | 'd') {
+        return None;
+    }
+    let shard = u16::from_str_radix(shard_str, 16).ok()?;
+    let mut job_id = [0u8; 16];
+    for (i, b) in job_id.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&job_str[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some((kind, shard, job_id))
 }
 
 #[cfg(test)]
