@@ -162,10 +162,7 @@ pub fn retry_delay_ms(
 
     let lower = ceiling.div_ceil(2);
     let span = ceiling - lower + 1;
-
-    let threshold = span.wrapping_neg() % span;
-    let mut counter = 0u32;
-    loop {
+    let offset = sample_offset(span, |counter| {
         let mut hasher = Sha256::new();
         hasher.update(b"StowQ-1-jitter\0");
         hasher.update(queue_id);
@@ -173,17 +170,26 @@ pub fn retry_delay_ms(
         hasher.update(attempt.to_be_bytes());
         hasher.update(counter.to_be_bytes());
         let result = hasher.finalize();
-        let x = u64::from_be_bytes(result[..8].try_into().unwrap());
+        u64::from_be_bytes(result[..8].try_into().unwrap())
+    });
+    Ok(lower + offset)
+}
 
+/// Rejection-sampled offset in [0, span). `draw` maps a rejection counter
+/// to a u64 sample; samples below `threshold` are biased and rejected.
+/// After 64 rejections the span midpoint is returned, which is also
+/// unbiased.
+fn sample_offset(span: u64, mut draw: impl FnMut(u32) -> u64) -> u64 {
+    let threshold = span.wrapping_neg() % span;
+    let mut counter = 0u32;
+    loop {
+        let x = draw(counter);
         if x >= threshold {
-            let offset = x % span;
-            return Ok(lower + offset);
+            return x % span;
         }
         counter += 1;
-        // Rejection sampling is unbiased but theoretically unbounded; fall
-        // back to the span midpoint, also unbiased, after 64 draws.
         if counter >= 64 {
-            return Ok(lower + span / 2);
+            return span / 2;
         }
     }
 }
@@ -251,6 +257,8 @@ mod tests {
         assert_eq!(eligibility_bucket_and_ns(1, width), Some((1, 10)));
         assert_eq!(eligibility_bucket_and_ns(25, width), Some((3, 30)));
         assert_eq!(eligibility_bucket_and_ns(1, 0), None);
+        // bucket = ceil(u64::MAX / 2) = 2^63; 2^63 * 2 overflows.
+        assert_eq!(eligibility_bucket_and_ns(u64::MAX, 2), None);
     }
 
     #[test]
@@ -263,6 +271,8 @@ mod tests {
             assert_eq!(bucket_number(start, width), Some(bucket));
         }
         assert_eq!(bucket_end_ns(u64::MAX, width), None);
+        // start fits, start + width overflows.
+        assert_eq!(bucket_end_ns(18_446_744_073_709_551, 1_000), None);
     }
 
     fn policy(base: u64, cap: u64, jitter: bool) -> RetryPolicy {
@@ -318,6 +328,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn delay_max_delay_tightens_cap() {
+        // cap 1600, max_delay 300: attempt 5 would be 1600 without the
+        // clamp; with it the ceiling (and no-jitter delay) is 300.
+        let p = RetryPolicy::new(100, 1_600, false, Some(300)).unwrap();
+        assert_eq!(retry_delay_ms(&Q, &J, 5, &p).unwrap(), 300);
+        let pj = RetryPolicy::new(100, 1_600, true, Some(300)).unwrap();
+        let d = retry_delay_ms(&Q, &J, 5, &pj).unwrap();
+        assert!((150..=300).contains(&d), "attempt 5 delay {d}");
+    }
+
     // SHA256("StowQ-1-jitter\0" || Q || J || attempt=1 BE || counter=0 BE),
     // first 8 bytes big-endian.
     const JITTER_X: u64 = 0xa56cdc89987e2da1;
@@ -329,6 +350,52 @@ mod tests {
         let expected = 50 + (JITTER_X % 51);
         let p = policy(100, 1_600, true);
         assert_eq!(retry_delay_ms(&Q, &J, 1, &p).unwrap(), expected);
+    }
+
+    #[test]
+    fn jitter_odd_ceiling_uses_div_ceil_lower_bound() {
+        // base 101, cap 151, attempt 1: odd ceiling 101, lower must be
+        // ceil(101/2) = 51 and span = 51. A truncating-div mutant lowers
+        // lower to 50 and span to 52, changing this delay to 95.
+        let p = policy(101, 151, true);
+        assert_eq!(retry_delay_ms(&Q, &J, 1, &p).unwrap(), 51 + (JITTER_X % 51));
+    }
+
+    #[test]
+    fn sampler_accepts_first_draw_and_rejects_below_threshold() {
+        // span 4: threshold = (-4) % 4 = 2^64 % 4 = 0, so every draw is
+        // accepted; offset = draw % 4.
+        assert_eq!(sample_offset(4, |_| 11), 3);
+        // span 6: threshold = 2^64 % 6 = 4; draw 3 is rejected, draw 9
+        // accepted on the second call.
+        let mut calls = 0;
+        assert_eq!(
+            sample_offset(6, |c| {
+                calls += 1;
+                if c == 0 {
+                    3
+                } else {
+                    9
+                }
+            }),
+            3
+        );
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn sampler_falls_back_to_midpoint_after_64_rejections() {
+        // threshold for span 3 is 2^64 % 3 = 1; draw 0 is always rejected.
+        let mut calls = 0;
+        assert_eq!(
+            sample_offset(3, |c| {
+                calls += 1;
+                let _ = c;
+                0
+            }),
+            1
+        );
+        assert_eq!(calls, 64);
     }
 
     #[test]
@@ -356,6 +423,8 @@ mod tests {
         assert_eq!(saturating_double(5, 1), 5);
         assert_eq!(saturating_double(5, 2), 10);
         assert_eq!(saturating_double(u64::MAX / 2 + 1, 2), u64::MAX);
+        assert_eq!(saturating_double(1, 64), 1 << 63);
+        assert_eq!(saturating_double(1, 65), u64::MAX);
         assert_eq!(saturating_double(1, 100), u64::MAX);
     }
 }
