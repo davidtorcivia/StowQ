@@ -398,17 +398,17 @@ impl Queue {
                 budget.spend()?;
                 let tag = self.tag_for(&rel);
                 let obj = self.store.get(&abs, None)?;
+                // An undecodable record is provably not ours.
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
                     Ok(found) if found == record => Ok(EnqueueOutcome::Committed { job_id }),
-                    Ok(_) => Ok(EnqueueOutcome::IdTaken { job_id }),
-                    Err(e) => Err(Error::Record(e.to_string())),
+                    _ => Ok(EnqueueOutcome::IdTaken { job_id }),
                 }
             }
         }
     }
 
     /// The outcome-unknown resolver shared by every conditional write:
-    /// re-read the key; absent means not committed (retry once), present
+    /// re-read the key; absent means not committed (bounded retry), present
     /// means committed by someone (compare evidence).
     fn put_resolving(
         &self,
@@ -534,8 +534,8 @@ impl Queue {
         budget: &mut OpBudget,
     ) -> Result<Option<Claim>, Error> {
         // Readiness: no terminal record. Only NotFound proves absence;
-        // any other error fails the candidate loudly rather than
-        // delivering past an unknown terminal state.
+        // any other error aborts the scan loudly rather than delivering
+        // past an unknown terminal state.
         for rel in [
             RelKey::Receipt { shard, job_id },
             RelKey::Dead { shard, job_id },
@@ -674,8 +674,10 @@ impl Queue {
             let body = Bytes::from(stowq_format::encode(&dead, &self.opts.queue_id, &tag));
             budget.spend()?;
             let body_digest: Digest = Sha256::digest(&body).into();
-            match self.put_resolving(&abs, body, body_digest, &dead, &rel, budget)? {
-                Resolved::Committed | Resolved::Lost | Resolved::NotCommitted => {}
+            if let Resolved::Committed =
+                self.put_resolving(&abs, body, body_digest, &dead, &rel, budget)?
+            {
+                self.write_termidx(&rel, stowq_keys::TermKind::Dead, shard, job_id, budget);
             }
             return Ok(None);
         }
@@ -968,6 +970,9 @@ impl Queue {
         job_id: [u8; 16],
         budget: &mut OpBudget,
     ) {
+        if budget.spend().is_err() {
+            return;
+        }
         let Ok(meta) = self.store.head(&self.absolute(terminal_rel)) else {
             return;
         };
