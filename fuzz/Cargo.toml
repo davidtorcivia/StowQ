@@ -32,6 +32,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "fuzz_record_construction"
+path = "fuzz_targets/fuzz_record_construction.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "fuzz_bucket_arithmetic"
 path = "fuzz_targets/fuzz_bucket_arithmetic.rs"
 test = false
