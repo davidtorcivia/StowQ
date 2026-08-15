@@ -1,0 +1,9 @@
+# Internal working documents
+stowq-spec.md
+stowq-implementation.md
+
+# Rust
+/target
+
+# pi agent
+/.pi
