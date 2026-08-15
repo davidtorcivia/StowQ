@@ -691,32 +691,36 @@ fn fresh_floor_below_watermark_fails_closed() {
 
 #[test]
 fn gc_interruption_leaves_terminal_record_last() {
-    let q = make_queue();
-    let mut budget = OpBudget::new(1_024);
-    q.enqueue(
-        EnqueueInput {
-            job_id: Some([9; 16]),
-            payload: b"x",
-            content_type: "text/plain".into(),
-            maximum_attempts: 3,
-            not_before_ns: None,
-        },
-        &mut budget,
-    )
-    .unwrap();
-    let stowq_core::ClaimOutcome::Claimed(claim) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
-    else {
-        panic!("claim")
-    };
-    q.ack(&claim, &mut budget).unwrap();
-    let jhex: String = claim.job_id.iter().map(|b| format!("{b:02x}")).collect();
+    // Starve the graph deletion mid-flight: each trial runs against a
+    // FRESH fixture (partial deletions consume the termidx discovery
+    // path, so cumulative trials strand the graph — recovery from that
+    // stranding is the repair scan's job, not a second gc pass). A
+    // trial whose budget covers the whole graph completes it; smaller
+    // budgets leave every intermediate state with the terminal record
+    // present and the job unclaimable.
+    let jhex: String = [9u8; 16].iter().map(|b| format!("{b:02x}")).collect();
+    let mut completed = false;
+    for trial in 1..=24 {
+        let q = make_queue();
+        let mut budget = OpBudget::new(1_024);
+        q.enqueue(
+            EnqueueInput {
+                job_id: Some([9; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap();
+        let stowq_core::ClaimOutcome::Claimed(claim) =
+            q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        else {
+            panic!("claim")
+        };
+        q.ack(&claim, &mut budget).unwrap();
 
-    // Starve the graph deletion mid-flight: a tiny budget exhausts
-    // inside delete_terminal_graph. Whatever partial state results,
-    // the terminal record must still exist and the job must be
-    // unclaimable.
-    for trial in 1..=8 {
         let mut small = OpBudget::new(trial);
         let _ = q.gc(u64::MAX / 4, 1_000, &mut small);
         let receipt = q.store().head(&Key::new(format!("q/receipts/0000/{jhex}")));
@@ -729,6 +733,7 @@ fn gc_interruption_leaves_terminal_record_last() {
                     .is_err(),
                 "job record must not outlive the terminal record"
             );
+            completed = true;
             break;
         }
         // Still mid-deletion: terminal record present, job unclaimable.
@@ -740,4 +745,8 @@ fn gc_interruption_leaves_terminal_record_last() {
             "trial {trial}: mid-GC job must be unclaimable while its terminal record exists"
         );
     }
+    assert!(
+        completed,
+        "some trial must complete the deletion to exercise the ordering assert"
+    );
 }
