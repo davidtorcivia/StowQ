@@ -6,6 +6,7 @@ members = [
     "crates/stowq-format",
     "crates/stowq-store",
     "crates/stowq-core",
+    "crates/stowq-testkit",
 ]
 
 [workspace.package]
@@ -24,3 +25,4 @@ stowq-format = { path = "crates/stowq-format" }
 stowq-keys = { path = "crates/stowq-keys" }
 stowq-math = { path = "crates/stowq-math" }
 stowq-store = { path = "crates/stowq-store" }
+stowq-core = { path = "crates/stowq-core" }

@@ -1,0 +1,18 @@
+[package]
+name = "stowq-testkit"
+description = "Logical oracle, differential driver, and fault-injecting harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+stowq-core.workspace = true
+stowq-format.workspace = true
+stowq-keys.workspace = true
+stowq-math.workspace = true
+stowq-store.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

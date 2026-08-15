@@ -438,3 +438,38 @@ fn open_rejects_missing_format() {
         Ok(_) => panic!("open must reject a prefix without FORMAT"),
     }
 }
+
+#[test]
+fn renew_and_ack_refuse_after_exhaustion_dead() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([6; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 1,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(claim) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    // Expire; another claimant writes dead at exhaustion.
+    let floor = claim.claim_store_time_ns + 2_000;
+    let out = q.claim(&claim_opts(floor, 1_000), &mut budget).unwrap();
+    assert!(matches!(out, stowq_core::ClaimOutcome::Empty));
+    // The zombie holder cannot extend custody or ack over the dead job.
+    let renewed = q.renew(&claim, &mut budget).unwrap();
+    assert!(matches!(renewed, stowq_core::RenewOutcome::LeaseLost));
+    let acked = q.ack(&claim, &mut budget).unwrap();
+    assert_eq!(acked, stowq_core::AckOutcome::SupersededByDead);
+    // And no receipt exists.
+    let jhex: String = [6u8; 16].iter().map(|b| format!("{b:02x}")).collect();
+    let receipt = q.store().head(&Key::new(format!("q/receipts/0000/{jhex}")));
+    assert!(receipt.is_err());
+}
