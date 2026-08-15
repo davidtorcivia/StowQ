@@ -98,6 +98,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "stowq-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "sha2",
+ "stowq-format",
+ "stowq-keys",
+ "stowq-math",
+ "stowq-store",
+ "thiserror",
+]
+
+[[package]]
 name = "stowq-format"
 version = "0.1.0"
 dependencies = [
