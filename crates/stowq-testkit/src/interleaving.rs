@@ -334,7 +334,6 @@ mod tests {
             panic!("renew")
         };
         assert_eq!(renewed.generation, 2);
-        // ...so the same-generation takeover attempt by B loses.
         // ...so the within-lease takeover attempt by B must lose:
         // floor equals the renewed tail's own store time, strictly
         // inside its lease.
