@@ -92,6 +92,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "stowq-format"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "stowq-keys"
 version = "0.1.0"
 dependencies = [

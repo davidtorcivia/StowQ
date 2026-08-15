@@ -4,21 +4,73 @@ Normative. Field names below are normative.
 
 ## Framing
 
-All records are canonical deterministic CBOR (RFC 8949 §4.2.1). Every record
-carries `magic`, `major = 1`, `minor = 0`, `queue_id`, `key_tag`, and a
-trailing `record_digest`. Unknown fields are rejected in v1;
-`required_feature_bits` gates evolution.
+All records are canonical deterministic CBOR (RFC 8949 §4.2.1). A record is
+a seven-element array
 
 ```
-record_digest = SHA256("StowQ-1-<type>\0" || canonical-cbor-without-digest)
+[magic, major, minor, queue_id, key_tag, record_type, fields]
+```
+
+followed by a trailing 32-byte byte string carrying `record_digest`:
+
+```
+record_digest = SHA256("StowQ-1-<type>\0" || canonical-encoding-of-the-array)
 key_tag       = first_8_bytes(SHA256("StowQ-1-key\0" || queue_id || key))
 ```
+
+`magic` is the u64 `0x53544f5751312d00`. `major` is 1 and `minor` is 0.
+`queue_id` is a 16-byte string, `key_tag` an 8-byte string (see
+namespace.md). `record_type`: 1 format, 2 job, 3 claim, 4 fail, 5 receipt,
+6 dead, 7 watermark. `fields` is a map with text keys; absent optional
+fields are omitted entirely. Unknown fields are rejected in v1;
+`required_feature_bits` gates evolution.
 
 `key_tag` is verified on every read, so a record copied to the wrong key or
 wrong queue is detected.
 
 Record types: `format`, `job`, `claim`, `fail`, `receipt`, `dead`,
 `watermark`.
+
+## Test vectors
+
+Vectors pin the canonical encoding. All use queue_id
+`000102030405060708090a0b0c0d0e0f` and key_tag `0707070707070707`.
+
+Job: job_id `101112131415161718191a1b1c1d1e1f`, maximum_attempts 3,
+content_type `text/plain`, payload `hello stowq` inline (payload_digest
+`896084e74043a1d22eb32d0eb9a63bce64c3792426a2ddd4b97509c68ff5cd38`).
+
+```text
+871b53544f5751312d00010050000102030405060708090a0b0c0d0e0f480707070707
+07070702a7666a6f625f696450101112131415161718191a1b1c1d1e1f6c636f6e74656e
+745f747970656a746578742f706c61696e6e7061796c6f61645f64696765737458208960
+84e74043a1d22eb32d0eb9a63bce64c3792426a2ddd4b97509c68ff5cd386e7061796c6f
+61645f696e6c696e654b68656c6c6f2073746f77716e7061796c6f61645f6c656e677468
+0b706d6178696d756d5f617474656d7074730375637265617465645f73746f72655f7469
+6d655f6e730058208b73824ef400fd84f63d7d43f1c443c32089b122731bd49308ac2737
+d6015df9
+```
+
+record_digest
+`8b73824ef400fd84f63d7d43f1c443c32089b122731bd49308ac2737d6015df9`.
+
+Claim (takeover, generation 1): job_id as above, attempt 1, worker_id
+`w1`, worker_token `42` × 16, lease_duration 60000000000 ns, all-zero
+basis.
+
+```text
+871b53544f5751312d00010050000102030405060708090a0b0c0d0e0f480707070707
+07070703a8656261736973a370707265765f6475726174696f6e5f6e730072707265765f
+73746f72655f74696d655f6e7300756f627365727665645f77617465726d61726b5f6e73
+00666a6f625f696450101112131415161718191a1b1c1d1e1f67617474656d7074016977
+6f726b65725f69646277316a67656e65726174696f6e016c636f6e74696e756174696f6e
+f46c776f726b65725f746f6b656e5042424242424242424242424242424242716c656173
+655f6475726174696f6e5f6e731b0000000df84758005820c9f5f3ee7144d8fa17ba9349
+8f04c4548667aa9c895864fc85274ad08aeec1ca
+```
+
+record_digest
+`c9f5f3ee7144d8fa17ba93498f04c4548667aa9c895864fc85274ad08aeec1ca`.
 
 ## FORMAT record
 
