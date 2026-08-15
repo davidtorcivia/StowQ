@@ -29,6 +29,7 @@ pub enum Error {
     UnsortedMapKeys,
     DuplicateMapKey,
     LengthOverflow,
+    MaxDepth,
 }
 
 impl fmt::Display for Error {
@@ -44,6 +45,7 @@ impl fmt::Display for Error {
             Error::UnsortedMapKeys => "map keys not in bytewise order",
             Error::DuplicateMapKey => "duplicate map key",
             Error::LengthOverflow => "declared length exceeds input",
+            Error::MaxDepth => "nesting depth exceeds the limit",
         };
         f.write_str(msg)
     }
@@ -125,11 +127,19 @@ pub fn encode(v: &Value) -> Vec<u8> {
 struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
+    depth: u32,
 }
+
+/// Canonical protocol records nest at most four levels (array, fields map,
+/// nested value); 64 leaves generous headroom while keeping hostile
+/// nesting from reaching the stack limit.
+const MAX_DEPTH: u32 = 64;
 
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if self.pos + n > self.data.len() {
+        // Subtraction form: `pos + n` can overflow usize on hostile
+        // length fields before the comparison runs.
+        if n > self.data.len() - self.pos {
             return Err(Error::UnexpectedEof);
         }
         let s = &self.data[self.pos..self.pos + n];
@@ -177,6 +187,17 @@ impl<'a> Reader<'a> {
     }
 
     fn value(&mut self) -> Result<Value, Error> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return Err(Error::MaxDepth);
+        }
+        let out = self.value_inner()?;
+        self.depth -= 1;
+        Ok(out)
+    }
+
+    fn value_inner(&mut self) -> Result<Value, Error> {
         let (major, value) = self.head()?;
         match major {
             0 => Ok(Value::Uint(value)),
@@ -232,7 +253,11 @@ impl<'a> Reader<'a> {
 
 /// Decodes exactly one canonical value covering the entire input.
 pub fn decode(data: &[u8]) -> Result<Value, Error> {
-    let mut r = Reader { data, pos: 0 };
+    let mut r = Reader {
+        data,
+        pos: 0,
+        depth: 0,
+    };
     let v = r.value()?;
     if r.pos != data.len() {
         return Err(Error::TrailingBytes);
@@ -322,6 +347,29 @@ mod tests {
             decode(&[0xf9, 0x3e, 0x00]),
             Err(Error::UnsupportedSimple(0))
         );
+    }
+
+    #[test]
+    fn hostile_length_does_not_overflow() {
+        // Byte string declaring length u64::MAX: `pos + n` would wrap in
+        // an addition-form bounds check.
+        let mut data = vec![0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        data.extend_from_slice(&[0x00]);
+        assert_eq!(decode(&data), Err(Error::UnexpectedEof));
+        // Same via a map head.
+        let data = vec![0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(decode(&data), Err(Error::UnexpectedEof));
+    }
+
+    #[test]
+    fn deep_nesting_is_bounded() {
+        // 100 nested single-element arrays: rejected at the depth limit,
+        // not by exhausting the stack.
+        let data = vec![0x81; 100];
+        assert_eq!(decode(&data), Err(Error::MaxDepth));
+        // Depth within the limit round-trips.
+        let ok = Value::Array(vec![Value::Array(vec![Value::Uint(1)])]);
+        assert_eq!(decode(&encode(&ok)), Ok(ok));
     }
 
     #[test]

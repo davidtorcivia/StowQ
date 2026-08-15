@@ -481,7 +481,10 @@ impl Record {
                     Some(_) => return Err(RecordError::Field("prev_token")),
                     None => None,
                 };
-                if continuation == (basis.is_some()) {
+                if continuation == (basis.is_some())
+                    || continuation != prev_token.is_some()
+                    || basis.is_some() == prev_token.is_some()
+                {
                     return Err(RecordError::Field("basis xor prev_token"));
                 }
                 Record::Claim(ClaimRecord {
@@ -533,6 +536,11 @@ impl Record {
                     .find(|(k, _)| k == &Value::Text("output_digests".into()))
                 {
                     Some((_, Value::Array(items))) => {
+                        if items.is_empty() {
+                            // The encoder omits the field when empty; an
+                            // explicit empty array is non-canonical.
+                            return Err(RecordError::Field("output_digests"));
+                        }
                         let mut out = Vec::new();
                         for item in items {
                             match item {
@@ -863,6 +871,73 @@ mod tests {
         assert_eq!(
             decode(&bytes2, &Q, &TAG),
             Err(RecordError::Field("basis xor prev_token"))
+        );
+
+        // continuation=true with prev_token absent: no custody proof.
+        let bad3 = ClaimRecord {
+            continuation: true,
+            basis: None,
+            prev_token: None,
+            ..match takeover_claim() {
+                Record::Claim(c) => c,
+                _ => unreachable!(),
+            }
+        };
+        let bytes3 = encode(&Record::Claim(bad3), &Q, &TAG);
+        assert_eq!(
+            decode(&bytes3, &Q, &TAG),
+            Err(RecordError::Field("basis xor prev_token"))
+        );
+
+        // takeover carrying both basis and prev_token.
+        let bad4 = ClaimRecord {
+            prev_token: Some([0xcd; 16]),
+            ..match takeover_claim() {
+                Record::Claim(c) => c,
+                _ => unreachable!(),
+            }
+        };
+        let bytes4 = encode(&Record::Claim(bad4), &Q, &TAG);
+        assert_eq!(
+            decode(&bytes4, &Q, &TAG),
+            Err(RecordError::Field("basis xor prev_token"))
+        );
+    }
+
+    #[test]
+    fn empty_output_digests_array_rejected() {
+        // Hand-build a valid-digest receipt whose output_digests is an
+        // empty array: the encoder omits the field when empty, so an
+        // explicit empty array is non-canonical.
+        let receipt = Record::Receipt(ReceiptRecord {
+            job_id: [0x10; 16],
+            generation: 2,
+            attempt: 2,
+            worker_id: "worker-1".into(),
+            worker_token: [0xcd; 16],
+            payload_digest: [0xab; 32],
+            output_digests: vec![],
+        });
+        let mut fields = receipt.fields();
+        fields.push((Value::Text("output_digests".into()), Value::Array(vec![])));
+        let body = Value::Array(vec![
+            Value::Uint(MAGIC),
+            Value::Uint(MAJOR),
+            Value::Uint(MINOR),
+            Value::Bytes(Q.to_vec()),
+            Value::Bytes(TAG.to_vec()),
+            Value::Uint(5),
+            Value::Map(fields),
+        ]);
+        let body_bytes = cbor::encode(&body);
+        let digest = record_digest("receipt", &body_bytes);
+        let mut out = body_bytes;
+        out.push(0x58);
+        out.push(32);
+        out.extend_from_slice(&digest);
+        assert_eq!(
+            decode(&out, &Q, &TAG),
+            Err(RecordError::Field("output_digests"))
         );
     }
 
