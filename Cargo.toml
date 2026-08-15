@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/stowq-keys", "crates/stowq-math", "crates/stowq-format"]
+members = [
+    "crates/stowq-keys",
+    "crates/stowq-math",
+    "crates/stowq-format",
+    "crates/stowq-store",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,5 +16,6 @@ authors = ["David Torcivia <david.torcivia@gmail.com>"]
 repository = "https://github.com/davidtorcivia/StowQ"
 
 [workspace.dependencies]
+bytes = "1"
 sha2 = "0.10"
 thiserror = "1"
