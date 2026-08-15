@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/stowq-keys", "crates/stowq-math"]
+members = ["crates/stowq-keys", "crates/stowq-math", "crates/stowq-format"]
 
 [workspace.package]
 version = "0.1.0"
