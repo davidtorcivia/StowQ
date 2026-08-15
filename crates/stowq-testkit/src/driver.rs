@@ -175,14 +175,14 @@ pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usiz
                 // writes dead as a side effect, the first claimable job
                 // wins, and the scan stops there.
                 let mut expected_job = None;
-                for j in 0..cfg.jobs {
+                for (j, slot) in held.iter_mut().enumerate() {
                     let id = job_id(j);
                     if oracle.exhaust_if_due(&id) {
                         exhausted += 1;
                         // Custody was lost at expiry and the sweep
                         // dead-ended the job; the held handle is stale,
                         // exactly as a real worker would learn.
-                        held[j] = None;
+                        *slot = None;
                         continue;
                     }
                     if oracle.can_claim(&id) {
