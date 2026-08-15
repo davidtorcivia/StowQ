@@ -112,8 +112,10 @@ pub fn run_interleaving(seed: u64, jobs: usize, steps: usize) {
 
     let mut rng = Rng::new(seed);
     let mut held: Vec<Vec<Option<Claim>>> = queues.iter().map(|_| vec![None; jobs]).collect();
+    // The scheduler's logical clock: the max of all advances. Claim
+    // floors come from it; store write times advance with it, so it is
+    // always a sound floor.
     let mut clock: u64 = 0;
-    let _ = &mut clock;
 
     for step in 0..steps {
         let worker = (rng.next_u64() % queues.len() as u64) as usize;
@@ -147,21 +149,27 @@ pub fn run_interleaving(seed: u64, jobs: usize, steps: usize) {
                 // Any worker's claim races any other's.
                 let opts = ClaimOptions {
                     shard: 0,
-                    floor_ns: store_clock(&queues[0]),
+                    floor_ns: clock,
                     lease_duration_ns: 1_000,
                 };
                 if let ClaimOutcome::Claimed(c) = q.claim(&opts, &mut budget).unwrap() {
                     let j = claimed_index(&c);
-                    // Two workers must never hold the same generation.
-                    for (other_w, other_held) in held.iter().enumerate() {
-                        if let Some(existing) = &other_held[j] {
-                            if other_w != worker {
-                                panic!(
+                    // A committed claim proves the previous lease ended:
+                    // any other worker's handle for this job is a zombie
+                    // (their generation is below the new tail). Model
+                    // what those workers would learn — custody
+                    // transferred.
+                    for (other_w, other_held) in held.iter_mut().enumerate() {
+                        if other_w != worker {
+                            if let Some(existing) = &other_held[j] {
+                                assert!(
+                                    existing.generation < c.generation,
                                     "step {step}: workers {other_w} and {worker} both hold \
-                                     job {j} (gen {} vs {})",
-                                    existing.generation, c.generation
+                                     live generation {} on job {j}",
+                                    c.generation
                                 );
                             }
+                            other_held[j] = None;
                         }
                     }
                     held[worker][j] = Some(c);
@@ -187,6 +195,7 @@ pub fn run_interleaving(seed: u64, jobs: usize, steps: usize) {
                 q.bury(&claim, 0x0003, &mut budget).unwrap();
             }
             Step::AdvanceClock(to) => {
+                clock = clock.max(to);
                 store.advance_clock_to(to);
             }
         }
@@ -198,19 +207,6 @@ fn claimed_index(c: &Claim) -> usize {
     let mut b = [0u8; 8];
     b.copy_from_slice(&c.job_id[..8]);
     u64::from_be_bytes(b) as usize
-}
-
-/// The lab's floor source: the store's own clock advanced by the
-/// scheduler, read via a beacon-free head of any existing object.
-fn store_clock(q: &Queue) -> u64 {
-    // List anything; the fake's clock only moves forward and every
-    // object's store time is <= clock. A cheap deterministic floor: the
-    // newest object's store time across the whole prefix.
-    let page = q.store().list("q/", None, 1).unwrap();
-    page.items
-        .first()
-        .map(|i| i.meta.store_time_ns)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -279,18 +275,20 @@ mod tests {
             ClaimOutcome::Empty => panic!("takeover"),
         };
         assert_eq!(b_claim.generation, a_claim.generation + 1);
-        // Zombie A acks late: allowed, but must not produce a second
-        // terminal record or clobber B's claim.
+        // Zombie A acks late: accepted (first terminal wins), must not
+        // produce a second terminal record, and must fence B's custody.
         let _ = qa.ack(&a_claim, &mut b).unwrap();
         check_invariants(&qa, 1, 0);
-        // B can still complete its work: renew then ack (the receipt
-        // from A's zombie ack verifies against B's? No: B's ack with
-        // matching payload verifies as AlreadyAcked).
+        // The receipt terminalizes the job: B cannot renew.
         let renewed = qb.renew(&b_claim, &mut b).unwrap();
-        if let RenewOutcome::Renewed(renewed) = renewed {
-            let out = qb.ack(&renewed, &mut b).unwrap();
-            assert!(matches!(out, AckOutcome::AlreadyAcked));
-        }
+        assert!(
+            matches!(renewed, RenewOutcome::LeaseLost),
+            "receipt must fence the live claim's renewal"
+        );
+        // B's direct ack against the existing receipt with matching
+        // payload evidence verifies as AlreadyAcked.
+        let out = qb.ack(&b_claim, &mut b).unwrap();
+        assert!(matches!(out, AckOutcome::AlreadyAcked));
         check_invariants(&qa, 1, 1);
     }
 
@@ -358,9 +356,12 @@ mod tests {
         check_invariants(&qa, 1, 0);
     }
 
-    /// Dueling sweepers over one store: both prune, no double effects.
+    /// Sweeper idempotence, sequentially: a second sweep over the
+    /// pruned index consumes nothing. (The lab cannot interleave inside
+    /// an operation; concurrent safety rests on idempotent deletes and
+    /// authoritative re-verification.)
     #[test]
-    fn adversarial_dueling_sweepers() {
+    fn sequential_sweeper_idempotence() {
         let store = MemoryStore::new();
         let mk = |w: usize| {
             let mut opts = OpenOptions::new([1; 16]);
@@ -404,11 +405,12 @@ mod tests {
         check_invariants(&q1, 1, 0);
     }
 
-    /// GC racing a late ack: the graph deletion and the receipt write
-    /// cannot both stand; whichever wins, at most one terminal record
-    /// exists and no partial graph misleads a claimant.
+    /// GC before and after a late ack, sequentially: non-terminal
+    /// graphs are never collected; the late ack succeeds; past
+    /// retention the full graph goes. (Mid-flight interleaving of gc
+    /// and ack is not exercisable at the lab's step granularity.)
     #[test]
-    fn adversarial_gc_racing_late_ack() {
+    fn gc_around_a_late_ack() {
         let store = MemoryStore::new();
         let mk = |w: usize| {
             let mut opts = OpenOptions::new([1; 16]);
