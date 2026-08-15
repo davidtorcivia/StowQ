@@ -175,6 +175,8 @@ pub enum AckOutcome {
     Acked,
     /// A receipt already existed and its evidence matches this claim.
     AlreadyAcked,
+    /// A dead record terminalized the job first; the ack refused.
+    SupersededByDead,
 }
 
 #[derive(Debug, Clone)]
@@ -762,6 +764,26 @@ impl Queue {
         if claim.generation >= u32::MAX as u64 {
             return Err(Error::Internal("generation space exhausted".into()));
         }
+        // A terminal job cannot extend its custody chain: without this
+        // check a zombie renewal after an exhaustion-dead would append a
+        // generation and enable a second terminal record.
+        for rel in [
+            RelKey::Receipt {
+                shard: claim.shard,
+                job_id: claim.job_id,
+            },
+            RelKey::Dead {
+                shard: claim.shard,
+                job_id: claim.job_id,
+            },
+        ] {
+            budget.spend()?;
+            match self.store.head(&self.absolute(&rel)) {
+                Ok(_) => return Ok(RenewOutcome::LeaseLost),
+                Err(StoreError::NotFound) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let record = Record::Claim(ClaimRecord {
             job_id: claim.job_id,
             generation: claim.generation + 1,
@@ -805,6 +827,17 @@ impl Queue {
     // ---------- ack ----------
 
     pub fn ack(&self, claim: &Claim, budget: &mut OpBudget) -> Result<AckOutcome, Error> {
+        // A dead record terminalized the job first; refuse so at most
+        // one terminal record per job ever exists.
+        budget.spend()?;
+        match self.store.head(&self.absolute(&RelKey::Dead {
+            shard: claim.shard,
+            job_id: claim.job_id,
+        })) {
+            Ok(_) => return Ok(AckOutcome::SupersededByDead),
+            Err(StoreError::NotFound) => {}
+            Err(e) => return Err(e.into()),
+        }
         // Payload evidence: re-verify before the terminal write.
         budget.spend()?;
         let payload = claim.payload(self.store.as_ref())?;
