@@ -422,6 +422,11 @@ mod tests {
             .unwrap();
         // Empty slice within bounds is fine.
         assert_eq!(&store.get(&k, Some(5..5)).unwrap().body[..], b"");
+        // Empty slice at EOF: only the start-past-size guard rejects it.
+        assert_eq!(
+            store.get(&k, Some(11..11)).unwrap_err(),
+            StoreError::NotFound
+        );
         // start past size.
         assert_eq!(
             store.get(&k, Some(12..12)).unwrap_err(),

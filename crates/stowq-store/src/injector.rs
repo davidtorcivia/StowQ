@@ -126,8 +126,8 @@ impl<S: ObjectStore> Injector<S> {
 
     /// Decides this call's fate. At most one fault fires per call: the
     /// first plan (in construction order) whose op matches and whose
-    /// index is due. Same-op plans count every call that reaches them,
-    /// including calls an earlier plan already faulted.
+    /// index is due. A faulted call returns immediately, so later
+    /// same-op plans never see it; they count only surviving calls.
     fn check(&self, op: Op) -> Action {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let mut plans = self.plans.lock().unwrap();
