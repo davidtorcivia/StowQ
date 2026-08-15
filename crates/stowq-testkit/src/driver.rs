@@ -102,8 +102,9 @@ fn gen_ops(rng: &mut Rng, cfg: &DriverConfig) -> Vec<DriveOp> {
             3 => DriveOp::Ack { job },
             4 => DriveOp::Nack { job },
             5 => DriveOp::Bury { job },
-            // Exponential clock: half the draws stay under ~8.4ms, the
-            // tail covers multi-second backoffs.
+            // Exponential clock: the median draw is ~93us and the
+            // maximum ~8.6s, so microsecond leases and the retry
+            // backoffs both elapse.
             _ => DriveOp::AdvanceClock {
                 to: (1u64 << rng.below(34)) - 1,
             },
@@ -178,6 +179,10 @@ pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usiz
                     let id = job_id(j);
                     if oracle.exhaust_if_due(&id) {
                         exhausted += 1;
+                        // Custody was lost at expiry and the sweep
+                        // dead-ended the job; the held handle is stale,
+                        // exactly as a real worker would learn.
+                        held[j] = None;
                         continue;
                     }
                     if oracle.can_claim(&id) {
