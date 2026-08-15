@@ -120,6 +120,43 @@ pub struct Claim {
     payload: PayloadRef,
 }
 
+impl Claim {
+    /// Builds a claim handle over an inline payload. For tooling that
+    /// reconstructs handles from persisted state; `payload` must be the
+    /// job's verified inline bytes. Arguments mirror the record's
+    /// fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inline(
+        job_id: [u8; 16],
+        shard: u16,
+        generation: u64,
+        attempt: u64,
+        worker_token: [u8; 16],
+        lease_duration_ns: u64,
+        claim_store_time_ns: u64,
+        payload: Bytes,
+    ) -> Claim {
+        Claim {
+            job_id,
+            shard,
+            generation,
+            attempt,
+            worker_token,
+            lease_duration_ns,
+            claim_store_time_ns,
+            payload: PayloadRef::Inline(payload),
+        }
+    }
+
+    /// The inline payload bytes, when the claim carries them.
+    pub fn payload_preview(&self) -> Option<&[u8]> {
+        match &self.payload {
+            PayloadRef::Inline(b) => Some(b),
+            PayloadRef::Detached { .. } => None,
+        }
+    }
+}
+
 impl std::fmt::Debug for Claim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Claim")

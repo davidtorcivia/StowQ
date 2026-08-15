@@ -33,6 +33,22 @@ The normative specification lives in `spec/`:
 - `recovery.md` — sweeping, repair, GC
 - `reasons.md` — reason registries
 
+## Quick Start
+
+```sh
+cargo build --release
+
+./target/release/stowq init myqueue
+echo "hello world" | ./target/release/stowq put myqueue - --content-type text/plain
+./target/release/stowq claim myqueue > handle.json
+./target/release/stowq ack myqueue "$(cat handle.json)"
+./target/release/stowq inspect myqueue <job_id>
+```
+
+The v1 CLI is memory-backed per invocation with a local snapshot; the
+S3-compatible backend for R2 and MinIO arrives with the conformance
+program.
+
 ## License
 
 Apache-2.0.

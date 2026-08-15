@@ -13,6 +13,9 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// A persisted object: key, body, version, store time.
+pub type SnapshotEntry = (String, Vec<u8>, u64, u64);
+
 struct Stored {
     body: Bytes,
     version: u64,
@@ -43,6 +46,45 @@ impl MemoryStore {
             clock: Arc::new(AtomicU64::new(1)),
             tick_step_ns,
         }
+    }
+
+    /// Full-state snapshot: (key, body, version, store_time_ns) per
+    /// object, plus the version counter and clock. For persistence and
+    /// test tooling.
+    pub fn snapshot_raw(&self) -> (Vec<SnapshotEntry>, u64, u64) {
+        let objects = self.objects.lock().unwrap();
+        let out = objects
+            .iter()
+            .map(|(k, s)| (k.clone(), s.body.to_vec(), s.version, s.store_time_ns))
+            .collect();
+        (
+            out,
+            self.version_counter.load(Ordering::SeqCst),
+            self.clock.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Replaces the store's contents from a snapshot. Only for fresh
+    /// stores (init paths); merging into a live store is unsupported.
+    pub fn restore_raw(
+        &self,
+        objects: Vec<(String, Vec<u8>, u64, u64)>,
+        next_version: u64,
+        clock: u64,
+    ) {
+        let mut map = self.objects.lock().unwrap();
+        for (k, body, version, store_time_ns) in objects {
+            map.insert(
+                k,
+                Stored {
+                    body: Bytes::from(body),
+                    version,
+                    store_time_ns,
+                },
+            );
+        }
+        self.version_counter.store(next_version, Ordering::SeqCst);
+        self.clock.store(clock, Ordering::SeqCst);
     }
 
     /// Raises the logical clock so the next write's store time is at
