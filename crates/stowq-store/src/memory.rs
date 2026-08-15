@@ -11,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 struct Stored {
     body: Bytes,
@@ -19,10 +19,12 @@ struct Stored {
     store_time_ns: u64,
 }
 
+/// Clones share state: one logical store, many handles.
+#[derive(Clone)]
 pub struct MemoryStore {
-    objects: Mutex<BTreeMap<String, Stored>>,
-    version_counter: AtomicU64,
-    clock: AtomicU64,
+    objects: Arc<Mutex<BTreeMap<String, Stored>>>,
+    version_counter: Arc<AtomicU64>,
+    clock: Arc<AtomicU64>,
     tick_step_ns: u64,
 }
 
@@ -36,9 +38,9 @@ impl MemoryStore {
     pub fn with_tick_step_ns(tick_step_ns: u64) -> Self {
         assert!(tick_step_ns > 0, "tick step must be positive");
         MemoryStore {
-            objects: Mutex::new(BTreeMap::new()),
-            version_counter: AtomicU64::new(1),
-            clock: AtomicU64::new(1),
+            objects: Arc::new(Mutex::new(BTreeMap::new())),
+            version_counter: Arc::new(AtomicU64::new(1)),
+            clock: Arc::new(AtomicU64::new(1)),
             tick_step_ns,
         }
     }

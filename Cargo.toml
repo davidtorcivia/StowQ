@@ -5,6 +5,7 @@ members = [
     "crates/stowq-math",
     "crates/stowq-format",
     "crates/stowq-store",
+    "crates/stowq-core",
 ]
 
 [workspace.package]
@@ -19,3 +20,7 @@ repository = "https://github.com/davidtorcivia/StowQ"
 bytes = "1"
 sha2 = "0.10"
 thiserror = "1"
+stowq-format = { path = "crates/stowq-format" }
+stowq-keys = { path = "crates/stowq-keys" }
+stowq-math = { path = "crates/stowq-math" }
+stowq-store = { path = "crates/stowq-store" }

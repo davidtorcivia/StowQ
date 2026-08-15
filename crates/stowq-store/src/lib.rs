@@ -9,7 +9,7 @@
 pub mod injector;
 pub mod memory;
 
-pub use injector::{FaultPlan, Injector};
+pub use injector::{Fault, FaultPlan, Injector, Op};
 pub use memory::MemoryStore;
 
 use bytes::Bytes;
