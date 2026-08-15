@@ -18,7 +18,7 @@ bound sweep work and are never trusted for correctness.
 
 ## Status
 
-Experimental. The protocol specification is frozen at draft-1; implementation has not started. Do not use it for workloads where job loss would cause harm.
+Experimental. Do not use it for workloads where job loss would cause harm.
 
 ## Specification
 
