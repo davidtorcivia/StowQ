@@ -42,8 +42,9 @@ index; only efficiency does.
 
 ## Sharding
 
-`shard = first 2 bytes of SHA256("StowQ-1-shard\0" || queue_id || job_id)`,
-formatted as 4 hex digits. Shard count is fixed in FORMAT at init.
+`shard = low log2(shard_count) bits of SHA256("StowQ-1-shard\0" || queue_id
+|| job_id)`, taken from the first 2 bytes of the hash and formatted as 4 hex
+digits. Shard count is a power of two fixed in FORMAT at init.
 
 Keys carry only identity, never mutable state. Keys are stable for the life
 of the job. State lives in the immutable record contents, integrity-bound
