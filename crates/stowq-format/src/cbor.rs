@@ -103,11 +103,18 @@ fn encode_into(v: &Value, out: &mut Vec<u8>) {
             }
         }
         Value::Map(pairs) => {
-            let mut sorted: Vec<&(Value, Value)> = pairs.iter().collect();
-            sorted.sort_by_key(|a| encoded_key_bytes(&a.0));
-            push_head(out, 5, sorted.len() as u64);
-            for (k, v) in sorted {
-                encode_into(k, out);
+            // Encode each key once and sort the decorated pairs: a
+            // comparator (or key fn) that re-encodes keys runs per
+            // comparison, and nested map keys then re-sort recursively,
+            // which is exponential in depth.
+            let mut decorated: Vec<(Vec<u8>, &Value)> = pairs
+                .iter()
+                .map(|(k, v)| (encoded_key_bytes(k), v))
+                .collect();
+            decorated.sort_by(|a, b| a.0.cmp(&b.0));
+            push_head(out, 5, decorated.len() as u64);
+            for (key_bytes, v) in decorated {
+                out.extend_from_slice(&key_bytes);
                 encode_into(v, out);
             }
         }
@@ -229,15 +236,19 @@ impl<'a> Reader<'a> {
                     pairs.push((k, v));
                 }
                 // Canonical maps: keys strictly increasing bytewise.
-                for window in pairs.windows(2) {
-                    let a = encoded_key_bytes(&window[0].0);
-                    let b = encoded_key_bytes(&window[1].0);
-                    if a == b {
-                        return Err(Error::DuplicateMapKey);
+                // One encode per key, not per comparison.
+                let mut prev: Option<Vec<u8>> = None;
+                for (k, _) in &pairs {
+                    let cur = encoded_key_bytes(k);
+                    if let Some(p) = &prev {
+                        if cur == *p {
+                            return Err(Error::DuplicateMapKey);
+                        }
+                        if cur < *p {
+                            return Err(Error::UnsortedMapKeys);
+                        }
                     }
-                    if a > b {
-                        return Err(Error::UnsortedMapKeys);
-                    }
+                    prev = Some(cur);
                 }
                 Ok(Value::Map(pairs))
             }
@@ -377,6 +388,21 @@ mod tests {
         assert_eq!(decode(&[0x18]), Err(Error::UnexpectedEof));
         assert_eq!(decode(&[0x43, 0x01, 0x02]), Err(Error::UnexpectedEof));
         assert_eq!(decode(&[0x01, 0x02]), Err(Error::TrailingBytes));
+    }
+
+    // Hostile nested-map-key input found by fuzzing: before the
+    // decorate-sort-undecorate fix, encoding keys per comparison made
+    // canonical-map handling exponential in depth (~1s for these 551
+    // bytes). Pins the decode result; the corpus seed guards the time.
+    const SLOW_NESTED_MAP_KEYS_HEX: &str = "b5b5b5a20c00a20000a20900a2615b6161a20c60a200f48700a2004918acf4f50200a1816161184918acf5f48700818181406100a20900a2615b6161a20c60a200f48700a2004918acf4f50200a1816161184918acf5f487cd00818181406100a261406161a20c001ba20000b5b5a20c00a20000a20900a2615b6161a20c60a200f48700a2004918acf4f50200a1816161184918acf5f48700818181406100a20900a2615b6161a20c60a200f48700a2004918acf4f50200a1816161184918acf5f487cd00818181406100a261406161a20c001ba20000000000000000000000000000000000000000000000000000000000a20c00a20000a20900a2615b6161a20c60a200f48700a261406161a20a001ba20000000000000000000000000000000000000000000000000000000000a20c00a20000a20900a2615b6161a20c60a200f4870c60a200f48700a2004918acf4f50200a181f5f48700818181000000000000000000000000000000000000000000000000000000a20c00a20000a20900a2615b6161a20c60a200f48700a261406161a20a001ba20000000000000000000000000000000000000000000000000000000000a20c00a20000a20900a2615b6161a20c60a200f4870c60a200f48700a2004918acf4f50200a181f5f48700818181406100a261406161a20c001ba200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000066";
+
+    #[test]
+    fn hostile_nested_map_keys_decode_bounded() {
+        let data: Vec<u8> = (0..SLOW_NESTED_MAP_KEYS_HEX.len() / 2)
+            .map(|i| u8::from_str_radix(&SLOW_NESTED_MAP_KEYS_HEX[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(data.len(), 551);
+        assert!(decode(&data).is_err());
     }
 
     #[test]

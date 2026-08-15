@@ -7,3 +7,8 @@ stowq-implementation.md
 
 # pi agent
 /.pi
+
+# fuzzing
+/fuzz/target
+/fuzz/artifacts
+/fuzz/coverage

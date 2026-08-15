@@ -6,7 +6,7 @@
 //! without-the-digest)`. Decoding verifies the digest before any field is
 //! trusted and rejects unknown fields in v1.
 
-mod cbor;
+pub mod cbor;
 
 use cbor::Value;
 use sha2::{Digest as _, Sha256};

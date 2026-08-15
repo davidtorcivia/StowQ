@@ -1,0 +1,46 @@
+[package]
+name = "stowq-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+stowq-format = { path = "../crates/stowq-format" }
+stowq-keys = { path = "../crates/stowq-keys" }
+stowq-math = { path = "../crates/stowq-math" }
+
+[[bin]]
+name = "fuzz_key_parse"
+path = "fuzz_targets/fuzz_key_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_cbor_decode"
+path = "fuzz_targets/fuzz_cbor_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_record_roundtrip"
+path = "fuzz_targets/fuzz_record_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_record_construction"
+path = "fuzz_targets/fuzz_record_construction.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_bucket_arithmetic"
+path = "fuzz_targets/fuzz_bucket_arithmetic.rs"
+test = false
+doc = false
+
+[workspace]
