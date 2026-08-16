@@ -852,9 +852,10 @@ fn open_rejects_format_with_unknown_required_features() {
 
     let store = MemoryStore::new();
     let mut f = format();
-    f.required_feature_bits = 1;
+    // Bit 1 is known as of v1.1 (quarantine); bit 2 is not.
+    f.required_feature_bits = 2;
     // Write the record directly, bypassing init's validation: open must
-    // reject a v1 store whose FORMAT demands unknown features.
+    // reject a v1.1 store whose FORMAT demands unknown features.
     let tag = stowq_keys::key_tag(&[1; 16], "meta/FORMAT");
     let body = bytes::Bytes::from(stowq_format::encode(
         &stowq_format::Record::Format(f),

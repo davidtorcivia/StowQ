@@ -30,4 +30,5 @@ Normative. Corruption is never mixed with dead-letter policy.
 | 0x0012 | store_time_regression |
 | 0x0013 | receipt_evidence_mismatch |
 | 0x0014 | orphan_referenced_payload_missing |
+| 0x0015 | missing_generation (v1.1: a claim-chain gap) |
 | 0x0100-0xffff | implementation/private detail |

@@ -29,7 +29,7 @@ fields are omitted entirely. Unknown fields are rejected in v1;
 wrong queue is detected.
 
 Record types: `format`, `job`, `claim`, `fail`, `receipt`, `dead`,
-`watermark`.
+`watermark`, `quarantine` (v1.1, feature bit 1).
 
 ## Test vectors
 
@@ -71,6 +71,55 @@ f46c776f726b65725f746f6b656e5042424242424242424242424242424242716c656173
 
 record_digest
 `c9f5f3ee7144d8fa17ba93498f04c4548667aa9c895864fc85274ad08aeec1ca`.
+
+Quarantine (v1.1): qid `10` x16, source_key
+`claims/0001/101112131415161718191a1b1c1d1e1f/00000002`, reason
+`0x0010` (inadmissible_claim), observed_store_ns 5000, detail 2.
+
+```text
+871b53544f5751312d00010050000102030405060708090a0b0c0d0e0f480707070707
+07070708a56371696450101010101010101010101010101010106664657461696c0266
+726561736f6e106a736f757263655f6b65797835636c61696d732f303030312f313031
+31313231333134313531363137313831393161316231633164316531662f3030303030
+30303032716f627365727665645f73746f72655f6e7319138858209a9f89b5a1c7027b
+560c8b657b9e85dc2886e1e901c5c6d9bff9e7d423527107
+```
+
+record_digest
+`9a9f89b5a1c7027b560c8b657b9e85dc2886e1e901c5c6d9bff9e7d423527107`.
+
+## Quarantine record (v1.1)
+
+Gated by `required_feature_bits` bit 1. A durable audit finding written
+put-if-absent under `quarantine/<t-bucket>/<qid>`. Both the key and the
+body are deterministic per (queue, source, reason) so independent
+auditors converge byte-identically:
+
+```
+qid    = first 16 bytes of SHA256("StowQ-1-qid\0" || queue_id || rel_key || reason)
+bucket = floor(observed_store_ns / terminal_bucket_width)
+```
+
+Fields: `qid`, `source_key` (the RELATIVE key of the offending object),
+`reason` (quarantine registry), `observed_store_ns` (the source
+object's store time — not the finding time, so the body is
+deterministic), and optional `detail` (a reason-specific code, e.g. a
+generation number).
+
+Per-reason source conventions: grammar and corruption name the
+offending key with its own listing store time; a claim chain without
+its job names the job key with the chain tail's store time; an
+inadmissible claim names the offending claim; a duplicate terminal
+pair names the `receipts/` key with the receipt's store time; a chain
+gap names the missing generation's key with the predecessor's store
+time; a missing referenced payload (0x0014) names the payload key with
+the referencing job record's store time.
+
+Quarantine records are never collected by GC. A finding that is
+repaired and later recurs is not re-recorded (the key exists);
+administrative deletion of the quarantine record is the resolution
+path. Quarantine is not job-addressable: delivery and claim paths do
+not read it, and nothing about it changes delivery behavior.
 
 ## FORMAT record
 
