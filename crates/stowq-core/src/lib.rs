@@ -36,7 +36,7 @@ impl OpenOptions {
             worker_id: "worker-1".into(),
             retry: RetryPolicy::new(100, 60_000, true, None).expect("valid default policy"),
             skew_guard_ns: 0,
-            max_inline_payload: 4_096,
+            max_inline_payload: 65_536,
         }
     }
 }
