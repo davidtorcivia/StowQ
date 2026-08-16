@@ -20,7 +20,7 @@ is structural: no action does either.
   represent: ack and bury write different keys, both put-if-absent, so
   the pre-write checks minimize but cannot close it. A pair produced by
   the window is a repair-scan quarantine finding (see
-  ../recovery.md errata).
+  ../../spec/recovery.md errata).
 - `OutputsPrecedeReceipt`: a receipt implies its outputs exist — the
   commit rule's visibility half.
 - `ClaimsBoundedByTerminal`: within this model's horizon, claims never
