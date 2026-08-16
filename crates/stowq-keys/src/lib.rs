@@ -58,10 +58,14 @@ fn push_hex(out: &mut String, bytes: &[u8]) {
 
 /// shard = low log2(shard_count) bits of SHA256("StowQ-1-shard\0" ||
 /// queue_id || job_id), taken from the first 2 hash bytes.
-/// `shard_count` must be a power of two between 1 and 65536.
+/// `shard_count` must be a power of two between 1 and 65536 (enforced
+/// by FORMAT validation; the assert guards direct callers).
 pub fn compute_shard(queue_id: &[u8; 16], job_id: &[u8; 16], shard_count: u32) -> u16 {
+    assert!(
+        shard_count.is_power_of_two() && shard_count <= 65_536,
+        "shard_count must be a power of two up to 65536"
+    );
     let k = shard_count.trailing_zeros();
-    assert!(k <= 16, "shard_count must be at most 65536");
     let mut hasher = Sha256::new();
     hasher.update(b"StowQ-1-shard\0");
     hasher.update(queue_id);

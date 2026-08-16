@@ -169,7 +169,8 @@ not flag it.
 
 **Retry (nack)** — the holder PUTs `fails/<shard>/<job-id>/<g>`
 (put-if-absent) recording `reason`, `attempt`, and
-`retry_not_before = now_floor + backoff(attempt)` with full jitter. It then
+`retry_not_before = now_floor + backoff(attempt)` with jitter (the delay is
+drawn from the upper half of the exponential ceiling). It then
 best-effort writes the corresponding `delayed/` index. The next takeover
 claim's readiness check honors `retry_not_before`.
 

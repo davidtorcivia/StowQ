@@ -100,7 +100,6 @@ fn primitives_certification() {
         panic!()
     };
     let stale = stowq_store::Version("deadbeef".into());
-    let _ = &k2;
     assert_eq!(
         s.cas(&k2, Bytes::from_static(b"x"), digest(b"x"), &stale)
             .unwrap(),
@@ -135,6 +134,15 @@ fn primitives_certification() {
     // Ranged GET.
     let obj = s.get(&k2, Some(1..2)).unwrap();
     assert_eq!(&obj.body[..], b"2");
+    // An unsatisfiable range (start past EOF) is absence of the slice,
+    // matching the memory fake's out-of-bounds semantics.
+    assert_eq!(s.get(&k2, Some(5..6)).unwrap_err(), StoreError::NotFound);
+    // Zero-limit listing is an empty terminal page on every backend.
+    let zero = s
+        .list(&format!("conformance/prim/{run}/"), None, 0)
+        .unwrap();
+    assert!(zero.items.is_empty());
+    assert_eq!(zero.next_after, None);
 }
 
 /// The full queue lifecycle over the endpoint.

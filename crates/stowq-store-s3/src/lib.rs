@@ -79,6 +79,9 @@ fn status_of<E>(e: &SdkError<E>) -> Option<u16> {
 fn read_err<E>(e: SdkError<E>) -> StoreError {
     match status_of(&e) {
         Some(404) => StoreError::NotFound,
+        // An unsatisfiable range is absence of the requested slice,
+        // matching the memory fake's semantics for out-of-bounds reads.
+        Some(416) => StoreError::NotFound,
         Some(status) if status >= 500 => StoreError::OutcomeUnknown(Ambiguity::AmbiguousResponse),
         Some(_) => StoreError::ProfileViolation(format!("read rejected: {e}")),
         None => classify_send_err(&e),
@@ -259,6 +262,14 @@ impl ObjectStore for S3Store {
     }
 
     fn list(&self, prefix: &str, after: Option<&Key>, limit: usize) -> StoreResult<Page> {
+        if limit == 0 {
+            // The contract's zero-limit page is empty and terminal;
+            // S3 would otherwise return one key.
+            return Ok(Page {
+                items: Vec::new(),
+                next_after: None,
+            });
+        }
         self.runtime.block_on(async {
             let mut req = self
                 .client
