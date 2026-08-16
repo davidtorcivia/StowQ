@@ -6,6 +6,7 @@ use crate::{
     Digest, Key, Listing, Meta, Object, ObjectStore, Page, PutOutcome, StoreError, StoreResult,
     Version,
 };
+use async_trait::async_trait;
 use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -121,8 +122,14 @@ impl Default for MemoryStore {
     }
 }
 
+#[async_trait]
 impl ObjectStore for MemoryStore {
-    fn put_if_absent(&self, key: &Key, body: Bytes, sha256: Digest) -> StoreResult<PutOutcome> {
+    async fn put_if_absent(
+        &self,
+        key: &Key,
+        body: Bytes,
+        sha256: Digest,
+    ) -> StoreResult<PutOutcome> {
         Self::verify(&body, &sha256)?;
         let mut objects = self.objects.lock().unwrap();
         if objects.contains_key(&key.0) {
@@ -143,7 +150,7 @@ impl ObjectStore for MemoryStore {
         })
     }
 
-    fn cas(
+    async fn cas(
         &self,
         key: &Key,
         body: Bytes,
@@ -170,7 +177,7 @@ impl ObjectStore for MemoryStore {
         }
     }
 
-    fn get(&self, key: &Key, range: Option<Range<u64>>) -> StoreResult<Object> {
+    async fn get(&self, key: &Key, range: Option<Range<u64>>) -> StoreResult<Object> {
         let objects = self.objects.lock().unwrap();
         let stored = objects.get(&key.0).ok_or(StoreError::NotFound)?;
         let size = stored.body.len() as u64;
@@ -196,7 +203,7 @@ impl ObjectStore for MemoryStore {
         })
     }
 
-    fn head(&self, key: &Key) -> StoreResult<Meta> {
+    async fn head(&self, key: &Key) -> StoreResult<Meta> {
         let objects = self.objects.lock().unwrap();
         let stored = objects.get(&key.0).ok_or(StoreError::NotFound)?;
         Ok(Meta {
@@ -206,7 +213,7 @@ impl ObjectStore for MemoryStore {
         })
     }
 
-    fn list(&self, prefix: &str, after: Option<&Key>, limit: usize) -> StoreResult<Page> {
+    async fn list(&self, prefix: &str, after: Option<&Key>, limit: usize) -> StoreResult<Page> {
         let objects = self.objects.lock().unwrap();
         let mut items = Vec::new();
         let mut last_key = None;
@@ -219,7 +226,7 @@ impl ObjectStore for MemoryStore {
             if !k.starts_with(prefix) {
                 // Keys are sorted; a miss past the prefix range can stop
                 // the scan only when k > prefix's upper bound, but a
-                // simple starts_with filter is correct and cheap enough
+                // simple startsWith filter is correct and cheap enough
                 // for a fake.
                 continue;
             }
@@ -245,7 +252,7 @@ impl ObjectStore for MemoryStore {
         })
     }
 
-    fn delete(&self, key: &Key) -> StoreResult<()> {
+    async fn delete(&self, key: &Key) -> StoreResult<()> {
         self.objects.lock().unwrap().remove(&key.0);
         Ok(())
     }
@@ -261,41 +268,45 @@ mod tests {
         h.finalize().into()
     }
 
-    #[test]
-    fn put_if_absent_first_wins() {
+    #[tokio::test]
+    async fn put_if_absent_first_wins() {
         let store = MemoryStore::new();
         let k = Key::new("jobs/0001/a");
         let a = store
             .put_if_absent(&k, Bytes::from_static(b"one"), digest(b"one"))
+            .await
             .unwrap();
         let b = store
             .put_if_absent(&k, Bytes::from_static(b"two"), digest(b"two"))
+            .await
             .unwrap();
         assert!(matches!(a, PutOutcome::Committed { .. }));
         assert_eq!(b, PutOutcome::Rejected);
-        assert_eq!(store.get(&k, None).unwrap().body, &b"one"[..]);
+        assert_eq!(store.get(&k, None).await.unwrap().body, &b"one"[..]);
     }
 
-    #[test]
-    fn put_rejects_digest_mismatch_without_writing() {
+    #[tokio::test]
+    async fn put_rejects_digest_mismatch_without_writing() {
         let store = MemoryStore::new();
         let k = Key::new("jobs/0001/a");
         let err = store
             .put_if_absent(&k, Bytes::from_static(b"one"), digest(b"other"))
+            .await
             .unwrap_err();
         assert_eq!(
             err,
             StoreError::IntegrityViolation(crate::IntegrityKind::DigestMismatch)
         );
-        assert_eq!(store.head(&k).unwrap_err(), StoreError::NotFound);
+        assert_eq!(store.head(&k).await.unwrap_err(), StoreError::NotFound);
     }
 
-    #[test]
-    fn cas_requires_matching_version() {
+    #[tokio::test]
+    async fn cas_requires_matching_version() {
         let store = MemoryStore::new();
         let k = Key::new("meta/watermark");
         let PutOutcome::Committed { version } = store
             .put_if_absent(&k, Bytes::from_static(b"v1"), digest(b"v1"))
+            .await
             .unwrap()
         else {
             panic!("first put must commit");
@@ -304,21 +315,23 @@ mod tests {
         assert_eq!(
             store
                 .cas(&k, Bytes::from_static(b"x"), digest(b"x"), &stale)
+                .await
                 .unwrap(),
             PutOutcome::Rejected
         );
         let ok = store
             .cas(&k, Bytes::from_static(b"v2"), digest(b"v2"), &version)
+            .await
             .unwrap();
         let PutOutcome::Committed { version: v2 } = ok else {
             panic!("cas must commit");
         };
         assert_ne!(version, v2);
-        assert_eq!(store.get(&k, None).unwrap().body, &b"v2"[..]);
+        assert_eq!(store.get(&k, None).await.unwrap().body, &b"v2"[..]);
     }
 
-    #[test]
-    fn cas_missing_key_is_not_found() {
+    #[tokio::test]
+    async fn cas_missing_key_is_not_found() {
         let store = MemoryStore::new();
         let err = store
             .cas(
@@ -327,48 +340,55 @@ mod tests {
                 digest(b"v"),
                 &Version("1".into()),
             )
+            .await
             .unwrap_err();
         assert_eq!(err, StoreError::NotFound);
     }
 
-    #[test]
-    fn store_times_are_strictly_monotone() {
+    #[tokio::test]
+    async fn store_times_are_strictly_monotone() {
         let store = MemoryStore::new();
-        let times: Vec<u64> = (0..5)
-            .map(|i| {
+        let times: Vec<u64> = {
+            let mut v = Vec::new();
+            for i in 0..5 {
                 let k = Key::new(format!("jobs/0001/{i}"));
                 store
                     .put_if_absent(&k, Bytes::from_static(b"x"), digest(b"x"))
+                    .await
                     .unwrap();
-                store.head(&k).unwrap().store_time_ns
-            })
-            .collect();
+                v.push(store.head(&k).await.unwrap().store_time_ns);
+            }
+            v
+        };
         assert!(times.windows(2).all(|w| w[0] < w[1]));
     }
 
-    #[test]
-    fn advance_clock_raises_and_never_lowers() {
+    #[tokio::test]
+    async fn advance_clock_raises_and_never_lowers() {
         let store = MemoryStore::with_tick_step_ns(10);
         let k1 = Key::new("a");
         store
             .put_if_absent(&k1, Bytes::from_static(b"x"), digest(b"x"))
+            .await
             .unwrap();
-        let t1 = store.head(&k1).unwrap().store_time_ns;
+        let t1 = store.head(&k1).await.unwrap().store_time_ns;
         // Advancing above the clock pins the next write past it.
         store.advance_clock_to(t1 + 1000);
         let k2 = Key::new("b");
         store
             .put_if_absent(&k2, Bytes::from_static(b"x"), digest(b"x"))
+            .await
             .unwrap();
-        let t2 = store.head(&k2).unwrap().store_time_ns;
+        let t2 = store.head(&k2).await.unwrap().store_time_ns;
         assert!(t2 > t1 + 1000, "t2 {t2} must exceed the advanced clock");
         // Advancing below the clock is ignored.
         store.advance_clock_to(t1);
         let k3 = Key::new("c");
         store
             .put_if_absent(&k3, Bytes::from_static(b"x"), digest(b"x"))
+            .await
             .unwrap();
-        assert!(store.head(&k3).unwrap().store_time_ns > t2);
+        assert!(store.head(&k3).await.unwrap().store_time_ns > t2);
     }
 
     #[test]
@@ -377,27 +397,29 @@ mod tests {
         let _ = MemoryStore::with_tick_step_ns(0);
     }
 
-    #[test]
-    fn overwrite_gets_a_new_time_and_version() {
+    #[tokio::test]
+    async fn overwrite_gets_a_new_time_and_version() {
         let store = MemoryStore::new();
         let k = Key::new("meta/watermark");
         let PutOutcome::Committed { version } = store
             .put_if_absent(&k, Bytes::from_static(b"1"), digest(b"1"))
+            .await
             .unwrap()
         else {
             panic!()
         };
-        let t1 = store.head(&k).unwrap().store_time_ns;
+        let t1 = store.head(&k).await.unwrap().store_time_ns;
         store
             .cas(&k, Bytes::from_static(b"2"), digest(b"2"), &version)
+            .await
             .unwrap();
-        let meta = store.head(&k).unwrap();
+        let meta = store.head(&k).await.unwrap();
         assert!(meta.store_time_ns > t1);
         assert_eq!(meta.version, Version("2".into()));
     }
 
-    #[test]
-    fn list_paginates_in_lexicographic_order() {
+    #[tokio::test]
+    async fn list_paginates_in_lexicographic_order() {
         let store = MemoryStore::new();
         for name in [
             "claims/0001/a/1",
@@ -408,36 +430,38 @@ mod tests {
             let k = Key::new(name);
             store
                 .put_if_absent(&k, Bytes::from_static(b"x"), digest(b"x"))
+                .await
                 .unwrap();
         }
-        let page1 = store.list("claims/", None, 2).unwrap();
+        let page1 = store.list("claims/", None, 2).await.unwrap();
         assert_eq!(page1.items.len(), 2);
         assert_eq!(page1.items[0].key.as_str(), "claims/0001/a/1");
         assert_eq!(page1.items[1].key.as_str(), "claims/0001/a/2");
         let after = page1.next_after.clone().unwrap();
-        let page2 = store.list("claims/", Some(&after), 2).unwrap();
+        let page2 = store.list("claims/", Some(&after), 2).await.unwrap();
         assert_eq!(page2.items.len(), 1);
         assert_eq!(page2.items[0].key.as_str(), "claims/0001/a/3");
         assert_eq!(page2.next_after, None);
     }
 
-    #[test]
-    fn list_after_excludes_the_marker() {
+    #[tokio::test]
+    async fn list_after_excludes_the_marker() {
         let store = MemoryStore::new();
         for i in 1..=3 {
             let k = Key::new(format!("claims/0001/a/{i}"));
             store
                 .put_if_absent(&k, Bytes::from_static(b"x"), digest(b"x"))
+                .await
                 .unwrap();
         }
         let after = Key::new("claims/0001/a/1");
-        let page = store.list("claims/", Some(&after), 10).unwrap();
+        let page = store.list("claims/", Some(&after), 10).await.unwrap();
         assert_eq!(page.items.len(), 2);
         assert_eq!(page.items[0].key.as_str(), "claims/0001/a/2");
     }
 
-    #[test]
-    fn get_range_slices() {
+    #[tokio::test]
+    async fn get_range_slices() {
         let store = MemoryStore::new();
         let k = Key::new("payloads/a/d");
         store
@@ -446,18 +470,19 @@ mod tests {
                 Bytes::from_static(b"hello stowq"),
                 digest(b"hello stowq"),
             )
+            .await
             .unwrap();
-        let obj = store.get(&k, Some(6..11)).unwrap();
+        let obj = store.get(&k, Some(6..11)).await.unwrap();
         assert_eq!(obj.body, &b"stowq"[..]);
         assert_eq!(obj.meta.size, 11);
         assert_eq!(
-            store.get(&k, Some(5..12)).unwrap_err(),
+            store.get(&k, Some(5..12)).await.unwrap_err(),
             StoreError::NotFound
         );
     }
 
-    #[test]
-    fn get_range_rejects_bad_bounds() {
+    #[tokio::test]
+    async fn get_range_rejects_bad_bounds() {
         let store = MemoryStore::new();
         let k = Key::new("payloads/a/d");
         store
@@ -466,53 +491,62 @@ mod tests {
                 Bytes::from_static(b"hello stowq"),
                 digest(b"hello stowq"),
             )
+            .await
             .unwrap();
         // The range contract is start < end <= size: empty, inverted,
         // and past-EOF ranges are all absence.
-        assert_eq!(store.get(&k, Some(5..5)).unwrap_err(), StoreError::NotFound);
         assert_eq!(
-            store.get(&k, Some(11..11)).unwrap_err(),
+            store.get(&k, Some(5..5)).await.unwrap_err(),
             StoreError::NotFound
         );
         assert_eq!(
-            store.get(&k, Some(12..12)).unwrap_err(),
+            store.get(&k, Some(11..11)).await.unwrap_err(),
             StoreError::NotFound
         );
         assert_eq!(
-            store.get(&k, Some(Range { start: 5, end: 2 })).unwrap_err(),
+            store.get(&k, Some(12..12)).await.unwrap_err(),
             StoreError::NotFound
         );
         assert_eq!(
-            store.get(&k, Some(0..12)).unwrap_err(),
+            store
+                .get(&k, Some(Range { start: 5, end: 2 }))
+                .await
+                .unwrap_err(),
+            StoreError::NotFound
+        );
+        assert_eq!(
+            store.get(&k, Some(0..12)).await.unwrap_err(),
             StoreError::NotFound
         );
         // The boundary end == size returns the tail through EOF.
-        let obj = store.get(&k, Some(6..11)).unwrap();
+        let obj = store.get(&k, Some(6..11)).await.unwrap();
         assert_eq!(&obj.body[..], b"stowq");
         assert_eq!(obj.meta.size, 11);
     }
 
-    #[test]
-    fn list_with_limit_zero_is_empty_and_terminal() {
+    #[tokio::test]
+    async fn list_with_limit_zero_is_empty_and_terminal() {
         let store = MemoryStore::new();
         let k = Key::new("claims/0001/a/1");
         store
             .put_if_absent(&k, Bytes::from_static(b"x"), digest(b"x"))
+            .await
             .unwrap();
-        let page = store.list("claims/", None, 0).unwrap();
+        let page = store.list("claims/", None, 0).await.unwrap();
         assert!(page.items.is_empty());
         assert_eq!(page.next_after, None);
     }
 
-    #[test]
-    fn delete_is_idempotent() {
+    #[tokio::test]
+    async fn delete_is_idempotent() {
         let store = MemoryStore::new();
         let k = Key::new("jobs/0001/a");
         store
             .put_if_absent(&k, Bytes::from_static(b"x"), digest(b"x"))
+            .await
             .unwrap();
-        store.delete(&k).unwrap();
-        store.delete(&k).unwrap();
-        assert_eq!(store.head(&k).unwrap_err(), StoreError::NotFound);
+        store.delete(&k).await.unwrap();
+        store.delete(&k).await.unwrap();
+        assert_eq!(store.head(&k).await.unwrap_err(), StoreError::NotFound);
     }
 }

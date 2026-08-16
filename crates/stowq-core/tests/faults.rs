@@ -18,7 +18,7 @@ fn format() -> FormatRecord {
     }
 }
 
-fn queue_with(plans: Vec<FaultPlan>) -> Queue {
+async fn queue_with(plans: Vec<FaultPlan>) -> Queue {
     let injector = Injector::new(MemoryStore::new(), plans);
     Queue::init(
         Box::new(injector),
@@ -26,6 +26,7 @@ fn queue_with(plans: Vec<FaultPlan>) -> Queue {
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap()
 }
 
@@ -37,14 +38,15 @@ fn claim_opts(floor_ns: u64) -> ClaimOptions {
     }
 }
 
-#[test]
-fn pre_transmit_fault_on_enqueue_retries_transparently() {
+#[tokio::test]
+async fn pre_transmit_fault_on_enqueue_retries_transparently() {
     // Call 0 is FORMAT's put during init; the job put is index 1.
     let q = queue_with(vec![FaultPlan::new(
         Op::PutIfAbsent,
         Fault::PreTransmit,
         [1],
-    )]);
+    )])
+    .await;
     let mut budget = OpBudget::new(64);
     let out = q
         .enqueue(
@@ -57,17 +59,19 @@ fn pre_transmit_fault_on_enqueue_retries_transparently() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
     assert!(matches!(out, EnqueueOutcome::Committed { .. }));
 }
 
-#[test]
-fn unknown_absent_on_enqueue_retries_to_commit() {
+#[tokio::test]
+async fn unknown_absent_on_enqueue_retries_to_commit() {
     let q = queue_with(vec![FaultPlan::new(
         Op::PutIfAbsent,
         Fault::PostTransmit,
         [1],
-    )]);
+    )])
+    .await;
     let mut budget = OpBudget::new(64);
     let out = q
         .enqueue(
@@ -80,17 +84,19 @@ fn unknown_absent_on_enqueue_retries_to_commit() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
     assert!(matches!(out, EnqueueOutcome::Committed { .. }));
 }
 
-#[test]
-fn unknown_committed_on_enqueue_resolves_to_committed() {
+#[tokio::test]
+async fn unknown_committed_on_enqueue_resolves_to_committed() {
     let q = queue_with(vec![FaultPlan::new(
         Op::PutIfAbsent,
         Fault::PostTransmitAfter,
         [1],
-    )]);
+    )])
+    .await;
     let mut budget = OpBudget::new(64);
     let out = q
         .enqueue(
@@ -103,6 +109,7 @@ fn unknown_committed_on_enqueue_resolves_to_committed() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
     // The resolver reads the key back, finds our record, reports
     // committed; a blind retry would also be safe but is not needed.
@@ -112,11 +119,11 @@ fn unknown_committed_on_enqueue_resolves_to_committed() {
         (0..16).map(|_| format!("{:02x}", 3u8)).collect::<String>()
     ));
     let store = q.store();
-    assert!(store.head(&job_key).is_ok());
+    assert!(store.head(&job_key).await.is_ok());
 }
 
-#[test]
-fn unknown_committed_on_claim_resolves_to_claimed() {
+#[tokio::test]
+async fn unknown_committed_on_claim_resolves_to_claimed() {
     // Put calls so far: FORMAT(0), job(1); the claim put is index 2.
     let injector = Injector::new(
         MemoryStore::new(),
@@ -132,6 +139,7 @@ fn unknown_committed_on_claim_resolves_to_claimed() {
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
     let mut budget = OpBudget::new(64);
     q.enqueue(
@@ -144,8 +152,9 @@ fn unknown_committed_on_claim_resolves_to_claimed() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
-    let claimed = q.claim(&claim_opts(0), &mut budget).unwrap();
+    let claimed = q.claim(&claim_opts(0), &mut budget).await.unwrap();
     match claimed {
         stowq_core::ClaimOutcome::Claimed(claim) => {
             assert_eq!(claim.generation, 1);
@@ -154,8 +163,8 @@ fn unknown_committed_on_claim_resolves_to_claimed() {
     }
 }
 
-#[test]
-fn put_outcome_helper_types_still_behind_trait() {
+#[tokio::test]
+async fn put_outcome_helper_types_still_behind_trait() {
     // Sanity: the injector passes clean runs through untouched.
     let injector = Injector::new(MemoryStore::new(), vec![]);
     let key = stowq_store::Key::new("k");
@@ -163,13 +172,14 @@ fn put_outcome_helper_types_still_behind_trait() {
     assert!(matches!(
         injector
             .put_if_absent(&key, bytes::Bytes::from_static(b"v"), digest)
+            .await
             .unwrap(),
         PutOutcome::Committed { .. }
     ));
 }
 
-#[test]
-fn transport_on_resolution_read_retries_to_resolve() {
+#[tokio::test]
+async fn transport_on_resolution_read_retries_to_resolve() {
     // Job put (call 1) is committed-but-response-lost; the first
     // resolution HEAD (call 0) fails pre-transmit and is retried.
     let injector = Injector::new(
@@ -185,6 +195,7 @@ fn transport_on_resolution_read_retries_to_resolve() {
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
     let mut budget = OpBudget::new(64);
     let out = q
@@ -198,12 +209,13 @@ fn transport_on_resolution_read_retries_to_resolve() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
     assert!(matches!(out, EnqueueOutcome::Committed { .. }));
 }
 
-#[test]
-fn watermark_unknown_outcome_resolves() {
+#[tokio::test]
+async fn watermark_unknown_outcome_resolves() {
     // Fault the watermark's creating put (PostTransmitAfter): the write
     // commits but the response is lost; the resolver must re-read and
     // confirm coverage. Call 0 is FORMAT's put; call 1 is the beacon's
@@ -222,16 +234,17 @@ fn watermark_unknown_outcome_resolves() {
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
     let mut budget = OpBudget::new(64);
-    let floor = q.establish_floor(&mut budget).unwrap();
-    q.advance_watermark(floor, &mut budget).unwrap();
-    let w = q.watermark(&mut budget).unwrap().unwrap();
+    let floor = q.establish_floor(&mut budget).await.unwrap();
+    q.advance_watermark(floor, &mut budget).await.unwrap();
+    let w = q.watermark(&mut budget).await.unwrap().unwrap();
     assert_eq!(w.highest_observed_wall_bucket, floor / 1_000);
 }
 
-#[test]
-fn detached_payload_unknown_outcome_resolves() {
+#[tokio::test]
+async fn detached_payload_unknown_outcome_resolves() {
     // Put calls: FORMAT(0) during init, payload(1) during enqueue. The
     // payload write is committed-but-response-lost: enqueue must
     // resolve by presence (the key embeds the digest) and the payload
@@ -246,7 +259,9 @@ fn detached_payload_unknown_outcome_resolves() {
     );
     let mut opts = OpenOptions::new([1; 16]);
     opts.max_inline_payload = 4;
-    let q = Queue::init(Box::new(injector), "q", &opts, &format()).unwrap();
+    let q = Queue::init(Box::new(injector), "q", &opts, &format())
+        .await
+        .unwrap();
     let mut budget = OpBudget::new(64);
     let out = q
         .enqueue(
@@ -259,12 +274,14 @@ fn detached_payload_unknown_outcome_resolves() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
     assert!(matches!(out, EnqueueOutcome::Committed { .. }));
     let jhex: String = (0..16).map(|_| "03").collect::<String>();
     let page = q
         .store()
         .list(&format!("q/payloads/{jhex}/"), None, 10)
+        .await
         .unwrap();
     assert!(
         !page.items.is_empty(),
@@ -272,8 +289,8 @@ fn detached_payload_unknown_outcome_resolves() {
     );
 }
 
-#[test]
-fn head_unknown_during_payload_resolution_retries() {
+#[tokio::test]
+async fn head_unknown_during_payload_resolution_retries() {
     // The payload put (call 1) is committed-but-response-lost; the
     // resolution head (call 0) itself returns outcome-unknown. Reads
     // have no side effects, so the probe retries and the enqueue
@@ -287,7 +304,9 @@ fn head_unknown_during_payload_resolution_retries() {
     );
     let mut opts = OpenOptions::new([1; 16]);
     opts.max_inline_payload = 4;
-    let q = Queue::init(Box::new(injector), "q", &opts, &format()).unwrap();
+    let q = Queue::init(Box::new(injector), "q", &opts, &format())
+        .await
+        .unwrap();
     let mut budget = OpBudget::new(64);
     let out = q
         .enqueue(
@@ -300,12 +319,13 @@ fn head_unknown_during_payload_resolution_retries() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
     assert!(matches!(out, EnqueueOutcome::Committed { .. }));
 }
 
-#[test]
-fn read_unknown_during_reack_verification_retries() {
+#[tokio::test]
+async fn read_unknown_during_reack_verification_retries() {
     // A committed receipt, then a re-ack whose verification GET (Get
     // call 2, after the FORMAT and job-record reads) returns
     // outcome-unknown: the retry reads the receipt and verifies as
@@ -320,6 +340,7 @@ fn read_unknown_during_reack_verification_retries() {
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
     let mut budget = OpBudget::new(128);
     q.enqueue(
@@ -332,6 +353,7 @@ fn read_unknown_during_reack_verification_retries() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) = q
         .claim(
@@ -342,22 +364,23 @@ fn read_unknown_during_reack_verification_retries() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!("claim")
     };
     assert_eq!(
-        q.ack(&claim, &mut budget).unwrap(),
+        q.ack(&claim, &mut budget).await.unwrap(),
         stowq_core::AckOutcome::Acked
     );
     assert_eq!(
-        q.ack(&claim, &mut budget).unwrap(),
+        q.ack(&claim, &mut budget).await.unwrap(),
         stowq_core::AckOutcome::AlreadyAcked
     );
 }
 
-#[test]
-fn watermark_resolution_read_unknown_retries() {
+#[tokio::test]
+async fn watermark_resolution_read_unknown_retries() {
     // The watermark create (Put call 2) is committed-but-response-lost;
     // the resolution read that follows (Get call 3, after open's FORMAT
     // read, establish_floor's watermark check, and the CAS loop's own
@@ -376,16 +399,17 @@ fn watermark_resolution_read_unknown_retries() {
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
     let mut budget = OpBudget::new(64);
-    let floor = q.establish_floor(&mut budget).unwrap();
-    q.advance_watermark(floor, &mut budget).unwrap();
-    let w = q.watermark(&mut budget).unwrap().unwrap();
+    let floor = q.establish_floor(&mut budget).await.unwrap();
+    q.advance_watermark(floor, &mut budget).await.unwrap();
+    let w = q.watermark(&mut budget).await.unwrap().unwrap();
     assert_eq!(w.highest_observed_wall_bucket, floor / 1_000);
 }
 
-#[test]
-fn init_rejected_branch_read_unknown_retries() {
+#[tokio::test]
+async fn init_rejected_branch_read_unknown_retries() {
     // An identical FORMAT already owns the prefix (init by another
     // participant): the put rejects and init reads the existing record
     // back to compare. That read (Get call 0) returns outcome-unknown;
@@ -397,6 +421,7 @@ fn init_rejected_branch_read_unknown_retries() {
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
     drop(pre);
     let injector = Injector::new(
@@ -409,5 +434,6 @@ fn init_rejected_branch_read_unknown_retries() {
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
 }

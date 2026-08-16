@@ -39,7 +39,7 @@ impl Handle {
     /// payloads come from the record itself; detached payloads are
     /// fetched by key and hash-checked. A mismatch is an error, never
     /// an empty inline claim.
-    pub fn to_claim(&self, store: &MemoryStore, queue: &str) -> Result<Claim, String> {
+    pub async fn to_claim(&self, store: &MemoryStore, queue: &str) -> Result<Claim, String> {
         let decode = |s: &str| -> Result<Vec<u8>, String> {
             (0..s.len() / 2)
                 .map(|i| {
@@ -65,6 +65,7 @@ impl Handle {
             queue,
             store,
         )
+        .await
         .map_err(|e| e.to_string())
     }
 }
@@ -147,7 +148,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, std::io::Error> {
         .collect()
 }
 
-pub fn inspect(
+pub async fn inspect(
     store: &dyn ObjectStore,
     queue: &str,
     job_id: [u8; 16],
@@ -162,7 +163,7 @@ pub fn inspect(
         format!("{queue}/dead/{shard:04x}/{h}"),
     ];
     for k in keys {
-        match store.head(&Key::new(k.clone())) {
+        match store.head(&Key::new(k.clone())).await {
             Ok(_) => lines.push(format!("{k}: present")),
             Err(StoreError::NotFound) => lines.push(format!("{k}: absent")),
             Err(e) => return Err(e.to_string()),
@@ -173,6 +174,7 @@ pub fn inspect(
     loop {
         let page = store
             .list(&claims_prefix, after.as_ref(), 64)
+            .await
             .map_err(|e| e.to_string())?;
         if page.items.is_empty() {
             break;

@@ -51,12 +51,15 @@ enum Step {
 }
 
 /// Checks the structural invariants of one job in the store.
-fn check_invariants(q: &Queue, jobs: usize, _step_index: usize) {
+async fn check_invariants(q: &Queue, jobs: usize, _step_index: usize) {
     for j in 0..jobs {
         let id = job_id(j);
         let h = jhex(id);
-        let receipt = q.store().head(&Key::new(format!("q/receipts/0000/{h}")));
-        let dead = q.store().head(&Key::new(format!("q/dead/0000/{h}")));
+        let receipt = q
+            .store()
+            .head(&Key::new(format!("q/receipts/0000/{h}")))
+            .await;
+        let dead = q.store().head(&Key::new(format!("q/dead/0000/{h}"))).await;
         // At most one terminal record.
         if receipt.is_ok() && dead.is_ok() {
             panic!("job {j}: both receipt and dead exist");
@@ -66,7 +69,7 @@ fn check_invariants(q: &Queue, jobs: usize, _step_index: usize) {
         let mut after: Option<Key> = None;
         let mut gens: Vec<u64> = Vec::new();
         loop {
-            let page = q.store().list(&prefix, after.as_ref(), 64).unwrap();
+            let page = q.store().list(&prefix, after.as_ref(), 64).await.unwrap();
             if page.items.is_empty() {
                 break;
             }
@@ -98,13 +101,15 @@ fn check_invariants(q: &Queue, jobs: usize, _step_index: usize) {
 /// Runs one seeded interleaving. Workers hold real claims; the
 /// scheduler picks which worker acts each step. Invariants are checked
 /// after every step.
-pub fn run_interleaving(seed: u64, jobs: usize, steps: usize) {
+pub async fn run_interleaving(seed: u64, jobs: usize, steps: usize) {
     let store = MemoryStore::new();
     let mut queues: Vec<Queue> = Vec::new();
     for w in 0..2 {
         let mut opts = OpenOptions::new([1; 16]);
         opts.worker_id = format!("worker-{w}");
-        let q = Queue::init(Box::new(store.clone()), "q", &opts, &format()).unwrap();
+        let q = Queue::init(Box::new(store.clone()), "q", &opts, &format())
+            .await
+            .unwrap();
         queues.push(q);
     }
     // init happened twice over the shared store; the second put was
@@ -143,6 +148,7 @@ pub fn run_interleaving(seed: u64, jobs: usize, steps: usize) {
                         },
                         &mut budget,
                     )
+                    .await
                     .unwrap();
             }
             Step::Claim => {
@@ -152,7 +158,7 @@ pub fn run_interleaving(seed: u64, jobs: usize, steps: usize) {
                     floor_ns: clock,
                     lease_duration_ns: 1_000,
                 };
-                if let ClaimOutcome::Claimed(c) = q.claim(&opts, &mut budget).unwrap() {
+                if let ClaimOutcome::Claimed(c) = q.claim(&opts, &mut budget).await.unwrap() {
                     let j = claimed_index(&c);
                     // A committed claim proves the previous lease ended:
                     // any other worker's handle for this job is a zombie
@@ -177,14 +183,14 @@ pub fn run_interleaving(seed: u64, jobs: usize, steps: usize) {
             }
             Step::Renew(j) => {
                 let claim = held[worker][j].clone().unwrap();
-                match q.renew(&claim, &mut budget).unwrap() {
+                match q.renew(&claim, &mut budget).await.unwrap() {
                     RenewOutcome::Renewed(renewed) => held[worker][j] = Some(renewed),
                     RenewOutcome::LeaseLost => held[worker][j] = None,
                 }
             }
             Step::Ack(j) => {
                 let claim = held[worker][j].take().unwrap();
-                let out = q.ack(&claim, &mut budget).unwrap();
+                let out = q.ack(&claim, &mut budget).await.unwrap();
                 assert!(matches!(
                     out,
                     AckOutcome::Acked | AckOutcome::AlreadyAcked | AckOutcome::SupersededByDead
@@ -192,14 +198,14 @@ pub fn run_interleaving(seed: u64, jobs: usize, steps: usize) {
             }
             Step::Bury(j) => {
                 let claim = held[worker][j].take().unwrap();
-                q.bury(&claim, 0x0003, &mut budget).unwrap();
+                q.bury(&claim, 0x0003, &mut budget).await.unwrap();
             }
             Step::AdvanceClock(to) => {
                 clock = clock.max(to);
                 store.advance_clock_to(to);
             }
         }
-        check_invariants(&queues[0], jobs, step);
+        check_invariants(&queues[0], jobs, step).await;
     }
 }
 
@@ -213,25 +219,30 @@ fn claimed_index(c: &Claim) -> usize {
 mod tests {
     use super::*;
 
-    #[test]
-    fn interleaving_corpus_green() {
+    #[tokio::test]
+    async fn interleaving_corpus_green() {
         for seed in 1..=25u64 {
-            run_interleaving(seed, 3, 150);
+            run_interleaving(seed, 3, 150).await;
         }
     }
 
     /// Zombie ack race: worker A claims, expires; worker B takes over;
     /// A acks late. At most one terminal record must exist.
-    #[test]
-    fn adversarial_zombie_ack_race() {
+    #[tokio::test]
+    async fn adversarial_zombie_ack_race() {
         let store = MemoryStore::new();
         let mk = |w: usize| {
             let mut opts = OpenOptions::new([1; 16]);
             opts.worker_id = format!("z{w}");
-            Queue::init(Box::new(store.clone()), "q", &opts, &format()).unwrap()
+            let store = store.clone();
+            async move {
+                Queue::init(Box::new(store), "q", &opts, &format())
+                    .await
+                    .unwrap()
+            }
         };
-        let qa = mk(0);
-        let qb = mk(1);
+        let qa = mk(0).await;
+        let qb = mk(1).await;
         let mut b = OpBudget::new(256);
         qa.enqueue(
             EnqueueInput {
@@ -243,6 +254,7 @@ mod tests {
             },
             &mut b,
         )
+        .await
         .unwrap();
         let a_claim = match qa
             .claim(
@@ -253,6 +265,7 @@ mod tests {
                 },
                 &mut b,
             )
+            .await
             .unwrap()
         {
             ClaimOutcome::Claimed(c) => c,
@@ -269,6 +282,7 @@ mod tests {
                 },
                 &mut b,
             )
+            .await
             .unwrap()
         {
             ClaimOutcome::Claimed(c) => c,
@@ -277,10 +291,10 @@ mod tests {
         assert_eq!(b_claim.generation, a_claim.generation + 1);
         // Zombie A acks late: accepted (first terminal wins), must not
         // produce a second terminal record, and must fence B's custody.
-        let _ = qa.ack(&a_claim, &mut b).unwrap();
-        check_invariants(&qa, 1, 0);
+        let _ = qa.ack(&a_claim, &mut b).await.unwrap();
+        check_invariants(&qa, 1, 0).await;
         // The receipt terminalizes the job: B cannot renew.
-        let renewed = qb.renew(&b_claim, &mut b).unwrap();
+        let renewed = qb.renew(&b_claim, &mut b).await.unwrap();
         assert!(
             matches!(renewed, RenewOutcome::LeaseLost),
             "receipt must fence the live claim's renewal"
@@ -289,25 +303,30 @@ mod tests {
         // evidence while B holds generation 2, so the idempotent-verify
         // fails the generation check and errors (quarantine finding
         // 0x0013). The job is terminal either way; no second record.
-        let out = qb.ack(&b_claim, &mut b);
+        let out = qb.ack(&b_claim, &mut b).await;
         assert!(
             matches!(out, Err(stowq_core::Error::ReceiptEvidenceMismatch)),
             "cross-generation ack must fail the receipt evidence check"
         );
-        check_invariants(&qa, 1, 1);
+        check_invariants(&qa, 1, 1).await;
     }
 
     /// Renewal vs takeover race at the same next generation.
-    #[test]
-    fn adversarial_renewal_vs_takeover() {
+    #[tokio::test]
+    async fn adversarial_renewal_vs_takeover() {
         let store = MemoryStore::new();
         let mk = |w: usize| {
             let mut opts = OpenOptions::new([1; 16]);
             opts.worker_id = format!("r{w}");
-            Queue::init(Box::new(store.clone()), "q", &opts, &format()).unwrap()
+            let store = store.clone();
+            async move {
+                Queue::init(Box::new(store), "q", &opts, &format())
+                    .await
+                    .unwrap()
+            }
         };
-        let qa = mk(0);
-        let qb = mk(1);
+        let qa = mk(0).await;
+        let qb = mk(1).await;
         let mut b = OpBudget::new(256);
         qa.enqueue(
             EnqueueInput {
@@ -319,6 +338,7 @@ mod tests {
             },
             &mut b,
         )
+        .await
         .unwrap();
         let a = match qa
             .claim(
@@ -329,13 +349,14 @@ mod tests {
                 },
                 &mut b,
             )
+            .await
             .unwrap()
         {
             ClaimOutcome::Claimed(c) => c,
             ClaimOutcome::Empty => panic!("claim"),
         };
         // Renewal wins generation 2...
-        let RenewOutcome::Renewed(renewed) = qa.renew(&a, &mut b).unwrap() else {
+        let RenewOutcome::Renewed(renewed) = qa.renew(&a, &mut b).await.unwrap() else {
             panic!("renew")
         };
         assert_eq!(renewed.generation, 2);
@@ -352,28 +373,34 @@ mod tests {
                 },
                 &mut b,
             )
+            .await
             .unwrap();
         assert!(
             matches!(raced, ClaimOutcome::Empty),
             "within-lease takeover must be refused"
         );
-        check_invariants(&qa, 1, 0);
+        check_invariants(&qa, 1, 0).await;
     }
 
     /// Sweeper idempotence, sequentially: a second sweep over the
     /// pruned index consumes nothing. (The lab cannot interleave inside
     /// an operation; concurrent safety rests on idempotent deletes and
     /// authoritative re-verification.)
-    #[test]
-    fn sequential_sweeper_idempotence() {
+    #[tokio::test]
+    async fn sequential_sweeper_idempotence() {
         let store = MemoryStore::new();
         let mk = |w: usize| {
             let mut opts = OpenOptions::new([1; 16]);
             opts.worker_id = format!("s{w}");
-            Queue::init(Box::new(store.clone()), "q", &opts, &format()).unwrap()
+            let store = store.clone();
+            async move {
+                Queue::init(Box::new(store), "q", &opts, &format())
+                    .await
+                    .unwrap()
+            }
         };
-        let q1 = mk(0);
-        let q2 = mk(1);
+        let q1 = mk(0).await;
+        let q2 = mk(1).await;
         let mut b = OpBudget::new(512);
         q1.enqueue(
             EnqueueInput {
@@ -385,6 +412,7 @@ mod tests {
             },
             &mut b,
         )
+        .await
         .unwrap();
         let claim = match q1
             .claim(
@@ -395,6 +423,7 @@ mod tests {
                 },
                 &mut b,
             )
+            .await
             .unwrap()
         {
             ClaimOutcome::Claimed(c) => c,
@@ -403,26 +432,31 @@ mod tests {
         let later = claim.claim_store_time_ns + 2_000;
         // Two sweepers race; both must succeed and both must see a
         // consistent store afterwards.
-        let r1 = q1.sweep_expired_leases(later, &mut b).unwrap();
-        let r2 = q2.sweep_expired_leases(later, &mut b).unwrap();
+        let r1 = q1.sweep_expired_leases(later, &mut b).await.unwrap();
+        let r2 = q2.sweep_expired_leases(later, &mut b).await.unwrap();
         assert_eq!(r1.entries + r2.entries, 1, "entry consumed exactly once");
-        check_invariants(&q1, 1, 0);
+        check_invariants(&q1, 1, 0).await;
     }
 
     /// GC before and after a late ack, sequentially: non-terminal
     /// graphs are never collected; the late ack succeeds; past
     /// retention the full graph goes. (Mid-flight interleaving of gc
     /// and ack is not exercisable at the lab's step granularity.)
-    #[test]
-    fn gc_around_a_late_ack() {
+    #[tokio::test]
+    async fn gc_around_a_late_ack() {
         let store = MemoryStore::new();
         let mk = |w: usize| {
             let mut opts = OpenOptions::new([1; 16]);
             opts.worker_id = format!("g{w}");
-            Queue::init(Box::new(store.clone()), "q", &opts, &format()).unwrap()
+            let store = store.clone();
+            async move {
+                Queue::init(Box::new(store), "q", &opts, &format())
+                    .await
+                    .unwrap()
+            }
         };
-        let qa = mk(0);
-        let qg = mk(1);
+        let qa = mk(0).await;
+        let qg = mk(1).await;
         let mut b = OpBudget::new(512);
         qa.enqueue(
             EnqueueInput {
@@ -434,6 +468,7 @@ mod tests {
             },
             &mut b,
         )
+        .await
         .unwrap();
         let a = match qa
             .claim(
@@ -444,6 +479,7 @@ mod tests {
                 },
                 &mut b,
             )
+            .await
             .unwrap()
         {
             ClaimOutcome::Claimed(c) => c,
@@ -452,15 +488,16 @@ mod tests {
         // GC first: the job is not terminal, so nothing is deleted.
         let report = qg
             .gc(a.claim_store_time_ns + 100, 1_000, 60_000_000_000, &mut b)
+            .await
             .unwrap();
         assert_eq!(report.jobs_deleted, 0, "non-terminal job must not be GC'd");
         // The late ack then succeeds normally.
-        let out = qa.ack(&a, &mut b).unwrap();
+        let out = qa.ack(&a, &mut b).await.unwrap();
         assert_eq!(out, AckOutcome::Acked);
         // A subsequent GC past retention deletes the graph; the
         // claimant is gone with it.
-        let report = qg.gc(u64::MAX / 4, 1_000, 1_000, &mut b).unwrap();
+        let report = qg.gc(u64::MAX / 4, 1_000, 1_000, &mut b).await.unwrap();
         assert_eq!(report.jobs_deleted, 1);
-        check_invariants(&qa, 1, 0);
+        check_invariants(&qa, 1, 0).await;
     }
 }

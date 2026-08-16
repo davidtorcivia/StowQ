@@ -127,7 +127,7 @@ impl Claim {
     /// record's digest. For tooling that rebuilds handles from
     /// persisted state.
     #[allow(clippy::too_many_arguments)]
-    pub fn detached_or_inline(
+    pub async fn detached_or_inline(
         job_id: [u8; 16],
         shard: u16,
         generation: u64,
@@ -141,7 +141,7 @@ impl Claim {
         let rel = RelKey::Job { shard, job_id };
         let abs = Key::new(format!("{queue_root}/{}", rel));
         let tag = stowq_keys::key_tag(&QUEUE_ID_FOR_TOOLING, &rel.to_string());
-        let obj = match store.get(&abs, None) {
+        let obj = match store.get(&abs, None).await {
             Ok(obj) => obj,
             Err(StoreError::NotFound) => {
                 return Err(Error::Record("job record not found for handle".into()))
@@ -156,7 +156,7 @@ impl Claim {
             (Some(b), _) => PayloadRef::Inline(Bytes::from(b.clone())),
             (None, Some(k)) => {
                 let key = Key::new(format!("{queue_root}/{k}"));
-                let obj = store.get(&key, None)?;
+                let obj = store.get(&key, None).await?;
                 let got: Digest = Sha256::digest(&obj.body).into();
                 if got != job.payload_digest || obj.body.len() as u64 != job.payload_length {
                     return Err(Error::PayloadCorrupt);
@@ -217,7 +217,7 @@ enum PayloadRef {
 impl Claim {
     /// The payload bytes, digest-verified. Detached payloads are fetched
     /// and hashed; a mismatch is an integrity error, never delivery.
-    pub fn payload(&self, store: &dyn ObjectStore) -> Result<Bytes, Error> {
+    pub async fn payload(&self, store: &dyn ObjectStore) -> Result<Bytes, Error> {
         match &self.payload {
             PayloadRef::Inline(b) => Ok(b.clone()),
             PayloadRef::Detached {
@@ -225,7 +225,7 @@ impl Claim {
                 digest,
                 length,
             } => {
-                let obj = store.get(key, None)?;
+                let obj = store.get(key, None).await?;
                 if obj.body.len() as u64 != *length {
                     return Err(Error::PayloadCorrupt);
                 }
@@ -295,21 +295,10 @@ impl From<stowq_format::RecordError> for Error {
 
 // ---------- Writer tokens ----------
 
-fn fresh_token(context: &[u8]) -> [u8; 16] {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut hasher = Sha256::new();
-    hasher.update(b"StowQ-1-token\0");
-    hasher.update(now.to_be_bytes());
-    hasher.update(n.to_be_bytes());
-    hasher.update(context);
-    hasher.finalize()[..16].try_into().unwrap()
+fn fresh_token() -> [u8; 16] {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).expect("entropy source unavailable");
+    b
 }
 
 fn hex(b: &[u8]) -> String {
@@ -326,20 +315,51 @@ pub struct Queue {
     /// Cached wall floor (store time) and when it was established; see
     /// establish_floor.
     floor: std::sync::Mutex<FloorCache>,
+    clock: std::sync::Arc<dyn ElapsedClock>,
+}
+
+/// Elapsed time since an arbitrary fixed anchor, monotone. The floor
+/// cache trusts local time only for its staleness deadline, never for
+/// protocol decisions; targets without a std clock supply their own.
+pub trait ElapsedClock: Send + Sync {
+    fn elapsed_ns(&self) -> u64;
+}
+
+/// Native clock anchored at construction.
+pub struct NativeElapsedClock {
+    anchor: std::time::Instant,
+}
+
+impl NativeElapsedClock {
+    pub fn new() -> Self {
+        NativeElapsedClock {
+            anchor: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for NativeElapsedClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ElapsedClock for NativeElapsedClock {
+    fn elapsed_ns(&self) -> u64 {
+        self.anchor.elapsed().as_nanos() as u64
+    }
 }
 
 #[derive(Debug, Clone)]
 struct FloorCache {
     floor_ns: u64,
-    /// Local monotonic instant of establishment; local clocks are
-    /// trusted only for this staleness deadline, never for protocol
-    /// decisions.
-    established_at: std::time::Instant,
+    /// Clock reading at establishment; see ElapsedClock.
+    established_at_ns: u64,
 }
 
 /// A floor is reused for at most this long before re-establishment;
 /// staleness only delays work, never delivers early.
-const FLOOR_STALENESS: std::time::Duration = std::time::Duration::from_secs(30);
+const FLOOR_STALENESS_NS: u64 = 30 * 1_000_000_000;
 
 const RETRY_TRANSPORT_MAX: usize = 4;
 
@@ -349,7 +369,11 @@ const QUEUE_ID_FOR_TOOLING: [u8; 16] = [1; 16];
 
 impl Queue {
     /// Opens an initialized queue: reads and verifies `meta/FORMAT`.
-    pub fn open(store: Box<dyn ObjectStore>, root: &str, opts: OpenOptions) -> Result<Self, Error> {
+    pub async fn open(
+        store: Box<dyn ObjectStore>,
+        root: &str,
+        opts: OpenOptions,
+    ) -> Result<Self, Error> {
         let root = format!("{}/", root.trim_end_matches('/'));
         let mut q = Queue {
             store,
@@ -365,12 +389,13 @@ impl Queue {
             },
             floor: std::sync::Mutex::new(FloorCache {
                 floor_ns: 0,
-                established_at: std::time::Instant::now(),
+                established_at_ns: 0,
             }),
+            clock: std::sync::Arc::new(NativeElapsedClock::new()),
         };
         let key = q.absolute(&RelKey::Format);
         let tag = key_tag(&q.opts.queue_id, "meta/FORMAT");
-        let obj = q.store.get(&key, None)?;
+        let obj = q.store.get(&key, None).await?;
         let record = stowq_format::decode(&obj.body, &q.opts.queue_id, &tag)?;
         let Record::Format(format) = record else {
             return Err(Error::Record("meta/FORMAT is not a format record".into()));
@@ -383,7 +408,7 @@ impl Queue {
     /// Initializes a queue prefix: writes `meta/FORMAT` (put-if-absent;
     /// an existing identical record is accepted, a different one is an
     /// error).
-    pub fn init(
+    pub async fn init(
         store: Box<dyn ObjectStore>,
         root: &str,
         opts: &OpenOptions,
@@ -400,7 +425,7 @@ impl Queue {
             &tag,
         ));
         let digest: Digest = Sha256::digest(&body).into();
-        match store.put_if_absent(&key, body, digest)? {
+        match store.put_if_absent(&key, body, digest).await? {
             PutOutcome::Committed { .. } => {}
             PutOutcome::Rejected => {
                 // A different format may already own the prefix: read
@@ -410,7 +435,7 @@ impl Queue {
                 // bounds the loop).
                 let mut retries = 0;
                 let obj = loop {
-                    match store.get(&key, None) {
+                    match store.get(&key, None).await {
                         Ok(obj) => break obj,
                         Err(StoreError::Transport(_)) | Err(StoreError::OutcomeUnknown(_)) => {
                             retries += 1;
@@ -428,7 +453,7 @@ impl Queue {
                 }
             }
         }
-        Self::open(store, &root, opts.clone())
+        Self::open(store, &root, opts.clone()).await
     }
 
     pub fn format(&self) -> &stowq_format::FormatRecord {
@@ -444,10 +469,16 @@ impl Queue {
     /// back, take the store-assigned time. The floor is a proven lower
     /// bound on store time. Cached until stale; staleness only delays
     /// work, never delivers early.
-    pub fn establish_floor(&self, budget: &mut OpBudget) -> Result<u64, Error> {
+    pub async fn establish_floor(&self, budget: &mut OpBudget) -> Result<u64, Error> {
         {
             let cache = self.floor.lock().unwrap();
-            if cache.floor_ns > 0 && cache.established_at.elapsed() < FLOOR_STALENESS {
+            if cache.floor_ns > 0
+                && self
+                    .clock
+                    .elapsed_ns()
+                    .saturating_sub(cache.established_at_ns)
+                    < FLOOR_STALENESS_NS
+            {
                 return Ok(cache.floor_ns);
             }
         }
@@ -457,14 +488,14 @@ impl Queue {
         for _ in 0..=RETRY_TRANSPORT_MAX {
             // Beacons are content-free: on a nonce collision or an
             // unknown outcome, a fresh nonce is always correct.
-            let nonce = fresh_token(b"beacon");
+            let nonce = fresh_token();
             let rel = RelKey::Beacon { nonce };
             let abs = self.absolute(&rel);
             budget.spend()?;
-            match self.store.put_if_absent(&abs, body.clone(), digest) {
+            match self.store.put_if_absent(&abs, body.clone(), digest).await {
                 Ok(PutOutcome::Committed { .. }) => {
                     budget.spend()?;
-                    let meta = self.store.head(&abs)?;
+                    let meta = self.store.head(&abs).await?;
                     floor_ns = meta.store_time_ns;
                     break;
                 }
@@ -488,7 +519,7 @@ impl Queue {
         // below — so raising can never mask a regression. The
         // watermark read is best-effort — its absence is not a
         // regression.
-        if let Some(w) = self.watermark(budget)? {
+        if let Some(w) = self.watermark(budget).await? {
             let wm_ns = w
                 .highest_observed_wall_bucket
                 .saturating_mul(self.format.delayed_bucket_width_ns);
@@ -511,13 +542,13 @@ impl Queue {
         }
         *self.floor.lock().unwrap() = FloorCache {
             floor_ns,
-            established_at: std::time::Instant::now(),
+            established_at_ns: self.clock.elapsed_ns(),
         };
         Ok(floor_ns)
     }
 
     /// Reads and verifies the watermark record, if present.
-    pub fn watermark(
+    pub async fn watermark(
         &self,
         budget: &mut OpBudget,
     ) -> Result<Option<stowq_format::WatermarkRecord>, Error> {
@@ -527,7 +558,7 @@ impl Queue {
         // read_retrying spends the budget; this read also backs the
         // watermark CAS's outcome resolution, so it must not leak an
         // unknown outcome upward.
-        match self.read_retrying(&abs, budget) {
+        match self.read_retrying(&abs, budget).await {
             Ok(obj) => match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
                 Record::Watermark(w) => Ok(Some(w)),
                 _ => Err(Error::Record(
@@ -544,13 +575,17 @@ impl Queue {
     /// then already covers our bucket and the call proceeds. A bucket at
     /// or below the stored one is a no-op. Genuine regression (a fresh
     /// floor below the watermark) is detected by fail-closed promotion.
-    pub fn advance_watermark(&self, floor_ns: u64, budget: &mut OpBudget) -> Result<(), Error> {
+    pub async fn advance_watermark(
+        &self,
+        floor_ns: u64,
+        budget: &mut OpBudget,
+    ) -> Result<(), Error> {
         let width = self.format.delayed_bucket_width_ns;
         let Some(bucket) = stowq_math::bucket_number(floor_ns, width) else {
             return Err(Error::Internal("zero delayed width".into()));
         };
         loop {
-            let current = self.watermark(budget)?;
+            let current = self.watermark(budget).await?;
             let exists = current.is_some();
             let next = match current {
                 None => stowq_format::WatermarkRecord {
@@ -590,10 +625,12 @@ impl Queue {
             let outcome = if exists {
                 // Read the current version and CAS against it.
                 budget.spend()?;
-                let meta = self.store.head(&abs)?;
-                self.store.cas(&abs, body.clone(), digest, &meta.version)
+                let meta = self.store.head(&abs).await?;
+                self.store
+                    .cas(&abs, body.clone(), digest, &meta.version)
+                    .await
             } else {
-                self.store.put_if_absent(&abs, body.clone(), digest)
+                self.store.put_if_absent(&abs, body.clone(), digest).await
             };
             // Resolve unknown outcomes by re-reading: our record (or any
             // record covering our bucket) means done; anything else
@@ -601,7 +638,7 @@ impl Queue {
             let outcome = match outcome {
                 Ok(o) => o,
                 Err(StoreError::OutcomeUnknown(_)) => {
-                    if self.watermark_covers(bucket, budget)? {
+                    if self.watermark_covers(bucket, budget).await? {
                         return Ok(());
                     }
                     continue;
@@ -616,8 +653,8 @@ impl Queue {
     }
 
     /// True when the stored watermark already covers `bucket`.
-    fn watermark_covers(&self, bucket: u64, budget: &mut OpBudget) -> Result<bool, Error> {
-        Ok(match self.watermark(budget)? {
+    async fn watermark_covers(&self, bucket: u64, budget: &mut OpBudget) -> Result<bool, Error> {
+        Ok(match self.watermark(budget).await? {
             Some(w) => w.highest_observed_wall_bucket >= bucket,
             None => false,
         })
@@ -633,7 +670,7 @@ impl Queue {
 
     // ---------- enqueue ----------
 
-    pub fn enqueue(
+    pub async fn enqueue(
         &self,
         input: EnqueueInput<'_>,
         budget: &mut OpBudget,
@@ -643,7 +680,7 @@ impl Queue {
         if input.maximum_attempts == 0 {
             return Err(Error::Record("maximum_attempts must be positive".into()));
         }
-        let job_id = input.job_id.unwrap_or_else(|| fresh_token(input.payload));
+        let job_id = input.job_id.unwrap_or_else(fresh_token);
         let shard = compute_shard(&self.opts.queue_id, &job_id, self.format.shard_count.max(1));
         let payload_digest: Digest = Sha256::digest(input.payload).into();
         // The queue's FORMAT declares the inline bound for all clients
@@ -665,7 +702,8 @@ impl Queue {
             // and an unknown outcome resolves by presence — the key
             // embeds the digest and the store verified the body hash at
             // PUT, so present at the key means the payload is in place.
-            self.put_bytes_resolving(&abs, body, payload_digest, budget)?;
+            self.put_bytes_resolving(&abs, body, payload_digest, budget)
+                .await?;
             (None, Some(rel.to_string()))
         };
 
@@ -686,7 +724,9 @@ impl Queue {
         let body = Bytes::from(stowq_format::encode(&record, &self.opts.queue_id, &tag));
         let digest: Digest = Sha256::digest(&body).into();
         budget.spend()?;
-        let outcome = self.put_resolving(&abs, body, digest, &record, &rel, budget)?;
+        let outcome = self
+            .put_resolving(&abs, body, digest, &record, &rel, budget)
+            .await?;
         match outcome {
             Resolved::NotCommitted => {
                 Err(Error::Internal("enqueue not committed after retry".into()))
@@ -703,7 +743,8 @@ impl Queue {
                     budget.spend()?;
                     let _ = self
                         .store
-                        .put_if_absent(&idx, Bytes::new(), Sha256::digest([]).into());
+                        .put_if_absent(&idx, Bytes::new(), Sha256::digest([]).into())
+                        .await;
                 }
                 Ok(EnqueueOutcome::Committed { job_id })
             }
@@ -711,7 +752,7 @@ impl Queue {
                 // Someone's record holds the key: ours if identical
                 // (idempotent enqueue), theirs otherwise.
                 let tag = self.tag_for(&rel);
-                let obj = self.read_retrying(&abs, budget)?;
+                let obj = self.read_retrying(&abs, budget).await?;
                 // An undecodable record is provably not ours.
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
                     Ok(found) if found == record => Ok(EnqueueOutcome::Committed { job_id }),
@@ -725,7 +766,7 @@ impl Queue {
     /// writes: transport retries and unknown outcomes never escape.
     /// Presence at the key proves the payload is in place (the store
     /// verified the body hash at PUT; the key embeds the digest).
-    fn put_bytes_resolving(
+    async fn put_bytes_resolving(
         &self,
         abs: &Key,
         body: Bytes,
@@ -735,7 +776,7 @@ impl Queue {
         let mut transport_retries = 0;
         loop {
             budget.spend()?;
-            match self.store.put_if_absent(abs, body.clone(), digest) {
+            match self.store.put_if_absent(abs, body.clone(), digest).await {
                 Ok(PutOutcome::Committed { .. }) | Ok(PutOutcome::Rejected) => return Ok(()),
                 Err(StoreError::Transport(_)) => {
                     transport_retries += 1;
@@ -745,7 +786,7 @@ impl Queue {
                     continue;
                 }
                 Err(StoreError::OutcomeUnknown(_)) => {
-                    match self.resolve_presence(abs, budget)? {
+                    match self.resolve_presence(abs, budget).await? {
                         // Present means committed (possibly by us before
                         // the response was lost); absent means retry.
                         true => return Ok(()),
@@ -764,11 +805,11 @@ impl Queue {
     }
 
     /// Head-only presence probe with transport retries.
-    fn resolve_presence(&self, abs: &Key, budget: &mut OpBudget) -> Result<bool, Error> {
+    async fn resolve_presence(&self, abs: &Key, budget: &mut OpBudget) -> Result<bool, Error> {
         let mut transport_retries = 0;
         loop {
             budget.spend()?;
-            match self.store.head(abs) {
+            match self.store.head(abs).await {
                 Ok(_) => return Ok(true),
                 Err(StoreError::NotFound) => return Ok(false),
                 Err(StoreError::Transport(_)) | Err(StoreError::OutcomeUnknown(_)) => {
@@ -788,7 +829,7 @@ impl Queue {
     /// safe to retry as a pre-transmit failure; bounded like every
     /// other retry. Used by the post-write resolution reads so
     /// outcome-unknown never escapes a write path.
-    fn read_retrying(
+    async fn read_retrying(
         &self,
         abs: &Key,
         budget: &mut OpBudget,
@@ -796,7 +837,7 @@ impl Queue {
         let mut transport_retries = 0;
         loop {
             budget.spend()?;
-            match self.store.get(abs, None) {
+            match self.store.get(abs, None).await {
                 Ok(obj) => return Ok(obj),
                 Err(StoreError::Transport(_)) | Err(StoreError::OutcomeUnknown(_)) => {
                     transport_retries += 1;
@@ -813,7 +854,7 @@ impl Queue {
     /// The outcome-unknown resolver shared by every conditional write:
     /// re-read the key; absent means not committed (bounded retry), present
     /// means committed by someone (compare evidence).
-    fn put_resolving(
+    async fn put_resolving(
         &self,
         abs: &Key,
         body: Bytes,
@@ -825,7 +866,7 @@ impl Queue {
         let mut transport_retries = 0;
         loop {
             budget.spend()?;
-            let result = self.store.put_if_absent(abs, body.clone(), digest);
+            let result = self.store.put_if_absent(abs, body.clone(), digest).await;
             match result {
                 Ok(PutOutcome::Committed { .. }) => return Ok(Resolved::Committed),
                 Ok(PutOutcome::Rejected) => return Ok(Resolved::Lost),
@@ -837,7 +878,7 @@ impl Queue {
                     continue;
                 }
                 Err(StoreError::OutcomeUnknown(_)) => {
-                    match self.resolve_unknown(abs, intended, rel, budget)? {
+                    match self.resolve_unknown(abs, intended, rel, budget).await? {
                         Resolved::Committed => return Ok(Resolved::Committed),
                         Resolved::Lost => return Ok(Resolved::Lost),
                         // Absent after an unknown outcome: the write
@@ -856,7 +897,7 @@ impl Queue {
         }
     }
 
-    fn resolve_unknown(
+    async fn resolve_unknown(
         &self,
         abs: &Key,
         intended: &Record,
@@ -866,9 +907,9 @@ impl Queue {
         let mut transport_retries = 0;
         loop {
             budget.spend()?;
-            match self.store.head(abs) {
+            match self.store.head(abs).await {
                 Ok(_) => {
-                    let obj = self.read_retrying(abs, budget)?;
+                    let obj = self.read_retrying(abs, budget).await?;
                     let tag = self.tag_for(rel);
                     // Present but undecodable is not ours: lost (the
                     // repair scan owns quarantine).
@@ -893,12 +934,16 @@ impl Queue {
 
     // ---------- claim ----------
 
-    pub fn claim(&self, opts: &ClaimOptions, budget: &mut OpBudget) -> Result<ClaimOutcome, Error> {
+    pub async fn claim(
+        &self,
+        opts: &ClaimOptions,
+        budget: &mut OpBudget,
+    ) -> Result<ClaimOutcome, Error> {
         let shard_prefix = format!("{}jobs/{:04x}/", self.root, opts.shard);
         let mut after: Option<Key> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(&shard_prefix, after.as_ref(), 32)?;
+            let page = self.store.list(&shard_prefix, after.as_ref(), 32).await?;
             if page.items.is_empty() {
                 return Ok(ClaimOutcome::Empty);
             }
@@ -913,7 +958,7 @@ impl Queue {
                 else {
                     continue;
                 };
-                if let Some(claim) = self.try_claim(job_id, shard, opts, budget)? {
+                if let Some(claim) = self.try_claim(job_id, shard, opts, budget).await? {
                     return Ok(ClaimOutcome::Claimed(claim));
                 }
                 if budget.max_ops == 0 {
@@ -928,7 +973,7 @@ impl Queue {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn try_claim(
+    async fn try_claim(
         &self,
         job_id: [u8; 16],
         shard: u16,
@@ -943,7 +988,7 @@ impl Queue {
             RelKey::Dead { shard, job_id },
         ] {
             budget.spend()?;
-            match self.store.head(&self.absolute(&rel)) {
+            match self.store.head(&self.absolute(&rel)).await {
                 Ok(_) => return Ok(None),
                 Err(StoreError::NotFound) => {}
                 Err(e) => return Err(e.into()),
@@ -957,7 +1002,7 @@ impl Queue {
         let mut after: Option<Key> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(&claims_prefix, after.as_ref(), 64)?;
+            let page = self.store.list(&claims_prefix, after.as_ref(), 64).await?;
             for item in page.items {
                 // Grammar violations in the chain are skipped; the
                 // repair scan owns quarantine.
@@ -992,7 +1037,7 @@ impl Queue {
             };
             let abs = self.absolute(&rel);
             let tag = self.tag_for(&rel);
-            let obj = self.store.get(&abs, None)?;
+            let obj = self.store.get(&abs, None).await?;
             match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
                 Record::Claim(c) => (c.attempt, c.lease_duration_ns),
                 _ => return Err(Error::Record("claim key holds a non-claim record".into())),
@@ -1015,7 +1060,7 @@ impl Queue {
                 job_id,
                 generation: tail_gen as u32,
             };
-            let fail = match self.store.get(&self.absolute(&rel), None) {
+            let fail = match self.store.get(&self.absolute(&rel), None).await {
                 Ok(obj) => {
                     let tag = self.tag_for(&rel);
                     match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
@@ -1046,7 +1091,7 @@ impl Queue {
         let job_rel = RelKey::Job { shard, job_id };
         let job_abs = self.absolute(&job_rel);
         let job_tag = self.tag_for(&job_rel);
-        let job_obj = match self.store.get(&job_abs, None) {
+        let job_obj = match self.store.get(&job_abs, None).await {
             Ok(obj) => obj,
             // GC may remove a terminal job between listing and read;
             // the candidate is gone, not errored.
@@ -1076,10 +1121,12 @@ impl Queue {
             let body = Bytes::from(stowq_format::encode(&dead, &self.opts.queue_id, &tag));
             budget.spend()?;
             let body_digest: Digest = Sha256::digest(&body).into();
-            if let Resolved::Committed =
-                self.put_resolving(&abs, body, body_digest, &dead, &rel, budget)?
+            if let Resolved::Committed = self
+                .put_resolving(&abs, body, body_digest, &dead, &rel, budget)
+                .await?
             {
-                self.write_termidx(&rel, stowq_keys::TermKind::Dead, shard, job_id, budget);
+                self.write_termidx(&rel, stowq_keys::TermKind::Dead, shard, job_id, budget)
+                    .await;
             }
             return Ok(None);
         }
@@ -1087,7 +1134,7 @@ impl Queue {
         if tail_gen >= u32::MAX as u64 {
             return Err(Error::Internal("generation space exhausted".into()));
         }
-        let worker_token = fresh_token(&job_id);
+        let worker_token = fresh_token();
         let record = Record::Claim(ClaimRecord {
             job_id,
             generation: tail_gen + 1,
@@ -1113,10 +1160,13 @@ impl Queue {
         let body = Bytes::from(stowq_format::encode(&record, &self.opts.queue_id, &tag));
         let digest: Digest = Sha256::digest(&body).into();
         budget.spend()?;
-        match self.put_resolving(&abs, body, digest, &record, &rel, budget)? {
+        match self
+            .put_resolving(&abs, body, digest, &record, &rel, budget)
+            .await?
+        {
             Resolved::Committed => {
                 budget.spend()?;
-                let meta = self.store.head(&abs)?;
+                let meta = self.store.head(&abs).await?;
                 let payload = match (&job.payload_inline, &job.payload_key) {
                     (Some(b), _) => PayloadRef::Inline(Bytes::from(b.clone())),
                     (None, Some(k)) => PayloadRef::Detached {
@@ -1140,7 +1190,8 @@ impl Queue {
                     budget.spend()?;
                     let _ = self
                         .store
-                        .put_if_absent(&idx, Bytes::new(), Sha256::digest([]).into());
+                        .put_if_absent(&idx, Bytes::new(), Sha256::digest([]).into())
+                        .await;
                 }
                 Ok(Some(Claim {
                     job_id,
@@ -1159,7 +1210,7 @@ impl Queue {
 
     // ---------- renew ----------
 
-    pub fn renew(&self, claim: &Claim, budget: &mut OpBudget) -> Result<RenewOutcome, Error> {
+    pub async fn renew(&self, claim: &Claim, budget: &mut OpBudget) -> Result<RenewOutcome, Error> {
         if claim.generation >= u32::MAX as u64 {
             return Err(Error::Internal("generation space exhausted".into()));
         }
@@ -1177,7 +1228,7 @@ impl Queue {
             },
         ] {
             budget.spend()?;
-            match self.store.head(&self.absolute(&rel)) {
+            match self.store.head(&self.absolute(&rel)).await {
                 Ok(_) => return Ok(RenewOutcome::LeaseLost),
                 Err(StoreError::NotFound) => {}
                 Err(e) => return Err(e.into()),
@@ -1204,10 +1255,13 @@ impl Queue {
         let body = Bytes::from(stowq_format::encode(&record, &self.opts.queue_id, &tag));
         let digest: Digest = Sha256::digest(&body).into();
         budget.spend()?;
-        match self.put_resolving(&abs, body, digest, &record, &rel, budget)? {
+        match self
+            .put_resolving(&abs, body, digest, &record, &rel, budget)
+            .await?
+        {
             Resolved::Committed => {
                 budget.spend()?;
-                let meta = self.store.head(&abs)?;
+                let meta = self.store.head(&abs).await?;
                 Ok(RenewOutcome::Renewed(Claim {
                     job_id: claim.job_id,
                     shard: claim.shard,
@@ -1225,21 +1279,25 @@ impl Queue {
 
     // ---------- ack ----------
 
-    pub fn ack(&self, claim: &Claim, budget: &mut OpBudget) -> Result<AckOutcome, Error> {
+    pub async fn ack(&self, claim: &Claim, budget: &mut OpBudget) -> Result<AckOutcome, Error> {
         // A dead record terminalized the job first; refuse so at most
         // one terminal record per job ever exists.
         budget.spend()?;
-        match self.store.head(&self.absolute(&RelKey::Dead {
-            shard: claim.shard,
-            job_id: claim.job_id,
-        })) {
+        match self
+            .store
+            .head(&self.absolute(&RelKey::Dead {
+                shard: claim.shard,
+                job_id: claim.job_id,
+            }))
+            .await
+        {
             Ok(_) => return Ok(AckOutcome::SupersededByDead),
             Err(StoreError::NotFound) => {}
             Err(e) => return Err(e.into()),
         }
         // Payload evidence: re-verify before the terminal write.
         budget.spend()?;
-        let payload = claim.payload(self.store.as_ref())?;
+        let payload = claim.payload(self.store.as_ref()).await?;
         let digest: Digest = Sha256::digest(&payload).into();
 
         let record = Record::Receipt(ReceiptRecord {
@@ -1260,7 +1318,10 @@ impl Queue {
         let body = Bytes::from(stowq_format::encode(&record, &self.opts.queue_id, &tag));
         let body_digest: Digest = Sha256::digest(&body).into();
         budget.spend()?;
-        match self.put_resolving(&abs, body, body_digest, &record, &rel, budget)? {
+        match self
+            .put_resolving(&abs, body, body_digest, &record, &rel, budget)
+            .await?
+        {
             Resolved::Committed => {
                 self.write_termidx(
                     &rel,
@@ -1268,14 +1329,15 @@ impl Queue {
                     claim.shard,
                     claim.job_id,
                     budget,
-                );
+                )
+                .await;
                 Ok(AckOutcome::Acked)
             }
             Resolved::Lost | Resolved::NotCommitted => {
                 // A receipt exists: idempotent-verify its evidence
                 // (identity is the key; generation, attempt, and the
                 // re-verified payload digest must match this claim).
-                let obj = self.read_retrying(&abs, budget)?;
+                let obj = self.read_retrying(&abs, budget).await?;
                 let tag = self.tag_for(&rel);
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
                     Record::Receipt(r)
@@ -1297,7 +1359,7 @@ impl Queue {
 
     // ---------- nack ----------
 
-    pub fn nack(
+    pub async fn nack(
         &self,
         claim: &Claim,
         reason: u64,
@@ -1333,7 +1395,10 @@ impl Queue {
         let body = Bytes::from(stowq_format::encode(&record, &self.opts.queue_id, &tag));
         let digest: Digest = Sha256::digest(&body).into();
         budget.spend()?;
-        match self.put_resolving(&abs, body, digest, &record, &rel, budget)? {
+        match self
+            .put_resolving(&abs, body, digest, &record, &rel, budget)
+            .await?
+        {
             Resolved::Committed | Resolved::Lost => {}
             // NotCommitted only arises from an absent key after an
             // unknown outcome, which the resolver retries internally.
@@ -1351,14 +1416,15 @@ impl Queue {
             budget.spend()?;
             let _ = self
                 .store
-                .put_if_absent(&idx, Bytes::new(), Sha256::digest([]).into());
+                .put_if_absent(&idx, Bytes::new(), Sha256::digest([]).into())
+                .await;
         }
         Ok(())
     }
 
     // ---------- bury ----------
 
-    pub fn bury(
+    pub async fn bury(
         &self,
         claim: &Claim,
         reason: u64,
@@ -1368,10 +1434,14 @@ impl Queue {
         // terminal record per job ever exists — the symmetric guard to
         // ack's dead check.
         budget.spend()?;
-        match self.store.head(&self.absolute(&RelKey::Receipt {
-            shard: claim.shard,
-            job_id: claim.job_id,
-        })) {
+        match self
+            .store
+            .head(&self.absolute(&RelKey::Receipt {
+                shard: claim.shard,
+                job_id: claim.job_id,
+            }))
+            .await
+        {
             Ok(_) => return Ok(BuryOutcome::SupersededByReceipt),
             Err(StoreError::NotFound) => {}
             Err(e) => return Err(e.into()),
@@ -1391,7 +1461,10 @@ impl Queue {
         let body = Bytes::from(stowq_format::encode(&record, &self.opts.queue_id, &tag));
         let digest: Digest = Sha256::digest(&body).into();
         budget.spend()?;
-        match self.put_resolving(&abs, body, digest, &record, &rel, budget)? {
+        match self
+            .put_resolving(&abs, body, digest, &record, &rel, budget)
+            .await?
+        {
             Resolved::Committed => {
                 self.write_termidx(
                     &rel,
@@ -1399,7 +1472,8 @@ impl Queue {
                     claim.shard,
                     claim.job_id,
                     budget,
-                );
+                )
+                .await;
                 Ok(BuryOutcome::Buried)
             }
             Resolved::Lost => {
@@ -1407,7 +1481,7 @@ impl Queue {
                 // evidence (identity is the key; generation and attempt
                 // must match) is success. Any other dead record is a
                 // conflicting-terminal finding.
-                let obj = self.read_retrying(&abs, budget)?;
+                let obj = self.read_retrying(&abs, budget).await?;
                 let tag = self.tag_for(&rel);
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
                     Record::Dead(d)
@@ -1423,7 +1497,7 @@ impl Queue {
     }
 
     /// Best-effort terminal index entry; drives GC ordering only.
-    fn write_termidx(
+    async fn write_termidx(
         &self,
         terminal_rel: &RelKey,
         kind: stowq_keys::TermKind,
@@ -1434,7 +1508,7 @@ impl Queue {
         if budget.spend().is_err() {
             return;
         }
-        let Ok(meta) = self.store.head(&self.absolute(terminal_rel)) else {
+        let Ok(meta) = self.store.head(&self.absolute(terminal_rel)).await else {
             return;
         };
         if let Some(bucket) =
@@ -1449,7 +1523,8 @@ impl Queue {
             if budget.spend().is_ok() {
                 let _ = self
                     .store
-                    .put_if_absent(&idx, Bytes::new(), Sha256::digest([]).into());
+                    .put_if_absent(&idx, Bytes::new(), Sha256::digest([]).into())
+                    .await;
             }
         }
     }
@@ -1557,7 +1632,7 @@ impl Queue {
     /// the report's caller persists the returned next-unscanned shard
     /// as its cursor; a shard's scan leaves no partial state a rerun
     /// would misread. Stops before the budget runs dry mid-shard.
-    pub fn repair_scan(
+    pub async fn repair_scan(
         &self,
         start_shard: u16,
         budget: &mut OpBudget,
@@ -1568,7 +1643,7 @@ impl Queue {
         // overflows on the final increment.
         let mut next = start_shard as u32;
         while next < shard_count {
-            self.repair_shard(next as u16, &mut report, budget)?;
+            self.repair_shard(next as u16, &mut report, budget).await?;
             report.shards_scanned += 1;
             next += 1;
             if budget.max_ops <= 4 {
@@ -1584,7 +1659,7 @@ impl Queue {
     /// each entry, re-evaluate the authoritative tail and delete the
     /// index entry. The index is advisory; correctness never reads it,
     /// and a missing entry hides nothing forever (repair scan).
-    pub fn sweep_expired_leases(
+    pub async fn sweep_expired_leases(
         &self,
         floor_ns: u64,
         budget: &mut OpBudget,
@@ -1601,7 +1676,7 @@ impl Queue {
         let mut after: Option<Key> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(&prefix, after.as_ref(), 64)?;
+            let page = self.store.list(&prefix, after.as_ref(), 64).await?;
             if page.items.is_empty() {
                 break;
             }
@@ -1622,11 +1697,14 @@ impl Queue {
                 let Some((shard, job_id, _gen)) = parse_lease_entry(rest) else {
                     continue;
                 };
-                if self.lease_reclaimable(shard, job_id, floor_ns, budget)? {
+                if self
+                    .lease_reclaimable(shard, job_id, floor_ns, budget)
+                    .await?
+                {
                     report.reclaimed += 1;
                 }
                 budget.spend()?;
-                let _ = self.store.delete(&item.key);
+                let _ = self.store.delete(&item.key).await;
             }
             match page.next_after {
                 Some(k) => after = Some(k),
@@ -1638,7 +1716,7 @@ impl Queue {
 
     /// Delayed sweep (spec recovery.md): walk `delayed/<b>/` for due
     /// buckets; verify the authoritative not_before; delete the entry.
-    pub fn sweep_delayed(
+    pub async fn sweep_delayed(
         &self,
         floor_ns: u64,
         budget: &mut OpBudget,
@@ -1652,7 +1730,7 @@ impl Queue {
         let mut after: Option<Key> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(&prefix, after.as_ref(), 64)?;
+            let page = self.store.list(&prefix, after.as_ref(), 64).await?;
             if page.items.is_empty() {
                 break;
             }
@@ -1676,11 +1754,11 @@ impl Queue {
                 };
                 // Authoritative gate: job not_before and any tail fail's
                 // retry_not_before must have passed.
-                if self.job_promotable(shard, job_id, floor_ns, budget)? {
+                if self.job_promotable(shard, job_id, floor_ns, budget).await? {
                     report.promoted += 1;
                 }
                 budget.spend()?;
-                let _ = self.store.delete(&item.key);
+                let _ = self.store.delete(&item.key).await;
             }
             match page.next_after {
                 Some(k) => after = Some(k),
@@ -1690,7 +1768,7 @@ impl Queue {
         Ok(report)
     }
 
-    fn lease_reclaimable(
+    async fn lease_reclaimable(
         &self,
         shard: u16,
         job_id: [u8; 16],
@@ -1703,14 +1781,14 @@ impl Queue {
             RelKey::Dead { shard, job_id },
         ] {
             budget.spend()?;
-            match self.store.head(&self.absolute(&rel)) {
+            match self.store.head(&self.absolute(&rel)).await {
                 Ok(_) => return Ok(false),
                 Err(StoreError::NotFound) => {}
                 Err(e) => return Err(e.into()),
             }
         }
         // Tail expiry: read the claim chain's last generation.
-        let (gen, meta, duration) = self.claim_tail(shard, job_id, budget)?;
+        let (gen, meta, duration) = self.claim_tail(shard, job_id, budget).await?;
         if gen == 0 {
             return Ok(false); // nothing held
         }
@@ -1721,7 +1799,7 @@ impl Queue {
                 .saturating_add(self.opts.skew_guard_ns))
     }
 
-    fn job_promotable(
+    async fn job_promotable(
         &self,
         shard: u16,
         job_id: [u8; 16],
@@ -1730,7 +1808,7 @@ impl Queue {
     ) -> Result<bool, Error> {
         budget.spend()?;
         let job_rel = RelKey::Job { shard, job_id };
-        let job = match self.store.get(&self.absolute(&job_rel), None) {
+        let job = match self.store.get(&self.absolute(&job_rel), None).await {
             Ok(obj) => {
                 let tag = self.tag_for(&job_rel);
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
@@ -1747,7 +1825,7 @@ impl Queue {
             }
         }
         // Backoff gate at the tail generation.
-        let (gen, _meta, _duration) = self.claim_tail(shard, job_id, budget)?;
+        let (gen, _meta, _duration) = self.claim_tail(shard, job_id, budget).await?;
         if gen > 0 {
             budget.spend()?;
             let rel = RelKey::Fail {
@@ -1755,7 +1833,7 @@ impl Queue {
                 job_id,
                 generation: gen as u32,
             };
-            match self.store.get(&self.absolute(&rel), None) {
+            match self.store.get(&self.absolute(&rel), None).await {
                 Ok(obj) => {
                     let tag = self.tag_for(&rel);
                     if let Record::Fail(f) =
@@ -1774,7 +1852,7 @@ impl Queue {
     }
 
     /// The tail of the claim chain: (generation, meta, lease_duration).
-    fn claim_tail(
+    async fn claim_tail(
         &self,
         shard: u16,
         job_id: [u8; 16],
@@ -1785,7 +1863,7 @@ impl Queue {
         let mut tail: Option<(u64, Meta)> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(&prefix, after.as_ref(), 64)?;
+            let page = self.store.list(&prefix, after.as_ref(), 64).await?;
             for item in page.items {
                 if let Some(g) = parse_generation(&item.key) {
                     tail = Some((g, item.meta));
@@ -1805,7 +1883,7 @@ impl Queue {
                     job_id,
                     generation: gen as u32,
                 };
-                let obj = match self.store.get(&self.absolute(&rel), None) {
+                let obj = match self.store.get(&self.absolute(&rel), None).await {
                     Ok(obj) => obj,
                     Err(StoreError::NotFound) => return Ok((gen, meta, 0)),
                     Err(e) => return Err(e.into()),
@@ -1827,7 +1905,7 @@ impl Queue {
     /// and orphan payloads (a payload whose job record is absent, older
     /// than `orphan_horizon_ns` relative to `now_ns` — the crash window
     /// between payload PUT and job-record PUT) are deleted.
-    pub fn gc(
+    pub async fn gc(
         &self,
         now_ns: u64,
         retention_ns: u64,
@@ -1847,7 +1925,7 @@ impl Queue {
         let mut after: Option<Key> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(&payload_prefix, after.as_ref(), 64)?;
+            let page = self.store.list(&payload_prefix, after.as_ref(), 64).await?;
             if page.items.is_empty() {
                 break;
             }
@@ -1868,11 +1946,12 @@ impl Queue {
                 match self
                     .store
                     .head(&self.absolute(&RelKey::Job { shard, job_id }))
+                    .await
                 {
                     Ok(_) => {}
                     Err(StoreError::NotFound) => {
                         budget.spend()?;
-                        let _ = self.store.delete(&item.key);
+                        let _ = self.store.delete(&item.key).await;
                         report.orphans_deleted += 1;
                     }
                     Err(e) => return Err(e.into()),
@@ -1886,19 +1965,19 @@ impl Queue {
 
         // Beacons: metadata is tiny; collect those older than 10x the
         // floor staleness window.
-        let beacon_cutoff = now_ns.saturating_sub(FLOOR_STALENESS.as_nanos() as u64 * 10);
+        let beacon_cutoff = now_ns.saturating_sub(FLOOR_STALENESS_NS.saturating_mul(10));
         let beacon_prefix = format!("{}meta/clock/", self.root);
         let mut after: Option<Key> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(&beacon_prefix, after.as_ref(), 64)?;
+            let page = self.store.list(&beacon_prefix, after.as_ref(), 64).await?;
             if page.items.is_empty() {
                 break;
             }
             for item in &page.items {
                 if item.meta.store_time_ns < beacon_cutoff {
                     budget.spend()?;
-                    let _ = self.store.delete(&item.key);
+                    let _ = self.store.delete(&item.key).await;
                     report.beacons_deleted += 1;
                 }
             }
@@ -1915,7 +1994,7 @@ impl Queue {
         let mut after: Option<Key> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(&term_prefix, after.as_ref(), 64)?;
+            let page = self.store.list(&term_prefix, after.as_ref(), 64).await?;
             if page.items.is_empty() {
                 break;
             }
@@ -1931,14 +2010,14 @@ impl Queue {
                 };
                 let terminal_abs = self.absolute(&terminal_rel);
                 budget.spend()?;
-                let meta = match self.store.head(&terminal_abs) {
+                let meta = match self.store.head(&terminal_abs).await {
                     Ok(meta) => meta,
                     // Only NotFound proves the authoritative record is
                     // gone; other errors abort loudly rather than
                     // pruning a live graph's index entry.
                     Err(StoreError::NotFound) => {
                         budget.spend()?;
-                        let _ = self.store.delete(&item.key);
+                        let _ = self.store.delete(&item.key).await;
                         continue;
                     }
                     Err(e) => return Err(e.into()),
@@ -1946,7 +2025,10 @@ impl Queue {
                 if meta.store_time_ns >= cutoff {
                     continue; // still within retention
                 }
-                if self.delete_terminal_graph(shard, job_id, &terminal_rel, &item.key, budget)? {
+                if self
+                    .delete_terminal_graph(shard, job_id, &terminal_rel, &item.key, budget)
+                    .await?
+                {
                     report.jobs_deleted += 1;
                 }
             }
@@ -1960,7 +2042,7 @@ impl Queue {
 
     /// Deletes one job's terminal graph in the strict spec order.
     #[allow(clippy::too_many_arguments)]
-    fn delete_terminal_graph(
+    async fn delete_terminal_graph(
         &self,
         shard: u16,
         job_id: [u8; 16],
@@ -1986,14 +2068,14 @@ impl Queue {
             let mut after: Option<Key> = None;
             loop {
                 budget.spend()?;
-                let page = self.store.list(&prefix, after.as_ref(), 64)?;
+                let page = self.store.list(&prefix, after.as_ref(), 64).await?;
                 if page.items.is_empty() {
                     break;
                 }
                 for item in &page.items {
                     if item.key.as_str().contains(&format!("/{shard:04x}/{jhex}")) {
                         budget.spend()?;
-                        let _ = self.store.delete(&item.key);
+                        let _ = self.store.delete(&item.key).await;
                     }
                 }
                 match page.next_after {
@@ -2004,7 +2086,7 @@ impl Queue {
         }
         // termidx entry.
         budget.spend()?;
-        let _ = self.store.delete(index_key);
+        let _ = self.store.delete(index_key).await;
         // Fails, claims.
         for prefix in [
             format!("{}fails/{shard:04x}/{jhex}/", self.root),
@@ -2013,13 +2095,13 @@ impl Queue {
             let mut after: Option<Key> = None;
             loop {
                 budget.spend()?;
-                let page = self.store.list(&prefix, after.as_ref(), 64)?;
+                let page = self.store.list(&prefix, after.as_ref(), 64).await?;
                 if page.items.is_empty() {
                     break;
                 }
                 for item in &page.items {
                     budget.spend()?;
-                    let _ = self.store.delete(&item.key);
+                    let _ = self.store.delete(&item.key).await;
                 }
                 match page.next_after {
                     Some(k) => after = Some(k),
@@ -2032,13 +2114,13 @@ impl Queue {
         let mut after: Option<Key> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(&payload_prefix, after.as_ref(), 64)?;
+            let page = self.store.list(&payload_prefix, after.as_ref(), 64).await?;
             if page.items.is_empty() {
                 break;
             }
             for item in &page.items {
                 budget.spend()?;
-                let _ = self.store.delete(&item.key);
+                let _ = self.store.delete(&item.key).await;
             }
             match page.next_after {
                 Some(k) => after = Some(k),
@@ -2049,10 +2131,11 @@ impl Queue {
         budget.spend()?;
         let _ = self
             .store
-            .delete(&self.absolute(&RelKey::Job { shard, job_id }));
+            .delete(&self.absolute(&RelKey::Job { shard, job_id }))
+            .await;
         // Terminal record last: the tombstone.
         budget.spend()?;
-        let _ = self.store.delete(&self.absolute(terminal_rel));
+        let _ = self.store.delete(&self.absolute(terminal_rel)).await;
         Ok(true)
     }
 
@@ -2063,7 +2146,7 @@ impl Queue {
     /// (queue, source, reason), so independent auditors converge
     /// byte-identically; put-if-absent with outcome resolution. On v1
     /// queues this is a no-op — findings are report-only there.
-    fn write_quarantine(
+    async fn write_quarantine(
         &self,
         rel_key: &str,
         reason: u64,
@@ -2090,11 +2173,11 @@ impl Queue {
         });
         let body = Bytes::from(stowq_format::encode(&record, &self.opts.queue_id, &tag));
         let digest: Digest = Sha256::digest(&body).into();
-        self.put_bytes_resolving(&abs, body, digest, budget)
+        self.put_bytes_resolving(&abs, body, digest, budget).await
     }
 
     /// Lists a prefix fully, spending the budget per page.
-    fn list_authoritative(
+    async fn list_authoritative(
         &self,
         prefix: &str,
         budget: &mut OpBudget,
@@ -2103,7 +2186,7 @@ impl Queue {
         let mut after: Option<Key> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(prefix, after.as_ref(), 64)?;
+            let page = self.store.list(prefix, after.as_ref(), 64).await?;
             if page.items.is_empty() {
                 break;
             }
@@ -2119,18 +2202,50 @@ impl Queue {
     /// Ensures an advisory index entry exists: present means done;
     /// absent means put-if-absent (a racing repairer's identical entry
     /// is benign). Returns true when the entry was missing.
-    fn ensure_index(&self, idx: &Key, budget: &mut OpBudget) -> Result<bool, Error> {
-        match self.store.head(idx) {
+    async fn ensure_index(&self, idx: &Key, budget: &mut OpBudget) -> Result<bool, Error> {
+        match self.store.head(idx).await {
             Ok(_) => Ok(false),
             Err(StoreError::NotFound) => {
                 budget.spend()?;
                 let _ = self
                     .store
-                    .put_if_absent(idx, Bytes::new(), Sha256::digest([]).into());
+                    .put_if_absent(idx, Bytes::new(), Sha256::digest([]).into())
+                    .await;
                 Ok(true)
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Records an inadmissible claim finding and writes its quarantine
+    /// object (0x0010).
+    async fn quarantine_inadmissible(
+        &self,
+        shard: u16,
+        job_id: [u8; 16],
+        chain: &[(u64, Meta)],
+        report: &mut RepairReport,
+        budget: &mut OpBudget,
+        gen: u64,
+    ) -> Result<(), Error> {
+        let rel = RelKey::Claim {
+            shard,
+            job_id,
+            generation: gen as u32,
+        };
+        report.findings.push(Finding {
+            kind: FindingKind::InadmissibleClaim,
+            key: self.absolute(&rel).0.clone(),
+            reason: 0x0010,
+        });
+        let observed = chain
+            .iter()
+            .find(|(g, _)| *g == gen)
+            .map(|(_, m)| m.store_time_ns)
+            .unwrap_or(0);
+        self.write_quarantine(&rel.to_string(), 0x0010, observed, Some(gen), budget)
+            .await?;
+        Ok(())
     }
 
     /// Full-chain admissibility audit (spec records.md, Admissibility):
@@ -2145,7 +2260,7 @@ impl Queue {
     /// budget exhaustion propagates and the shard reruns idempotently.
     /// Returns (tail_generation, tail_meta, tail_lease_duration); the
     /// duration is 0 when the tail record is unavailable.
-    fn audit_claim_chain(
+    async fn audit_claim_chain(
         &self,
         shard: u16,
         job_id: [u8; 16],
@@ -2153,26 +2268,6 @@ impl Queue {
         report: &mut RepairReport,
         budget: &mut OpBudget,
     ) -> Result<(u64, Meta, u64), Error> {
-        let inadmissible =
-            |report: &mut RepairReport, budget: &mut OpBudget, gen: u64| -> Result<(), Error> {
-                let rel = RelKey::Claim {
-                    shard,
-                    job_id,
-                    generation: gen as u32,
-                };
-                report.findings.push(Finding {
-                    kind: FindingKind::InadmissibleClaim,
-                    key: self.absolute(&rel).0.clone(),
-                    reason: 0x0010,
-                });
-                let observed = chain
-                    .iter()
-                    .find(|(g, _)| *g == gen)
-                    .map(|(_, m)| m.store_time_ns)
-                    .unwrap_or(0);
-                self.write_quarantine(&rel.to_string(), 0x0010, observed, Some(gen), budget)?;
-                Ok(())
-            };
         // Contiguity: generations must run 1..=tail with no gaps (a gap
         // is a missing object — foreign deletion or corruption).
         let first = chain.first().expect("chain is nonempty").0;
@@ -2202,7 +2297,8 @@ impl Queue {
                     pair[0].1.store_time_ns,
                     Some(missing),
                     budget,
-                )?;
+                )
+                .await?;
             }
         }
         if first != 1 {
@@ -2226,7 +2322,8 @@ impl Queue {
             // A head gap has no predecessor; the head entry's own store
             // time is the deterministic choice (records.md).
             let head_time = chain.first().expect("chain is nonempty").1.store_time_ns;
-            self.write_quarantine(&rel.to_string(), 0x0015, head_time, Some(first), budget)?;
+            self.write_quarantine(&rel.to_string(), 0x0015, head_time, Some(first), budget)
+                .await?;
         }
         // Decode every generation; keep (index-aligned) decoded records.
         let mut decoded: Vec<Option<stowq_format::ClaimRecord>> = Vec::with_capacity(chain.len());
@@ -2238,7 +2335,7 @@ impl Queue {
             };
             let abs = self.absolute(&rel);
             budget.spend()?;
-            match self.store.get(&abs, None) {
+            match self.store.get(&abs, None).await {
                 Ok(obj) => {
                     let tag = self.tag_for(&rel);
                     match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
@@ -2255,7 +2352,8 @@ impl Queue {
                                 _meta.store_time_ns,
                                 None,
                                 budget,
-                            )?;
+                            )
+                            .await?;
                             decoded.push(None);
                         }
                         Err(e) => {
@@ -2271,7 +2369,8 @@ impl Queue {
                                 _meta.store_time_ns,
                                 None,
                                 budget,
-                            )?;
+                            )
+                            .await?;
                             decoded.push(None);
                         }
                     }
@@ -2290,13 +2389,15 @@ impl Queue {
                 let custody =
                     rec.worker_id == prev.worker_id && rec.prev_token == Some(prev.worker_token);
                 if !custody {
-                    inadmissible(report, budget, gen)?;
+                    self.quarantine_inadmissible(shard, job_id, chain, report, budget, gen)
+                        .await?;
                 }
             } else {
                 let Some(basis) = &rec.basis else {
                     // Unreachable through decode (evidence exclusivity
                     // is enforced at the format layer); defensive.
-                    inadmissible(report, budget, gen)?;
+                    self.quarantine_inadmissible(shard, job_id, chain, report, budget, gen)
+                        .await?;
                     continue;
                 };
                 let evidence = basis.prev_store_time_ns == chain[i - 1].1.store_time_ns
@@ -2306,7 +2407,8 @@ impl Queue {
                         .saturating_add(basis.prev_duration_ns)
                         <= basis.observed_watermark_ns;
                 if !evidence {
-                    inadmissible(report, budget, gen)?;
+                    self.quarantine_inadmissible(shard, job_id, chain, report, budget, gen)
+                        .await?;
                 }
             }
         }
@@ -2318,7 +2420,7 @@ impl Queue {
         Ok((*tail_gen, tail_meta.clone(), tail_duration))
     }
 
-    fn repair_shard(
+    async fn repair_shard(
         &self,
         shard: u16,
         report: &mut RepairReport,
@@ -2329,8 +2431,9 @@ impl Queue {
         // Jobs: delayed-index regeneration plus decode findings. The
         // parsed job set cross-references the claim scan below.
         let mut job_ids: HashSet<[u8; 16]> = HashSet::new();
-        for listing in
-            self.list_authoritative(&format!("{}jobs/{shard:04x}/", self.root), budget)?
+        for listing in self
+            .list_authoritative(&format!("{}jobs/{shard:04x}/", self.root), budget)
+            .await?
         {
             report.jobs_scanned += 1;
             let stripped = listing.key.as_str().strip_prefix(&self.root).unwrap_or("");
@@ -2341,12 +2444,13 @@ impl Queue {
                     key: listing.key.0.clone(),
                     reason: 0x0003,
                 });
-                self.write_quarantine(stripped, 0x0003, listing.meta.store_time_ns, None, budget)?;
+                self.write_quarantine(stripped, 0x0003, listing.meta.store_time_ns, None, budget)
+                    .await?;
                 continue;
             };
             job_ids.insert(job_id);
             let job_rel = RelKey::Job { shard, job_id };
-            match self.store.get(&self.absolute(&job_rel), None) {
+            match self.store.get(&self.absolute(&job_rel), None).await {
                 Ok(obj) => {
                     let tag = self.tag_for(&job_rel);
                     match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
@@ -2357,7 +2461,7 @@ impl Queue {
                             if let Some(pk) = j.payload_key.clone() {
                                 let abs_payload = Key::new(format!("{}{}", self.root, pk));
                                 budget.spend()?;
-                                match self.store.head(&abs_payload) {
+                                match self.store.head(&abs_payload).await {
                                     Ok(_) => {}
                                     Err(StoreError::NotFound) => {
                                         report.findings.push(Finding {
@@ -2371,7 +2475,8 @@ impl Queue {
                                             listing.meta.store_time_ns,
                                             None,
                                             budget,
-                                        )?;
+                                        )
+                                        .await?;
                                     }
                                     Err(e) => return Err(e.into()),
                                 }
@@ -2386,7 +2491,7 @@ impl Queue {
                                         shard,
                                         job_id,
                                     });
-                                    if self.ensure_index(&idx, budget)? {
+                                    if self.ensure_index(&idx, budget).await? {
                                         report.indexes_regenerated += 1;
                                     }
                                 }
@@ -2404,7 +2509,8 @@ impl Queue {
                                 listing.meta.store_time_ns,
                                 None,
                                 budget,
-                            )?;
+                            )
+                            .await?;
                         }
                         Err(e) => {
                             let reason = record_violation_reason(&e);
@@ -2419,7 +2525,8 @@ impl Queue {
                                 listing.meta.store_time_ns,
                                 None,
                                 budget,
-                            )?;
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -2433,8 +2540,9 @@ impl Queue {
         // Claim chains: leases-index regeneration from each tail, plus
         // basis evidence checked against the listing's store times.
         let mut chains: HashMap<[u8; 16], Vec<(u64, Meta)>> = HashMap::new();
-        for listing in
-            self.list_authoritative(&format!("{}claims/{shard:04x}/", self.root), budget)?
+        for listing in self
+            .list_authoritative(&format!("{}claims/{shard:04x}/", self.root), budget)
+            .await?
         {
             let rel = listing
                 .key
@@ -2451,7 +2559,8 @@ impl Queue {
                     reason: 0x0003,
                 });
                 let stripped = listing.key.as_str().strip_prefix(&self.root).unwrap_or("");
-                self.write_quarantine(stripped, 0x0003, listing.meta.store_time_ns, None, budget)?;
+                self.write_quarantine(stripped, 0x0003, listing.meta.store_time_ns, None, budget)
+                    .await?;
                 continue;
             };
             chains
@@ -2472,8 +2581,9 @@ impl Queue {
             // Generations are fixed-width hex: listing order is
             // numeric order, so ascending sort yields the chain.
             chain.sort_by_key(|(g, _)| *g);
-            let (tail_gen, tail_meta, tail_duration) =
-                self.audit_claim_chain(shard, job_id, &chain, report, budget)?;
+            let (tail_gen, tail_meta, tail_duration) = self
+                .audit_claim_chain(shard, job_id, &chain, report, budget)
+                .await?;
             if orphaned {
                 // Convention: the chain tail's store time (records.md).
                 let job_rel = RelKey::Job { shard, job_id };
@@ -2483,7 +2593,8 @@ impl Queue {
                     tail_meta.store_time_ns,
                     None,
                     budget,
-                )?;
+                )
+                .await?;
             }
             let duration = tail_duration;
             if let Some(bucket) = stowq_math::bucket_number(
@@ -2496,7 +2607,7 @@ impl Queue {
                     job_id,
                     generation: tail_gen as u32,
                 });
-                if self.ensure_index(&idx, budget)? {
+                if self.ensure_index(&idx, budget).await? {
                     report.indexes_regenerated += 1;
                 }
             }
@@ -2519,7 +2630,7 @@ impl Queue {
                 &mut dead_jobs,
             ),
         ] {
-            for listing in self.list_authoritative(&prefix, budget)? {
+            for listing in self.list_authoritative(&prefix, budget).await? {
                 let rel = listing
                     .key
                     .as_str()
@@ -2541,7 +2652,8 @@ impl Queue {
                             listing.meta.store_time_ns,
                             None,
                             budget,
-                        )?;
+                        )
+                        .await?;
                         continue;
                     }
                 };
@@ -2557,7 +2669,7 @@ impl Queue {
                         shard,
                         job_id,
                     });
-                    if self.ensure_index(&idx, budget)? {
+                    if self.ensure_index(&idx, budget).await? {
                         report.indexes_regenerated += 1;
                     }
                 }
@@ -2583,7 +2695,8 @@ impl Queue {
                 receipt_jobs[&job_id],
                 None,
                 budget,
-            )?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -2677,14 +2790,15 @@ mod tests {
     // The receipt-evidence-mismatch branch is unreachable through the
     // public claim path (a foreign receipt makes the job terminal and
     // unclaimable), so the claim handle is built in-crate.
-    #[test]
-    fn ack_against_conflicting_receipt_evidence_errors() {
+    #[tokio::test]
+    async fn ack_against_conflicting_receipt_evidence_errors() {
         let q = Queue::init(
             Box::new(MemoryStore::new()),
             "q",
             &OpenOptions::new([1; 16]),
             &format(),
         )
+        .await
         .unwrap();
         let mut budget = OpBudget::new(64);
         let EnqueueOutcome::Committed { job_id } = q
@@ -2698,6 +2812,7 @@ mod tests {
                 },
                 &mut budget,
             )
+            .await
             .unwrap()
         else {
             panic!()
@@ -2718,6 +2833,7 @@ mod tests {
         let digest: Digest = Sha256::digest(&body).into();
         q.store
             .put_if_absent(&q.absolute(&rel), body, digest)
+            .await
             .unwrap();
         let claim = Claim {
             job_id,
@@ -2729,21 +2845,22 @@ mod tests {
             claim_store_time_ns: 0,
             payload: PayloadRef::Inline(Bytes::from_static(b"x")),
         };
-        let err = q.ack(&claim, &mut budget).unwrap_err();
+        let err = q.ack(&claim, &mut budget).await.unwrap_err();
         assert!(matches!(err, Error::ReceiptEvidenceMismatch));
     }
 
     // Same payload digest, different generation: the generation-evidence
     // check must still fail the idempotent-verify (spec records.md,
     // Acknowledgment; quarantine 0x0013).
-    #[test]
-    fn ack_against_same_digest_foreign_generation_receipt_errors() {
+    #[tokio::test]
+    async fn ack_against_same_digest_foreign_generation_receipt_errors() {
         let q = Queue::init(
             Box::new(MemoryStore::new()),
             "q",
             &OpenOptions::new([1; 16]),
             &format(),
         )
+        .await
         .unwrap();
         let mut budget = OpBudget::new(64);
         let EnqueueOutcome::Committed { job_id } = q
@@ -2757,6 +2874,7 @@ mod tests {
                 },
                 &mut budget,
             )
+            .await
             .unwrap()
         else {
             panic!()
@@ -2777,6 +2895,7 @@ mod tests {
         let digest: Digest = Sha256::digest(&body).into();
         q.store
             .put_if_absent(&q.absolute(&rel), body, digest)
+            .await
             .unwrap();
         let claim = Claim {
             job_id,
@@ -2788,7 +2907,7 @@ mod tests {
             claim_store_time_ns: 0,
             payload: PayloadRef::Inline(Bytes::from_static(b"x")),
         };
-        let err = q.ack(&claim, &mut budget).unwrap_err();
+        let err = q.ack(&claim, &mut budget).await.unwrap_err();
         assert!(matches!(err, Error::ReceiptEvidenceMismatch));
     }
 
@@ -2797,14 +2916,15 @@ mod tests {
     // Both branches are unreachable through the public claim path (a
     // dead record makes the job terminal and unclaimable), so the
     // handles are built in-crate.
-    #[test]
-    fn bury_against_dead_evidence_verified_by_generation() {
+    #[tokio::test]
+    async fn bury_against_dead_evidence_verified_by_generation() {
         let q = Queue::init(
             Box::new(MemoryStore::new()),
             "q",
             &OpenOptions::new([1; 16]),
             &format(),
         )
+        .await
         .unwrap();
         let mut budget = OpBudget::new(64);
         let EnqueueOutcome::Committed { job_id } = q
@@ -2818,6 +2938,7 @@ mod tests {
                 },
                 &mut budget,
             )
+            .await
             .unwrap()
         else {
             panic!()
@@ -2834,6 +2955,7 @@ mod tests {
         let digest: Digest = Sha256::digest(&body).into();
         q.store
             .put_if_absent(&q.absolute(&rel), body, digest)
+            .await
             .unwrap();
         let holder = Claim {
             job_id,
@@ -2852,11 +2974,11 @@ mod tests {
         };
         // The tail holder at the dead record's own generation: success.
         assert_eq!(
-            q.bury(&holder, 0x0003, &mut budget).unwrap(),
+            q.bury(&holder, 0x0003, &mut budget).await.unwrap(),
             BuryOutcome::Buried
         );
         // A stale-generation holder: conflicting evidence, an error.
-        let err = q.bury(&zombie, 0x0003, &mut budget).unwrap_err();
+        let err = q.bury(&zombie, 0x0003, &mut budget).await.unwrap_err();
         assert!(matches!(err, Error::Record(_)));
     }
 }
@@ -2877,17 +2999,19 @@ mod handle_tests {
         }
     }
 
-    fn detached_queue() -> (Queue, MemoryStore) {
+    async fn detached_queue() -> (Queue, MemoryStore) {
         let store = MemoryStore::new();
         let mut opts = OpenOptions::new([1; 16]);
         opts.max_inline_payload = 4;
-        let q = Queue::init(Box::new(store.clone()), "q", &opts, &format()).unwrap();
+        let q = Queue::init(Box::new(store.clone()), "q", &opts, &format())
+            .await
+            .unwrap();
         (q, store)
     }
 
-    #[test]
-    fn detached_handle_reconstruction_verifies_payload() {
-        let (q, store) = detached_queue();
+    #[tokio::test]
+    async fn detached_handle_reconstruction_verifies_payload() {
+        let (q, store) = detached_queue().await;
         let mut b = OpBudget::new(64);
         let payload = vec![7u8; 64];
         let EnqueueOutcome::Committed { job_id } = q
@@ -2901,22 +3025,25 @@ mod handle_tests {
                 },
                 &mut b,
             )
+            .await
             .unwrap()
         else {
             panic!()
         };
-        let claim =
-            Claim::detached_or_inline(job_id, 0, 1, 1, [9; 16], 1_000, 0, "q", &store).unwrap();
-        assert_eq!(&claim.payload(&store).unwrap()[..], &payload[..]);
+        let claim = Claim::detached_or_inline(job_id, 0, 1, 1, [9; 16], 1_000, 0, "q", &store)
+            .await
+            .unwrap();
+        assert_eq!(&claim.payload(&store).await.unwrap()[..], &payload[..]);
         // A stale (pre-write) handle for an absent job errors.
         let err = Claim::detached_or_inline([4; 16], 0, 1, 1, [9; 16], 1_000, 0, "q", &store)
+            .await
             .unwrap_err();
         assert!(matches!(err, Error::Record(_)));
     }
 
-    #[test]
-    fn detached_handle_reconstruction_rejects_tampered_payload() {
-        let (q, store) = detached_queue();
+    #[tokio::test]
+    async fn detached_handle_reconstruction_rejects_tampered_payload() {
+        let (q, store) = detached_queue().await;
         let mut b = OpBudget::new(64);
         let payload = vec![7u8; 64];
         let EnqueueOutcome::Committed { job_id } = q
@@ -2930,6 +3057,7 @@ mod handle_tests {
                 },
                 &mut b,
             )
+            .await
             .unwrap()
         else {
             panic!()
@@ -2937,15 +3065,17 @@ mod handle_tests {
         // Corrupt the detached payload object in place.
         let jhex: String = job_id.iter().map(|x| format!("{x:02x}")).collect();
         let prefix = format!("q/payloads/{jhex}/");
-        let page = store.list(&prefix, None, 10).unwrap();
+        let page = store.list(&prefix, None, 10).await.unwrap();
         let key = page.items[0].key.clone();
         let digest: Digest = Sha256::digest(vec![0u8; 64].as_slice()).into();
-        let _ = store.delete(&key);
+        let _ = store.delete(&key).await;
         store
             .put_if_absent(&key, bytes::Bytes::from(vec![0u8; 64]), digest)
+            .await
             .unwrap();
-        let err =
-            Claim::detached_or_inline(job_id, 0, 1, 1, [9; 16], 1_000, 0, "q", &store).unwrap_err();
+        let err = Claim::detached_or_inline(job_id, 0, 1, 1, [9; 16], 1_000, 0, "q", &store)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::PayloadCorrupt));
     }
 }

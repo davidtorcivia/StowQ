@@ -116,12 +116,12 @@ fn gen_ops(rng: &mut Rng, cfg: &DriverConfig) -> Vec<DriveOp> {
 /// Runs the sequence against both sides. Every operation's observable
 /// outcome is asserted equal, and the terminal state of every job is
 /// verified against the store at the end. Returns the final clock.
-pub fn run_differential(seed: u64, cfg: &DriverConfig, faults: bool) -> u64 {
-    run_with_stats(seed, cfg, faults).0
+pub async fn run_differential(seed: u64, cfg: &DriverConfig, faults: bool) -> u64 {
+    run_with_stats(seed, cfg, faults).await.0
 }
 
 /// Returns (final clock, exhaustion-dead transitions observed).
-pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usize) {
+pub async fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usize) {
     let mut rng = Rng::new(seed);
     let ops = gen_ops(&mut rng, cfg);
 
@@ -142,7 +142,9 @@ pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usiz
         Box::new(store.clone())
     };
 
-    let queue = Queue::init(queue_store, "q", &OpenOptions::new([1; 16]), &format()).expect("init");
+    let queue = Queue::init(queue_store, "q", &OpenOptions::new([1; 16]), &format())
+        .await
+        .expect("init");
 
     let mut oracle = Oracle::new();
     // The real handles a worker would hold, from core returns.
@@ -166,6 +168,7 @@ pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usiz
                         },
                         &mut budget,
                     )
+                    .await
                     .expect("enqueue survives faults");
                 let committed = matches!(out, EnqueueOutcome::Committed { .. });
                 assert_eq!(committed, expected, "seed {seed} op {i} enqueue({job})");
@@ -195,7 +198,7 @@ pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usiz
                     floor_ns: oracle.clock,
                     lease_duration_ns: cfg.lease_ns,
                 };
-                let out = queue.claim(&opts, &mut budget).expect("claim op");
+                let out = queue.claim(&opts, &mut budget).await.expect("claim op");
                 match (out, expected_job) {
                     (ClaimOutcome::Claimed(c), Some(j)) => {
                         assert_eq!(
@@ -230,7 +233,7 @@ pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usiz
                 match held[job].clone() {
                     Some(claim) => {
                         let expected = oracle.renew(&id, cfg.lease_ns);
-                        let out = queue.renew(&claim, &mut budget).expect("renew op");
+                        let out = queue.renew(&claim, &mut budget).await.expect("renew op");
                         match (out, expected) {
                             (RenewOutcome::Renewed(renewed), true) => {
                                 oracle.override_expiry(
@@ -260,7 +263,7 @@ pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usiz
                 match held[job].take() {
                     Some(claim) => {
                         let expected = oracle.ack(&id);
-                        let out = queue.ack(&claim, &mut budget).expect("ack op");
+                        let out = queue.ack(&claim, &mut budget).await.expect("ack op");
                         // First ack commits; an already-acked receipt with
                         // matching evidence is success either way.
                         let acked = matches!(out, AckOutcome::Acked | AckOutcome::AlreadyAcked);
@@ -289,6 +292,7 @@ pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usiz
                         let expected = oracle.nack(&id, until);
                         queue
                             .nack(&claim, 0x0001, oracle.clock, &mut budget)
+                            .await
                             .expect("nack op");
                         assert!(expected, "seed {seed} op {i} nack mismatch");
                     }
@@ -303,7 +307,10 @@ pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usiz
                 match held[job].take() {
                     Some(claim) => {
                         let expected = oracle.bury(&id, 0x0003);
-                        queue.bury(&claim, 0x0003, &mut budget).expect("bury op");
+                        queue
+                            .bury(&claim, 0x0003, &mut budget)
+                            .await
+                            .expect("bury op");
                         assert!(expected, "seed {seed} op {i} bury mismatch");
                     }
                     None => assert!(
@@ -324,8 +331,12 @@ pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usiz
     for j in 0..cfg.jobs {
         let id = job_id(j);
         let hex_id: String = id.iter().map(|b| format!("{b:02x}")).collect();
-        let receipt = store.head(&stowq_store::Key::new(format!("q/receipts/0000/{hex_id}")));
-        let dead = store.head(&stowq_store::Key::new(format!("q/dead/0000/{hex_id}")));
+        let receipt = store
+            .head(&stowq_store::Key::new(format!("q/receipts/0000/{hex_id}")))
+            .await;
+        let dead = store
+            .head(&stowq_store::Key::new(format!("q/dead/0000/{hex_id}")))
+            .await;
         match oracle.jobs.get(&id).map(|s| &s.phase) {
             Some(Phase::Terminal(Terminal::Receipt)) => {
                 assert!(
@@ -360,40 +371,40 @@ pub fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64, usiz
 mod tests {
     use super::*;
 
-    #[test]
-    fn differential_clean_seeds() {
+    #[tokio::test]
+    async fn differential_clean_seeds() {
         for seed in 1..=25u64 {
-            run_differential(seed, &DriverConfig::default(), false);
+            run_differential(seed, &DriverConfig::default(), false).await;
         }
     }
 
-    #[test]
-    fn differential_faulted_seeds() {
+    #[tokio::test]
+    async fn differential_faulted_seeds() {
         for seed in 1..=25u64 {
-            run_differential(seed, &DriverConfig::default(), true);
+            run_differential(seed, &DriverConfig::default(), true).await;
         }
     }
 
-    #[test]
-    fn exhaustion_transition_is_exercised() {
+    #[tokio::test]
+    async fn exhaustion_transition_is_exercised() {
         let cfg = DriverConfig::default();
         let mut total = 0;
         for seed in 1..=25u64 {
-            total += run_with_stats(seed, &cfg, false).1;
+            total += run_with_stats(seed, &cfg, false).await.1;
         }
         assert!(total > 0, "distribution must reach exhaustion-dead");
     }
 
-    #[test]
-    fn faulted_and_clean_agree_on_terminal_state() {
+    #[tokio::test]
+    async fn faulted_and_clean_agree_on_terminal_state() {
         // The same seed's final terminal set is identical with and
         // without injection: faults are transport-level only.
         let cfg = DriverConfig::default();
         for seed in 1..=10u64 {
             // run_differential returns the clock; both runs internally
             // verify terminal state, so completing is the assertion.
-            run_differential(seed, &cfg, false);
-            run_differential(seed, &cfg, true);
+            run_differential(seed, &cfg, false).await;
+            run_differential(seed, &cfg, true).await;
         }
     }
 }
