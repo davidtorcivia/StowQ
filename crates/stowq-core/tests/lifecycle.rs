@@ -1735,3 +1735,75 @@ fn repair_audits_around_a_corrupt_middle_generation() {
         report.findings
     );
 }
+
+// ---------- Watermark-raised floors (Option D) ----------
+
+#[test]
+fn establish_floor_raises_to_the_watermark_bucket() {
+    // A watermark above the fresh beacon but within the skew guard:
+    // the gate passes on the raw beacon, and the returned floor is
+    // raised to the watermark bucket — a proven lower bound, never a
+    // regression mask.
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.skew_guard_ns = 10_000_000_000;
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format()).unwrap();
+    let mut budget = OpBudget::new(256);
+    // delayed width 1000: floor 5_000_000 -> bucket 5000 -> wm 5_000_000.
+    q.advance_watermark(5_000_000, &mut budget).unwrap();
+    let f = q.establish_floor(&mut budget).unwrap();
+    assert_eq!(f, 5_000_000, "floor raised to the watermark bucket");
+    // The cached repeat returns the raised value.
+    assert_eq!(q.establish_floor(&mut budget).unwrap(), 5_000_000);
+}
+
+#[test]
+fn raised_floor_evaluates_expiry_as_a_normal_floor() {
+    // The raised floor is a valid lower bound: a takeover evaluated
+    // against it must behave exactly as a beacon floor would, and a
+    // fresh handle over the same store inherits the raise. The
+    // constants matter: the raise is bounded by skew_guard above the
+    // beacon, and expiry needs floor >= claim_time + lease + skew_guard,
+    // so the beacon must land at least one lease after the claim.
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.skew_guard_ns = 1_000_000;
+    let store = MemoryStore::new();
+    let q = Queue::init(Box::new(store.clone()), "q", &opts, &format()).unwrap();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([29; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(first) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    // Advance store time a lease-length past the claim so the beacon
+    // clears T1 + lease; then a watermark 50_000 above the guard.
+    store.advance_clock_to(first.claim_store_time_ns + 100_000);
+    q.advance_watermark(1_050_000, &mut budget).unwrap();
+    let raised = q.establish_floor(&mut budget).unwrap();
+    assert_eq!(raised, 1_050_000);
+    let stowq_core::ClaimOutcome::Claimed(second) =
+        q.claim(&claim_opts(raised, 1_000), &mut budget).unwrap()
+    else {
+        panic!("takeover at the raised floor")
+    };
+    assert_eq!(second.generation, 2);
+    // A lower advance is a no-op, and a FRESH handle over the same
+    // store still raises to the stored bucket: the watermark is
+    // shared state, so floors never go down across participants.
+    q.advance_watermark(1_000, &mut budget).unwrap();
+    let q2 = Queue::open(Box::new(store), "q", opts).unwrap();
+    assert_eq!(
+        q2.establish_floor(&mut OpBudget::new(64)).unwrap(),
+        1_050_000
+    );
+}
