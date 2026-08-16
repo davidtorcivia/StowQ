@@ -781,3 +781,35 @@ fn zombie_bury_after_ack_is_refused() {
         "no dead record may coexist with a receipt"
     );
 }
+
+#[test]
+fn tail_holder_bury_after_exhaustion_dead_verifies() {
+    // The exhaustion-dead try_claim writes carries the tail claim's
+    // (generation, attempt): the tail holder's late bury must hit the
+    // Lost branch and verify as Buried, not conflicting evidence.
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([12; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 1,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(claim) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    let floor = claim.claim_store_time_ns + 2_000;
+    let out = q.claim(&claim_opts(floor, 1_000), &mut budget).unwrap();
+    assert!(matches!(out, stowq_core::ClaimOutcome::Empty));
+    // The tail holder buries over the exhaustion-dead record: the
+    // evidence (generation, attempt) matches, so success.
+    let bury = q.bury(&claim, 0x0003, &mut budget).unwrap();
+    assert_eq!(bury, stowq_core::BuryOutcome::Buried);
+}
