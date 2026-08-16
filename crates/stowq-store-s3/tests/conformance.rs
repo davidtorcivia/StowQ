@@ -290,3 +290,140 @@ fn idempotence_and_takeover_certification() {
     assert_eq!(second.generation, first.generation + 1);
     assert_eq!(second.attempt, first.attempt + 1);
 }
+
+/// Empirical calibration (implementation-doc open questions 1 and 3):
+/// measures timestamp dispersion across read surfaces to size the
+/// skew guard, and inline-vs-detached enqueue+deliver cost to pick the
+/// inline threshold. Print-only (the CI lane runs --nocapture, so the
+/// log is the record); assertions are sanity bounds only.
+#[test]
+fn calibration_measurements() {
+    let Some(_) = endpoint() else { return };
+    use std::time::Instant;
+
+    // ---- Skew guard: surface divergence over repeated beacon writes.
+    let s = store();
+    let run = run_id();
+    let empty: [u8; 32] = Sha256::digest([]).into();
+    let mut max_divergence_ns: u64 = 0;
+    for i in 0..16 {
+        let k = Key::new(format!("conformance/cal/{run}/beacon-{i}"));
+        let PutOutcome::Committed { .. } =
+            s.put_if_absent(&k, Bytes::from_static(b""), empty).unwrap()
+        else {
+            panic!("beacon {i}")
+        };
+        let head = s.head(&k).unwrap();
+        let list_page = s
+            .list(&format!("conformance/cal/{run}/"), None, 64)
+            .unwrap();
+        let listed = list_page
+            .items
+            .iter()
+            .find(|l| l.key.as_str() == k.as_str())
+            .unwrap_or_else(|| panic!("beacon {i} not listed"));
+        let div = listed.meta.store_time_ns.abs_diff(head.store_time_ns);
+        max_divergence_ns = max_divergence_ns.max(div);
+    }
+    // Suggested guard: the observed divergence rounded up past the
+    // profile granularity (1 s for the S3 family), minimum one G.
+    let granularity_ns = 1_000_000_000u64;
+    let suggested_guard_ns = max_divergence_ns
+        .clamp(granularity_ns, u64::MAX)
+        .div_ceil(granularity_ns)
+        * granularity_ns;
+    println!(
+        "calibration: skew_guard — max LIST-vs-HEAD divergence {max_divergence_ns} ns \
+         over 16 beacons; suggested skew_guard {suggested_guard_ns} ns"
+    );
+    // Sanity: dispersion far beyond the profile granularity is a
+    // profile violation, not noise.
+    assert!(
+        max_divergence_ns < 60_000_000_000,
+        "divergence {max_divergence_ns} ns"
+    );
+
+    // ---- Inline threshold: one PUT (record embeds payload) vs two
+    // (payload + record), timed through the real queue paths.
+    let root = format!("cal-{run}");
+    // One shard: the measurement is payload cost, not sharding; a
+    // fixed shard keeps the claim loop trivial.
+    let cal_format = FormatRecord {
+        shard_count: 1,
+        ..format()
+    };
+    let sizes: [(u64, usize); 5] = [
+        (1_024, 1),
+        (4_096, 2),
+        (16_384, 3),
+        (65_536, 4),
+        (262_144, 5),
+    ];
+    println!("calibration: inline threshold — enqueue+claim+deliver by payload size (ns):");
+    println!(
+        "  {:>9} {:>12} {:>12} {:>8}",
+        "bytes", "inline", "detached", "ratio"
+    );
+    for (limit, idx) in sizes {
+        let payload = vec![0xA5u8; limit as usize];
+        let mut timings = Vec::new();
+        for inline_limit in [limit, 0] {
+            let mut opts = OpenOptions::new([1; 16]);
+            opts.max_inline_payload = inline_limit;
+            let q = Queue::init(
+                Box::new(store()),
+                &format!("{root}-{idx}-{inline_limit}"),
+                &opts,
+                &cal_format,
+            )
+            .unwrap();
+            let mut b = OpBudget::new(256);
+            let start = Instant::now();
+            let EnqueueOutcome::Committed { job_id } = q
+                .enqueue(
+                    EnqueueInput {
+                        job_id: Some([idx as u8; 16]),
+                        payload: &payload,
+                        content_type: "application/octet-stream".into(),
+                        maximum_attempts: 1,
+                        not_before_ns: None,
+                    },
+                    &mut b,
+                )
+                .unwrap()
+            else {
+                panic!()
+            };
+            let floor = q.establish_floor(&mut OpBudget::new(16)).unwrap();
+            let ClaimOutcome::Claimed(claim) = q
+                .claim(
+                    &ClaimOptions {
+                        shard: 0,
+                        floor_ns: floor,
+                        lease_duration_ns: 60_000_000_000,
+                    },
+                    &mut OpBudget::new(512),
+                )
+                .unwrap()
+            else {
+                panic!("claim {idx}/{inline_limit}")
+            };
+            let got = claim.payload(q.store()).unwrap();
+            assert_eq!(got.len(), payload.len());
+            assert_eq!(claim.job_id, job_id);
+            timings.push(start.elapsed().as_nanos() as u64);
+        }
+        let (inline_ns, detached_ns) = (timings[0], timings[1]);
+        println!(
+            "  {:>9} {:>12} {:>12} {:>8}",
+            limit,
+            inline_ns,
+            detached_ns,
+            format!("{:.2}", detached_ns as f64 / inline_ns.max(1) as f64)
+        );
+    }
+    println!(
+        "calibration: inline threshold — the crossover row (ratio <~1) is the \
+         suggested default below; the current default is 4096"
+    );
+}
