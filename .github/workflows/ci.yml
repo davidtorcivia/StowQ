@@ -31,6 +31,48 @@ jobs:
       - name: Test
         run: cargo test --all
 
+  minio-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # dtolnay/rust-toolchain pinned; resolves to 1.97.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - name: Start MinIO
+        run: |
+          # RELEASE.2025-09-07T16-13-09Z, pinned by digest
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data
+          for i in $(seq 30); do
+            ready=http://localhost:9000/minio/health/ready
+            curl -sf -o /dev/null "$ready" && break
+            sleep 2
+          done
+          curl -sf -o /dev/null http://localhost:9000/minio/health/ready
+      - name: Create bucket
+        run: |
+          url=https://dl.min.io/client/mc/release/linux-amd64
+          curl -fsSL "$url/mc" -o /tmp/mc
+          sum=01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
+          echo "$sum  /tmp/mc" | sha256sum --check --strict
+          chmod +x /tmp/mc
+          /tmp/mc alias set ci http://localhost:9000 minioadmin minioadmin
+          /tmp/mc mb --ignore-existing ci/stowq-conformance
+      - name: Conformance suite
+        env:
+          STOWQ_CONFORMANCE_ENDPOINT: http://localhost:9000
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+        run: >
+          cargo test -p stowq-store-s3 --features conformance --
+          --nocapture
+
   tla:
     runs-on: ubuntu-latest
     steps:
@@ -44,7 +86,8 @@ jobs:
           url=https://github.com/tlaplus/tlaplus/releases/download/v1.7.4
           curl -fsSL "$url/tla2tools.jar" -o /tmp/tla2tools.jar
           sum=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
-          echo "$sum  /tmp/tla2tools.jar" | sha256sum --check --strict
+          echo "$sum  /tmp/tla2tools.jar" |
+            sha256sum --check --strict
       - name: Check claims model
         run: >
           java -cp /tmp/tla2tools.jar tlc2.TLC
