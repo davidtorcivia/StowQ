@@ -34,7 +34,8 @@ conformance run against a named endpoint and version.
 | Amazon S3 | `If-None-Match: *` (2024-08) | `If-Match` on PUT (2024-11) | strong (2020+) | yes | 1 s | LIST or HEAD | |
 | Google GCS | `x-goog-if-generation-match: 0` | generation-match | strong | yes | 1 ms | `updated` | Generations are native fencing. |
 | Azure Blob | `If-None-Match: *` | `If-Match` | strong | yes | 1 s | LIST or HEAD | |
-| MinIO / Ceph RGW | version-dependent | version-dependent | version-dependent | yes | per deployment | per deployment | Must be certified per deployment. |
+| MinIO | `If-None-Match: *` | `If-Match` | strong | yes | 1 s | LIST or HEAD | Certified at RELEASE.2025-09-07T16-13-09Z by the conformance suite. |
+| Ceph RGW | version-dependent | version-dependent | version-dependent | yes | per deployment | per deployment | Must be certified per deployment. |
 
 P6 is the load-bearing assumption most likely to be subtle in practice.
 StowQ/1 does not require store clocks to be *accurate*, only that the
