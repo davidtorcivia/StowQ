@@ -181,7 +181,14 @@ fn run(command: Command) -> Result<(), String> {
             }
             match outcome {
                 ClaimOutcome::Claimed(claim) => {
-                    let handle = state::Handle::from_claim(&claim);
+                    let payload_ref = match claim.payload_preview() {
+                        Some(b) => format!(
+                            "inline:{}",
+                            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+                        ),
+                        None => format!("detached:{}", hex(&claim.job_id)),
+                    };
+                    let handle = state::Handle::from_claim(&claim, &payload_ref);
                     println!(
                         "{}",
                         serde_json::to_string(&handle).map_err(|e| e.to_string())?
@@ -194,7 +201,7 @@ fn run(command: Command) -> Result<(), String> {
         Command::Ack { queue, handle } => {
             let (q, store) = open(&queue)?;
             let handle: state::Handle = serde_json::from_str(&handle).map_err(|e| e.to_string())?;
-            let claim = handle.to_claim()?;
+            let claim = handle.to_claim(&store, &queue)?;
             match q.ack(&claim, &mut OpBudget::new(128)) {
                 Ok(AckOutcome::Acked) => {
                     println!("acked");
@@ -212,7 +219,7 @@ fn run(command: Command) -> Result<(), String> {
         } => {
             let (q, store) = open(&queue)?;
             let handle: state::Handle = serde_json::from_str(&handle).map_err(|e| e.to_string())?;
-            let claim = handle.to_claim()?;
+            let claim = handle.to_claim(&store, &queue)?;
             let floor = q
                 .establish_floor(&mut OpBudget::new(16))
                 .map_err(|e| e.to_string())?;
@@ -228,7 +235,7 @@ fn run(command: Command) -> Result<(), String> {
         } => {
             let (q, store) = open(&queue)?;
             let handle: state::Handle = serde_json::from_str(&handle).map_err(|e| e.to_string())?;
-            let claim = handle.to_claim()?;
+            let claim = handle.to_claim(&store, &queue)?;
             q.bury(&claim, reason, &mut OpBudget::new(128))
                 .map_err(|e| e.to_string())?;
             println!("buried");
@@ -271,7 +278,8 @@ fn run(command: Command) -> Result<(), String> {
         Command::Inspect { queue, job_id } => {
             let (q, _store) = open(&queue)?;
             let id = parse_job_id(&job_id)?;
-            let out = state::inspect(q.store(), &queue, id).map_err(|e| e.to_string())?;
+            let out = state::inspect(q.store(), &queue, id, q.format().shard_count.max(1))
+                .map_err(|e| e.to_string())?;
             println!("{out}");
         }
     }

@@ -148,6 +148,66 @@ impl Claim {
         }
     }
 
+    /// Builds a claim handle whose payload reference is reconstructed
+    /// from the job record: inline bytes come from the record; a
+    /// detached payload is fetched by its key and verified against the
+    /// record's digest. For tooling that rebuilds handles from
+    /// persisted state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detached_or_inline(
+        job_id: [u8; 16],
+        shard: u16,
+        generation: u64,
+        attempt: u64,
+        worker_token: [u8; 16],
+        lease_duration_ns: u64,
+        claim_store_time_ns: u64,
+        queue_root: &str,
+        store: &dyn ObjectStore,
+    ) -> Result<Claim, Error> {
+        let rel = RelKey::Job { shard, job_id };
+        let abs = Key::new(format!("{queue_root}/{}", rel));
+        let tag = stowq_keys::key_tag(&QUEUE_ID_FOR_TOOLING, &rel.to_string());
+        let obj = match store.get(&abs, None) {
+            Ok(obj) => obj,
+            Err(StoreError::NotFound) => {
+                return Err(Error::Record("job record not found for handle".into()))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let job = match stowq_format::decode(&obj.body, &QUEUE_ID_FOR_TOOLING, &tag)? {
+            Record::Job(j) => j,
+            _ => return Err(Error::Record("job key holds a non-job record".into())),
+        };
+        let payload = match (&job.payload_inline, &job.payload_key) {
+            (Some(b), _) => PayloadRef::Inline(Bytes::from(b.clone())),
+            (None, Some(k)) => {
+                let key = Key::new(format!("{queue_root}/{k}"));
+                let obj = store.get(&key, None)?;
+                let got: Digest = Sha256::digest(&obj.body).into();
+                if got != job.payload_digest || obj.body.len() as u64 != job.payload_length {
+                    return Err(Error::PayloadCorrupt);
+                }
+                PayloadRef::Detached {
+                    key,
+                    digest: job.payload_digest,
+                    length: job.payload_length,
+                }
+            }
+            _ => return Err(Error::Record("job payload reference invalid".into())),
+        };
+        Ok(Claim {
+            job_id,
+            shard,
+            generation,
+            attempt,
+            worker_token,
+            lease_duration_ns,
+            claim_store_time_ns,
+            payload,
+        })
+    }
+
     /// The inline payload bytes, when the claim carries them.
     pub fn payload_preview(&self) -> Option<&[u8]> {
         match &self.payload {
@@ -301,6 +361,10 @@ struct FloorCache {
 const FLOOR_STALENESS: std::time::Duration = std::time::Duration::from_secs(30);
 
 const RETRY_TRANSPORT_MAX: usize = 4;
+
+/// Queue id for handle-reconstruction tooling built on the dev
+/// convention (OpenOptions::new([1; 16])).
+const QUEUE_ID_FOR_TOOLING: [u8; 16] = [1; 16];
 
 impl Queue {
     /// Opens an initialized queue: reads and verifies `meta/FORMAT`.

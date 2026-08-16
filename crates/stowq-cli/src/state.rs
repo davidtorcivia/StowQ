@@ -15,17 +15,13 @@ pub struct Handle {
     pub worker_token: String,
     pub lease_duration_ns: u64,
     pub claim_store_time_ns: u64,
-    pub inline_payload: String,
+    /// The payload reference: 'inline:<hex>' or
+    /// 'detached:<payload_key>' — reconstructed through the store.
+    pub payload: String,
 }
 
 impl Handle {
-    pub fn from_claim(c: &Claim) -> Self {
-        // The payload reference is inline for CLI flows (small
-        // payloads); detached reads re-fetch through the store.
-        let inline = c
-            .payload_preview()
-            .map(|b| b.iter().map(|x| format!("{x:02x}")).collect())
-            .unwrap_or_default();
+    pub fn from_claim(c: &Claim, payload: &str) -> Self {
         Handle {
             job_id: c.job_id.iter().map(|x| format!("{x:02x}")).collect(),
             shard: c.shard,
@@ -34,11 +30,16 @@ impl Handle {
             worker_token: c.worker_token.iter().map(|x| format!("{x:02x}")).collect(),
             lease_duration_ns: c.lease_duration_ns,
             claim_store_time_ns: c.claim_store_time_ns,
-            inline_payload: inline,
+            payload: payload.to_string(),
         }
     }
 
-    pub fn to_claim(&self) -> Result<Claim, String> {
+    /// Rebuilds the claim, re-fetching the payload through the store
+    /// and verifying it against the job record's evidence — inline
+    /// payloads come from the record itself; detached payloads are
+    /// fetched by key and hash-checked. A mismatch is an error, never
+    /// an empty inline claim.
+    pub fn to_claim(&self, store: &MemoryStore, queue: &str) -> Result<Claim, String> {
         let decode = |s: &str| -> Result<Vec<u8>, String> {
             (0..s.len() / 2)
                 .map(|i| {
@@ -53,8 +54,7 @@ impl Handle {
         let token: [u8; 16] = decode(&self.worker_token)?
             .try_into()
             .map_err(|_| "bad token".to_string())?;
-        let payload = decode(&self.inline_payload)?;
-        Ok(stowq_core::Claim::inline(
+        stowq_core::Claim::detached_or_inline(
             job_id,
             self.shard,
             self.generation,
@@ -62,8 +62,10 @@ impl Handle {
             token,
             self.lease_duration_ns,
             self.claim_store_time_ns,
-            bytes::Bytes::from(payload),
-        ))
+            queue,
+            store,
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -145,9 +147,14 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, std::io::Error> {
         .collect()
 }
 
-pub fn inspect(store: &dyn ObjectStore, queue: &str, job_id: [u8; 16]) -> Result<String, String> {
+pub fn inspect(
+    store: &dyn ObjectStore,
+    queue: &str,
+    job_id: [u8; 16],
+    shard_count: u32,
+) -> Result<String, String> {
     let h: String = job_id.iter().map(|x| format!("{x:02x}")).collect();
-    let shard = stowq_keys::compute_shard(&[1; 16], &job_id, 256);
+    let shard = stowq_keys::compute_shard(&[1; 16], &job_id, shard_count);
     let mut lines = Vec::new();
     let keys = [
         format!("{queue}/jobs/{shard:04x}/{h}"),
