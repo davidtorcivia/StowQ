@@ -35,6 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       minio:
+        # minio RELEASE.2025-09-07T16-13-09Z, pinned by digest
         image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
         env:
           MINIO_ROOT_USER: minioadmin
@@ -44,7 +45,7 @@ jobs:
         options: >-
           --health-cmd "curl -f http://localhost:9000/minio/health/ready"
           --health-interval 5s --health-timeout 3s --health-retries 10
-          --command server /data
+          --cmd server /data
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       # dtolnay/rust-toolchain pinned; resolves to 1.97.1
