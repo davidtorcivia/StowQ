@@ -71,6 +71,25 @@ fn claim_vector_round_trips_both_directions() {
     assert_eq!(encode(&claim_record(), &Q, &TAG), bytes);
 }
 
+const QUARANTINE_HEX: &str = "871b53544f5751312d00010050000102030405060708090a0b0c0d0e0f48070707070707070708a56371696450101010101010101010101010101010106664657461696c0266726561736f6e106a736f757263655f6b65797835636c61696d732f303030312f31303131313231333134313531363137313831393161316231633164316531662f3030303030303032716f627365727665645f73746f72655f6e7319138858209a9f89b5a1c7027b560c8b657b9e85dc2886e1e901c5c6d9bff9e7d423527107";
+
+fn quarantine_record() -> Record {
+    Record::Quarantine(QuarantineRecord {
+        qid: [0x10; 16],
+        source_key: "claims/0001/101112131415161718191a1b1c1d1e1f/00000002".into(),
+        reason: 0x0010,
+        observed_store_ns: 5_000,
+        detail: Some(2),
+    })
+}
+
+#[test]
+fn quarantine_vector_round_trips_both_directions() {
+    let bytes = unhex(QUARANTINE_HEX);
+    assert_eq!(decode(&bytes, &Q, &TAG), Ok(quarantine_record()));
+    assert_eq!(encode(&quarantine_record(), &Q, &TAG), bytes);
+}
+
 #[test]
 fn record_digests_match_spec() {
     let job_digest = &unhex(JOB_HEX)[unhex(JOB_HEX).len() - 32..];

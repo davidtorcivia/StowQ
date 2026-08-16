@@ -47,9 +47,15 @@ fn type_name(t: u64) -> Option<&'static str> {
         5 => "receipt",
         6 => "dead",
         7 => "watermark",
+        8 => "quarantine",
         _ => return None,
     })
 }
+
+/// v1.1: the feature bits this decoder understands. Bit 1 gates the
+/// quarantine record (type 8). A FORMAT demanding any other bit is
+/// rejected as an unknown required feature.
+pub const KNOWN_FEATURE_BITS: u64 = 1;
 
 fn record_digest(type_str: &str, body: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -171,7 +177,7 @@ impl FormatRecord {
         {
             return Err(RecordError::Field("bucket width"));
         }
-        if self.required_feature_bits != 0 {
+        if self.required_feature_bits & !KNOWN_FEATURE_BITS != 0 {
             return Err(RecordError::Field("required_feature_bits"));
         }
         Ok(())
@@ -245,6 +251,27 @@ pub struct DeadRecord {
     pub reason: u64,
 }
 
+/// v1.1 (feature bit 1): a durable audit finding under
+/// `quarantine/<t-bucket>/<qid>`. Both the key and the body are
+/// deterministic per (queue, source, reason) so independent auditors
+/// converge byte-identically (records.md, Quarantine).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineRecord {
+    /// Deterministic: SHA256("StowQ-1-qid\0" || queue_id || rel_key ||
+    /// reason), first 16 bytes.
+    pub qid: [u8; 16],
+    /// The offending object's RELATIVE key (root prefixes are a
+    /// deployment detail; key_tag uses relative keys too).
+    pub source_key: String,
+    /// Quarantine reason (spec reasons.md).
+    pub reason: u64,
+    /// The SOURCE object's store time — not the finding time — so the
+    /// record body is deterministic. Also determines the t-bucket.
+    pub observed_store_ns: u64,
+    /// Optional reason-specific code (e.g. a generation number).
+    pub detail: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatermarkRecord {
     pub highest_observed_wall_bucket: u64,
@@ -260,6 +287,7 @@ pub enum Record {
     Receipt(ReceiptRecord),
     Dead(DeadRecord),
     Watermark(WatermarkRecord),
+    Quarantine(QuarantineRecord),
 }
 
 impl Record {
@@ -272,6 +300,7 @@ impl Record {
             Record::Receipt(_) => 5,
             Record::Dead(_) => 6,
             Record::Watermark(_) => 7,
+            Record::Quarantine(_) => 8,
         }
     }
 
@@ -365,6 +394,15 @@ impl Record {
                     r.highest_observed_wall_bucket,
                 );
                 kv_u64(&mut m, "sequence", r.sequence);
+            }
+            Record::Quarantine(r) => {
+                kv_bytes(&mut m, "qid", &r.qid);
+                kv_text(&mut m, "source_key", &r.source_key);
+                kv_u64(&mut m, "reason", r.reason);
+                kv_u64(&mut m, "observed_store_ns", r.observed_store_ns);
+                if let Some(d) = r.detail {
+                    kv_u64(&mut m, "detail", d);
+                }
             }
         }
         m
@@ -611,6 +649,25 @@ impl Record {
                 Record::Watermark(WatermarkRecord {
                     highest_observed_wall_bucket: get_u64(m, "highest_observed_wall_bucket")?,
                     sequence: get_u64(m, "sequence")?,
+                })
+            }
+            8 => {
+                let mut allowed = vec!["qid", "source_key", "reason", "observed_store_ns"];
+                if m.iter().any(|(k, _)| k == &Value::Text("detail".into())) {
+                    allowed.push("detail");
+                }
+                expect_keys(m, &allowed)?;
+                let detail = match m.iter().find(|(k, _)| k == &Value::Text("detail".into())) {
+                    Some((_, Value::Uint(d))) => Some(*d),
+                    Some(_) => return Err(RecordError::Field("detail")),
+                    None => None,
+                };
+                Record::Quarantine(QuarantineRecord {
+                    qid: get_bytes(m, "qid")?,
+                    source_key: get_text(m, "source_key")?,
+                    reason: get_u64(m, "reason")?,
+                    observed_store_ns: get_u64(m, "observed_store_ns")?,
+                    detail,
                 })
             }
             _ => return Err(RecordError::Type),
@@ -1103,12 +1160,84 @@ mod tests {
                 "{width_field} = 0 must fail validate"
             );
         }
+        // Bit 1 is known (v1.1 quarantine); bit 2 is not.
         assert_eq!(
             FormatRecord {
-                required_feature_bits: 1,
+                required_feature_bits: 2,
                 ..base_format()
             }
             .validate(),
+            Err(RecordError::Field("required_feature_bits"))
+        );
+    }
+
+    #[test]
+    fn quarantine_round_trips_with_and_without_detail() {
+        let base = Record::Quarantine(QuarantineRecord {
+            qid: [0x10; 16],
+            source_key: "claims/0001/abcd/00000002".into(),
+            reason: 0x0010,
+            observed_store_ns: 5_000,
+            detail: Some(2),
+        });
+        let bytes = encode(&base, &Q, &TAG);
+        assert_eq!(decode(&bytes, &Q, &TAG), Ok(base.clone()));
+        let no_detail = Record::Quarantine(QuarantineRecord {
+            detail: None,
+            ..match base {
+                Record::Quarantine(q) => q,
+                _ => unreachable!(),
+            }
+        });
+        let bytes = encode(&no_detail, &Q, &TAG);
+        assert_eq!(decode(&bytes, &Q, &TAG), Ok(no_detail));
+    }
+
+    #[test]
+    fn quarantine_rejects_unknown_fields_and_bad_types() {
+        let record = Record::Quarantine(QuarantineRecord {
+            qid: [0x10; 16],
+            source_key: "jobs/0001/x".into(),
+            reason: 0x0003,
+            observed_store_ns: 1,
+            detail: None,
+        });
+        let mut fields = record.fields();
+        fields.push((Value::Text("extra".into()), Value::Uint(1)));
+        let body = Value::Array(vec![
+            Value::Uint(MAGIC),
+            Value::Uint(MAJOR),
+            Value::Uint(MINOR),
+            Value::Bytes(Q.to_vec()),
+            Value::Bytes(TAG.to_vec()),
+            Value::Uint(8),
+            Value::Map(fields),
+        ]);
+        let body_bytes = cbor::encode(&body);
+        let digest = record_digest("quarantine", &body_bytes);
+        let mut out = body_bytes;
+        out.push(0x58);
+        out.push(32);
+        out.extend_from_slice(&digest);
+        assert_eq!(
+            decode(&out, &Q, &TAG),
+            Err(RecordError::UnknownField("extra".into()))
+        );
+    }
+
+    #[test]
+    fn validate_accepts_bit1_and_rejects_unknown_bits() {
+        let mut f = base_format();
+        f.required_feature_bits = KNOWN_FEATURE_BITS;
+        assert!(f.validate().is_ok());
+        f.required_feature_bits = 2;
+        assert_eq!(
+            f.validate(),
+            Err(RecordError::Field("required_feature_bits"))
+        );
+        f.required_feature_bits = 3; // known bit plus unknown
+        assert_eq!(
+            f.validate(),
             Err(RecordError::Field("required_feature_bits"))
         );
     }

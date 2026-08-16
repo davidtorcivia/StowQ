@@ -22,6 +22,14 @@ the index entry.
 
 ## Repair scan (rare, resumable)
 
+On v1.1 queues (feature bit 1) the repair scan additionally WRITES each
+finding as a quarantine record (see records.md, Quarantine record):
+deterministic key and body per (queue, source, reason), put-if-absent,
+never GC'd. Repaired-then-recurring findings are not re-recorded (the
+key exists); administrative deletion of the quarantine record is the
+resolution path. On v1 queues the scan reports findings to its caller
+and writes nothing.
+
 Advisory indexes are best-effort (their PUT follows the authoritative PUT
 non-atomically), so a low-frequency repair scan LISTs `claims/` and `jobs/`
 shard-by-shard with a persisted CAS'd cursor, regenerating missing index
