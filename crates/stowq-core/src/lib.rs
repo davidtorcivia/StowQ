@@ -403,8 +403,25 @@ impl Queue {
         match store.put_if_absent(&key, body, digest)? {
             PutOutcome::Committed { .. } => {}
             PutOutcome::Rejected => {
-                // A different format already owns the prefix.
-                let obj = store.get(&key, None)?;
+                // A different format may already own the prefix: read
+                // it back and compare. This is a post-write resolution
+                // read, so outcome-unknown retries rather than leaking
+                // (init predates the budget; the retry counter alone
+                // bounds the loop).
+                let mut retries = 0;
+                let obj = loop {
+                    match store.get(&key, None) {
+                        Ok(obj) => break obj,
+                        Err(StoreError::Transport(_)) | Err(StoreError::OutcomeUnknown(_)) => {
+                            retries += 1;
+                            if retries > RETRY_TRANSPORT_MAX {
+                                return Err(Error::TransportExhausted);
+                            }
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                };
                 let existing = stowq_format::decode(&obj.body, &opts.queue_id, &tag)?;
                 if existing != Record::Format(format.clone()) {
                     return Err(Error::QueueIdMismatch);
@@ -491,19 +508,21 @@ impl Queue {
         &self,
         budget: &mut OpBudget,
     ) -> Result<Option<stowq_format::WatermarkRecord>, Error> {
-        budget.spend()?;
         let rel = RelKey::Watermark;
         let abs = self.absolute(&rel);
         let tag = self.tag_for(&rel);
-        match self.store.get(&abs, None) {
+        // read_retrying spends the budget; this read also backs the
+        // watermark CAS's outcome resolution, so it must not leak an
+        // unknown outcome upward.
+        match self.read_retrying(&abs, budget) {
             Ok(obj) => match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
                 Record::Watermark(w) => Ok(Some(w)),
                 _ => Err(Error::Record(
                     "watermark key holds a non-watermark record".into(),
                 )),
             },
-            Err(StoreError::NotFound) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(Error::Store(StoreError::NotFound)) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 

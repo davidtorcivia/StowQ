@@ -355,3 +355,59 @@ fn read_unknown_during_reack_verification_retries() {
         stowq_core::AckOutcome::AlreadyAcked
     );
 }
+
+#[test]
+fn watermark_resolution_read_unknown_retries() {
+    // The watermark create (Put call 2) is committed-but-response-lost;
+    // the resolution read that follows (Get call 3, after open's FORMAT
+    // read, establish_floor's watermark check, and the CAS loop's own
+    // initial read) itself returns outcome-unknown: the retry reads the
+    // committed watermark, coverage resolves, and no unknown escapes.
+    let injector = Injector::new(
+        MemoryStore::new(),
+        vec![
+            FaultPlan::new(Op::PutIfAbsent, Fault::PostTransmitAfter, [2]),
+            FaultPlan::new(Op::Get, Fault::PostTransmit, [3]),
+        ],
+    );
+    let q = Queue::init(
+        Box::new(injector),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .unwrap();
+    let mut budget = OpBudget::new(64);
+    let floor = q.establish_floor(&mut budget).unwrap();
+    q.advance_watermark(floor, &mut budget).unwrap();
+    let w = q.watermark(&mut budget).unwrap().unwrap();
+    assert_eq!(w.highest_observed_wall_bucket, floor / 1_000);
+}
+
+#[test]
+fn init_rejected_branch_read_unknown_retries() {
+    // An identical FORMAT already owns the prefix (init by another
+    // participant): the put rejects and init reads the existing record
+    // back to compare. That read (Get call 0) returns outcome-unknown;
+    // the retry reads it, the records compare equal, and open proceeds.
+    let inner = MemoryStore::new();
+    let pre = Queue::init(
+        Box::new(inner.clone()),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .unwrap();
+    drop(pre);
+    let injector = Injector::new(
+        inner,
+        vec![FaultPlan::new(Op::Get, Fault::PostTransmit, [0])],
+    );
+    Queue::init(
+        Box::new(injector),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .unwrap();
+}
