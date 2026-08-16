@@ -1143,13 +1143,18 @@ impl Queue {
                 Ok(AckOutcome::Acked)
             }
             Resolved::Lost | Resolved::NotCommitted => {
-                // A receipt exists: verify its evidence matches.
+                // A receipt exists: idempotent-verify its evidence
+                // (identity is the key; generation, attempt, and the
+                // re-verified payload digest must match this claim).
                 budget.spend()?;
                 let obj = self.store.get(&abs, None)?;
                 let tag = self.tag_for(&rel);
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
                     Record::Receipt(r)
-                        if r.job_id == claim.job_id && r.payload_digest == digest =>
+                        if r.job_id == claim.job_id
+                            && r.generation == claim.generation
+                            && r.attempt == claim.attempt
+                            && r.payload_digest == digest =>
                     {
                         Ok(AckOutcome::AlreadyAcked)
                     }
@@ -1267,13 +1272,19 @@ impl Queue {
                 Ok(BuryOutcome::Buried)
             }
             Resolved::Lost => {
-                // First-wins: an existing dead record for the same job
-                // with consistent evidence is success.
+                // First-wins: an existing dead record with this claim's
+                // evidence (identity is the key; generation and attempt
+                // must match) is success. Any other dead record is a
+                // conflicting-terminal finding.
                 budget.spend()?;
                 let obj = self.store.get(&abs, None)?;
                 let tag = self.tag_for(&rel);
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
-                    Record::Dead(d) if d.job_id == claim.job_id => Ok(BuryOutcome::Buried),
+                    Record::Dead(d)
+                        if d.generation == claim.generation && d.attempt == claim.attempt =>
+                    {
+                        Ok(BuryOutcome::Buried)
+                    }
                     _ => Err(Error::Record("dead key holds conflicting evidence".into())),
                 }
             }
@@ -1918,6 +1929,133 @@ mod tests {
         };
         let err = q.ack(&claim, &mut budget).unwrap_err();
         assert!(matches!(err, Error::ReceiptEvidenceMismatch));
+    }
+
+    // Same payload digest, different generation: the generation-evidence
+    // check must still fail the idempotent-verify (spec records.md,
+    // Acknowledgment; quarantine 0x0013).
+    #[test]
+    fn ack_against_same_digest_foreign_generation_receipt_errors() {
+        let q = Queue::init(
+            Box::new(MemoryStore::new()),
+            "q",
+            &OpenOptions::new([1; 16]),
+            &format(),
+        )
+        .unwrap();
+        let mut budget = OpBudget::new(64);
+        let EnqueueOutcome::Committed { job_id } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([7; 16]),
+                    payload: b"x",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut budget,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let rel = RelKey::Receipt { shard: 0, job_id };
+        let tag = q.tag_for(&rel);
+        let payload_digest: Digest = Sha256::digest(b"x").into();
+        let receipt = Record::Receipt(ReceiptRecord {
+            job_id,
+            generation: 2,
+            attempt: 2,
+            worker_id: "other".into(),
+            worker_token: [0x99; 16],
+            payload_digest,
+            output_digests: vec![],
+        });
+        let body = Bytes::from(stowq_format::encode(&receipt, &[1; 16], &tag));
+        let digest: Digest = Sha256::digest(&body).into();
+        q.store
+            .put_if_absent(&q.absolute(&rel), body, digest)
+            .unwrap();
+        let claim = Claim {
+            job_id,
+            shard: 0,
+            generation: 1,
+            attempt: 1,
+            worker_token: [1; 16],
+            lease_duration_ns: 60_000_000_000,
+            claim_store_time_ns: 0,
+            payload: PayloadRef::Inline(Bytes::from_static(b"x")),
+        };
+        let err = q.ack(&claim, &mut budget).unwrap_err();
+        assert!(matches!(err, Error::ReceiptEvidenceMismatch));
+    }
+
+    // Bury's idempotent-verify: matching evidence is success, a
+    // foreign-generation dead record is a conflicting-terminal error.
+    // Both branches are unreachable through the public claim path (a
+    // dead record makes the job terminal and unclaimable), so the
+    // handles are built in-crate.
+    #[test]
+    fn bury_against_dead_evidence_verified_by_generation() {
+        let q = Queue::init(
+            Box::new(MemoryStore::new()),
+            "q",
+            &OpenOptions::new([1; 16]),
+            &format(),
+        )
+        .unwrap();
+        let mut budget = OpBudget::new(64);
+        let EnqueueOutcome::Committed { job_id } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([7; 16]),
+                    payload: b"x",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut budget,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let rel = RelKey::Dead { shard: 0, job_id };
+        let tag = q.tag_for(&rel);
+        let dead = Record::Dead(DeadRecord {
+            job_id,
+            generation: 2,
+            attempt: 2,
+            reason: 0x0003,
+        });
+        let body = Bytes::from(stowq_format::encode(&dead, &[1; 16], &tag));
+        let digest: Digest = Sha256::digest(&body).into();
+        q.store
+            .put_if_absent(&q.absolute(&rel), body, digest)
+            .unwrap();
+        let holder = Claim {
+            job_id,
+            shard: 0,
+            generation: 2,
+            attempt: 2,
+            worker_token: [1; 16],
+            lease_duration_ns: 60_000_000_000,
+            claim_store_time_ns: 0,
+            payload: PayloadRef::Inline(Bytes::from_static(b"x")),
+        };
+        let zombie = Claim {
+            generation: 1,
+            attempt: 1,
+            ..holder.clone()
+        };
+        // The tail holder at the dead record's own generation: success.
+        assert_eq!(
+            q.bury(&holder, 0x0003, &mut budget).unwrap(),
+            BuryOutcome::Buried
+        );
+        // A stale-generation holder: conflicting evidence, an error.
+        let err = q.bury(&zombie, 0x0003, &mut budget).unwrap_err();
+        assert!(matches!(err, Error::Record(_)));
     }
 }
 

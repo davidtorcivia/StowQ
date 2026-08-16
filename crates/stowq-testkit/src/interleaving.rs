@@ -285,10 +285,15 @@ mod tests {
             matches!(renewed, RenewOutcome::LeaseLost),
             "receipt must fence the live claim's renewal"
         );
-        // B's direct ack against the existing receipt with matching
-        // payload evidence verifies as AlreadyAcked.
-        let out = qb.ack(&b_claim, &mut b).unwrap();
-        assert!(matches!(out, AckOutcome::AlreadyAcked));
+        // B's ack against A's receipt: the receipt holds generation-1
+        // evidence while B holds generation 2, so the idempotent-verify
+        // fails the generation check and errors (quarantine finding
+        // 0x0013). The job is terminal either way; no second record.
+        let out = qb.ack(&b_claim, &mut b);
+        assert!(
+            matches!(out, Err(stowq_core::Error::ReceiptEvidenceMismatch)),
+            "cross-generation ack must fail the receipt evidence check"
+        );
         check_invariants(&qa, 1, 1);
     }
 
