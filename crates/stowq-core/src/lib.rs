@@ -674,9 +674,8 @@ impl Queue {
             Resolved::Lost => {
                 // Someone's record holds the key: ours if identical
                 // (idempotent enqueue), theirs otherwise.
-                budget.spend()?;
                 let tag = self.tag_for(&rel);
-                let obj = self.store.get(&abs, None)?;
+                let obj = self.read_retrying(&abs, budget)?;
                 // An undecodable record is provably not ours.
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
                     Ok(found) if found == record => Ok(EnqueueOutcome::Committed { job_id }),
@@ -736,7 +735,34 @@ impl Queue {
             match self.store.head(abs) {
                 Ok(_) => return Ok(true),
                 Err(StoreError::NotFound) => return Ok(false),
-                Err(StoreError::Transport(_)) => {
+                Err(StoreError::Transport(_)) | Err(StoreError::OutcomeUnknown(_)) => {
+                    transport_retries += 1;
+                    if transport_retries > RETRY_TRANSPORT_MAX {
+                        return Err(Error::TransportExhausted);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// A full read with transport retries. Reads have no side effects,
+    /// so an outcome-unknown read (an S3 5xx or timeout on GET) is as
+    /// safe to retry as a pre-transmit failure; bounded like every
+    /// other retry. Used by the post-write resolution reads so
+    /// outcome-unknown never escapes a write path.
+    fn read_retrying(
+        &self,
+        abs: &Key,
+        budget: &mut OpBudget,
+    ) -> Result<stowq_store::Object, Error> {
+        let mut transport_retries = 0;
+        loop {
+            budget.spend()?;
+            match self.store.get(abs, None) {
+                Ok(obj) => return Ok(obj),
+                Err(StoreError::Transport(_)) | Err(StoreError::OutcomeUnknown(_)) => {
                     transport_retries += 1;
                     if transport_retries > RETRY_TRANSPORT_MAX {
                         return Err(Error::TransportExhausted);
@@ -806,8 +832,7 @@ impl Queue {
             budget.spend()?;
             match self.store.head(abs) {
                 Ok(_) => {
-                    budget.spend()?;
-                    let obj = self.store.get(abs, None)?;
+                    let obj = self.read_retrying(abs, budget)?;
                     let tag = self.tag_for(rel);
                     // Present but undecodable is not ours: lost (the
                     // repair scan owns quarantine).
@@ -818,7 +843,7 @@ impl Queue {
                     }
                 }
                 Err(StoreError::NotFound) => return Ok(Resolved::NotCommitted),
-                Err(StoreError::Transport(_)) => {
+                Err(StoreError::Transport(_)) | Err(StoreError::OutcomeUnknown(_)) => {
                     transport_retries += 1;
                     if transport_retries > RETRY_TRANSPORT_MAX {
                         return Err(Error::TransportExhausted);
@@ -1214,8 +1239,7 @@ impl Queue {
                 // A receipt exists: idempotent-verify its evidence
                 // (identity is the key; generation, attempt, and the
                 // re-verified payload digest must match this claim).
-                budget.spend()?;
-                let obj = self.store.get(&abs, None)?;
+                let obj = self.read_retrying(&abs, budget)?;
                 let tag = self.tag_for(&rel);
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
                     Record::Receipt(r)
@@ -1347,8 +1371,7 @@ impl Queue {
                 // evidence (identity is the key; generation and attempt
                 // must match) is success. Any other dead record is a
                 // conflicting-terminal finding.
-                budget.spend()?;
-                let obj = self.store.get(&abs, None)?;
+                let obj = self.read_retrying(&abs, budget)?;
                 let tag = self.tag_for(&rel);
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
                     Record::Dead(d)

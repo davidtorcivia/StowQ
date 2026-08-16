@@ -1086,14 +1086,23 @@ mod tests {
 
     #[test]
     fn format_validate_rejects_zero_widths_and_unknown_features() {
-        assert_eq!(
-            FormatRecord {
-                lease_bucket_width_ns: 0,
-                ..base_format()
+        for width_field in [
+            "lease_bucket_width_ns",
+            "delayed_bucket_width_ns",
+            "terminal_bucket_width_ns",
+        ] {
+            let mut f = base_format();
+            match width_field {
+                "lease_bucket_width_ns" => f.lease_bucket_width_ns = 0,
+                "delayed_bucket_width_ns" => f.delayed_bucket_width_ns = 0,
+                _ => f.terminal_bucket_width_ns = 0,
             }
-            .validate(),
-            Err(RecordError::Field("bucket width"))
-        );
+            assert_eq!(
+                f.validate(),
+                Err(RecordError::Field("bucket width")),
+                "{width_field} = 0 must fail validate"
+            );
+        }
         assert_eq!(
             FormatRecord {
                 required_feature_bits: 1,
