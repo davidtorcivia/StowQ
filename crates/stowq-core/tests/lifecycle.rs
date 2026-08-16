@@ -1611,7 +1611,7 @@ fn repair_flags_generation_gap() {
         report
             .findings
             .iter()
-            .any(|f| f.kind == RK::ChainGap && f.reason == 0x0010),
+            .any(|f| f.kind == RK::ChainGap && f.reason == 0x0015),
         "findings: {:?}",
         report.findings
     );
@@ -1807,4 +1807,189 @@ fn raised_floor_evaluates_expiry_as_a_normal_floor() {
         q2.establish_floor(&mut OpBudget::new(64)).unwrap(),
         1_050_000
     );
+}
+
+// ---------- v1.1 quarantine writes ----------
+
+fn v11_format() -> FormatRecord {
+    let mut f = format();
+    f.required_feature_bits = 1;
+    f
+}
+
+fn list_prefix(q: &Queue, prefix: &str) -> Vec<String> {
+    list_all(q, prefix)
+}
+
+#[test]
+fn repair_writes_quarantine_on_v11_queues() {
+    use sha2::Digest as _;
+    let q = Queue::init(
+        Box::new(MemoryStore::new()),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &v11_format(),
+    )
+    .unwrap();
+    let mut budget = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([30; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    // Corrupt the job record in place: delete, write self-consistent
+    // garbage (the store verifies PUT digests).
+    let k = Key::new(format!("q/jobs/0000/{jhex}"));
+    q.store().delete(&k).unwrap();
+    let junk = bytes::Bytes::from_static(b"garbage");
+    let digest: [u8; 32] = sha2::Sha256::digest(&junk).into();
+    q.store().put_if_absent(&k, junk, digest).unwrap();
+    let garbage_time = q.store().head(&k).unwrap().store_time_ns;
+
+    let (report, _) = repair_all(&q);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::RecordCorrupt && f.reason == 0x0001),
+        "findings: {:?}",
+        report.findings
+    );
+    // Exactly one quarantine entry, with the deterministic fields.
+    let entries = list_prefix(&q, "q/quarantine/");
+    assert_eq!(entries.len(), 1, "one entry per (source, reason)");
+    let rel: stowq_keys::Key = entries[0]
+        .trim_start_matches("q/")
+        .parse()
+        .expect("quarantine key parses");
+    let tag = stowq_keys::key_tag(&[1; 16], &rel.to_string());
+    let obj = q.store().get(&Key::new(entries[0].clone()), None).unwrap();
+    let rec = match stowq_format::decode(&obj.body, &[1; 16], &tag).unwrap() {
+        stowq_format::Record::Quarantine(r) => r,
+        other => panic!("expected quarantine, got {other:?}"),
+    };
+    let expected_rel = format!("jobs/0000/{jhex}");
+    assert_eq!(rec.source_key, expected_rel);
+    assert_eq!(rec.reason, 0x0001);
+    assert_eq!(rec.observed_store_ns, garbage_time);
+    assert_eq!(rec.detail, None);
+    // Deterministic qid: the domain-separated formula.
+    let mut h = sha2::Sha256::new();
+    h.update(b"StowQ-1-qid\0");
+    h.update([1u8; 16]);
+    h.update(expected_rel.as_bytes());
+    h.update(0x0001u64.to_be_bytes());
+    let want: [u8; 16] = h.finalize()[..16].try_into().unwrap();
+    assert_eq!(rec.qid, want);
+    match rel {
+        stowq_keys::Key::Quarantine { qid, .. } => assert_eq!(qid, want),
+        other => panic!("parsed wrong key shape: {other:?}"),
+    }
+    // Idempotent convergence: a second audit run writes nothing new.
+    let (_, _) = repair_all(&q);
+    assert_eq!(list_prefix(&q, "q/quarantine/").len(), 1);
+}
+
+#[test]
+fn repair_writes_nothing_on_v1_queues() {
+    use sha2::Digest as _;
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([31; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    let k = Key::new(format!("q/jobs/0000/{jhex}"));
+    q.store().delete(&k).unwrap();
+    let junk = bytes::Bytes::from_static(b"garbage");
+    let digest: [u8; 32] = sha2::Sha256::digest(&junk).into();
+    q.store().put_if_absent(&k, junk, digest).unwrap();
+    let (report, _) = repair_all(&q);
+    assert!(report.findings.iter().any(|f| f.kind == RK::RecordCorrupt));
+    assert!(
+        list_prefix(&q, "q/quarantine/").is_empty(),
+        "v1 queues write nothing"
+    );
+}
+
+#[test]
+fn repair_reports_and_quarantines_missing_referenced_payload() {
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.max_inline_payload = 4;
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &v11_format()).unwrap();
+    let mut budget = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([32; 16]),
+                payload: b"detached",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    // Delete ONLY the payload: the job record references it (0x0014 —
+    // distinct from gc's orphan direction, which deletes the job).
+    let payload_key = list_prefix(&q, &format!("q/payloads/{jhex}/"))
+        .into_iter()
+        .next()
+        .expect("payload exists");
+    q.store().delete(&Key::new(payload_key.clone())).unwrap();
+    let job_time = q
+        .store()
+        .head(&Key::new(format!("q/jobs/0000/{jhex}")))
+        .unwrap()
+        .store_time_ns;
+
+    let (report, _) = repair_all(&q);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::PayloadMissing && f.reason == 0x0014),
+        "findings: {:?}",
+        report.findings
+    );
+    let entries = list_prefix(&q, "q/quarantine/");
+    assert_eq!(entries.len(), 1);
+    let rel: stowq_keys::Key = entries[0].trim_start_matches("q/").parse().unwrap();
+    let tag = stowq_keys::key_tag(&[1; 16], &rel.to_string());
+    let obj = q.store().get(&Key::new(entries[0].clone()), None).unwrap();
+    let rec = match stowq_format::decode(&obj.body, &[1; 16], &tag).unwrap() {
+        stowq_format::Record::Quarantine(r) => r,
+        other => panic!("expected quarantine, got {other:?}"),
+    };
+    assert_eq!(rec.reason, 0x0014);
+    assert_eq!(rec.observed_store_ns, job_time);
+    let payload_rel = payload_key.trim_start_matches("q/").to_string();
+    assert_eq!(rec.source_key, payload_rel);
 }

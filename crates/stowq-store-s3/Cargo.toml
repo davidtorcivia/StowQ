@@ -25,4 +25,5 @@ conformance = []
 stowq-testkit.workspace = true
 stowq-core.workspace = true
 stowq-format.workspace = true
+stowq-keys.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }

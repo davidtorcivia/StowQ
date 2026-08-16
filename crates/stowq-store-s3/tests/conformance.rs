@@ -466,3 +466,88 @@ fn calibration_measurements() {
          suggested default below; the current default is 4096"
     );
 }
+
+/// v1.1 quarantine round-trip: the repair scan writes durable,
+/// deterministic findings on a live endpoint, and they decode.
+#[test]
+fn quarantine_certification() {
+    let Some(_) = endpoint() else { return };
+    let root = format!("cq-v11-{}", std::process::id());
+    let f = FormatRecord {
+        shard_count: 4,
+        required_feature_bits: 1,
+        ..format()
+    };
+    let q = Queue::init(Box::new(store()), &root, &OpenOptions::new([1; 16]), &f).unwrap();
+
+    // A detached job whose payload is deleted: the 0x0014 finding.
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.max_inline_payload = 4;
+    let q_det = Queue::init(Box::new(store()), &format!("{root}-det"), &opts, &f).unwrap();
+    let mut b = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q_det
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([0x42; 16]),
+                payload: b"detached",
+                content_type: "text/plain".into(),
+                maximum_attempts: 2,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    // Find and delete the payload object directly.
+    let s = store();
+    let page = s
+        .list(&format!("{root}-det/payloads/{jhex}/"), None, 10)
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    let payload_key = page.items[0].key.clone();
+    s.delete(&payload_key).unwrap();
+
+    let (report, resume) = q_det.repair_scan(0, &mut OpBudget::new(4096)).unwrap();
+    assert!(resume.is_none());
+    assert!(
+        report.findings.iter().any(|f| f.reason == 0x0014),
+        "findings: {:?}",
+        report.findings
+    );
+    // The durable entry exists on the live store and decodes.
+    let qpage = s
+        .list(&format!("{root}-det/quarantine/"), None, 10)
+        .unwrap();
+    assert_eq!(qpage.items.len(), 1, "one durable finding");
+    let rel: stowq_keys::Key = qpage.items[0]
+        .key
+        .as_str()
+        .trim_start_matches(&format!("{root}-det/"))
+        .parse()
+        .unwrap();
+    let tag = stowq_keys::key_tag(&[1; 16], &rel.to_string());
+    let obj = s.get(&qpage.items[0].key.clone(), None).unwrap();
+    match stowq_format::decode(&obj.body, &[1; 16], &tag).unwrap() {
+        stowq_format::Record::Quarantine(r) => {
+            assert_eq!(r.reason, 0x0014);
+            assert_eq!(
+                r.source_key,
+                payload_key
+                    .as_str()
+                    .trim_start_matches(&format!("{root}-det/"))
+            );
+        }
+        other => panic!("expected quarantine, got {other:?}"),
+    }
+    // Rescan converges: nothing new written.
+    let (report2, _) = q_det.repair_scan(0, &mut OpBudget::new(4096)).unwrap();
+    let qpage2 = s
+        .list(&format!("{root}-det/quarantine/"), None, 10)
+        .unwrap();
+    assert_eq!(qpage2.items.len(), 1, "rescan writes nothing new");
+    let _ = q;
+    let _ = &report;
+}

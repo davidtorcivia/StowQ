@@ -1523,6 +1523,20 @@ pub enum FindingKind {
     DuplicateTerminal,
     /// A claim chain missing generations (a gap or a nonzero head).
     ChainGap,
+    /// A detached job whose payload object is absent (0x0014).
+    PayloadMissing,
+}
+
+/// Deterministic quarantine qid (spec records.md, Quarantine record):
+/// first 16 bytes of a domain-separated hash over the queue, the
+/// offending RELATIVE key, and the reason.
+fn quarantine_qid(queue_id: &[u8; 16], rel_key: &str, reason: u64) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"StowQ-1-qid\0");
+    hasher.update(queue_id);
+    hasher.update(rel_key.as_bytes());
+    hasher.update(reason.to_be_bytes());
+    hasher.finalize()[..16].try_into().unwrap()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2044,6 +2058,41 @@ impl Queue {
 
     // ---------- Repair scan ----------
 
+    /// Writes one finding as a durable quarantine record on v1.1
+    /// queues (FORMAT feature bit 1). Deterministic key and body per
+    /// (queue, source, reason), so independent auditors converge
+    /// byte-identically; put-if-absent with outcome resolution. On v1
+    /// queues this is a no-op — findings are report-only there.
+    fn write_quarantine(
+        &self,
+        rel_key: &str,
+        reason: u64,
+        observed_store_ns: u64,
+        detail: Option<u64>,
+        budget: &mut OpBudget,
+    ) -> Result<(), Error> {
+        if self.format.required_feature_bits & 1 == 0 {
+            return Ok(());
+        }
+        let qid = quarantine_qid(&self.opts.queue_id, rel_key, reason);
+        let bucket =
+            stowq_math::bucket_number(observed_store_ns, self.format.terminal_bucket_width_ns)
+                .ok_or_else(|| Error::Internal("zero terminal width".into()))?;
+        let rel = RelKey::Quarantine { bucket, qid };
+        let abs = self.absolute(&rel);
+        let tag = self.tag_for(&rel);
+        let record = Record::Quarantine(stowq_format::QuarantineRecord {
+            qid,
+            source_key: rel_key.to_string(),
+            reason,
+            observed_store_ns,
+            detail,
+        });
+        let body = Bytes::from(stowq_format::encode(&record, &self.opts.queue_id, &tag));
+        let digest: Digest = Sha256::digest(&body).into();
+        self.put_bytes_resolving(&abs, body, digest, budget)
+    }
+
     /// Lists a prefix fully, spending the budget per page.
     fn list_authoritative(
         &self,
@@ -2104,35 +2153,56 @@ impl Queue {
         report: &mut RepairReport,
         budget: &mut OpBudget,
     ) -> Result<(u64, Meta, u64), Error> {
-        let inadmissible = |report: &mut RepairReport, gen: u64| {
-            let key = self.absolute(&RelKey::Claim {
-                shard,
-                job_id,
-                generation: gen as u32,
-            });
-            report.findings.push(Finding {
-                kind: FindingKind::InadmissibleClaim,
-                key: key.0.clone(),
-                reason: 0x0010,
-            });
-        };
+        let inadmissible =
+            |report: &mut RepairReport, budget: &mut OpBudget, gen: u64| -> Result<(), Error> {
+                let rel = RelKey::Claim {
+                    shard,
+                    job_id,
+                    generation: gen as u32,
+                };
+                report.findings.push(Finding {
+                    kind: FindingKind::InadmissibleClaim,
+                    key: self.absolute(&rel).0.clone(),
+                    reason: 0x0010,
+                });
+                let observed = chain
+                    .iter()
+                    .find(|(g, _)| *g == gen)
+                    .map(|(_, m)| m.store_time_ns)
+                    .unwrap_or(0);
+                self.write_quarantine(&rel.to_string(), 0x0010, observed, Some(gen), budget)?;
+                Ok(())
+            };
         // Contiguity: generations must run 1..=tail with no gaps (a gap
         // is a missing object — foreign deletion or corruption).
         let first = chain.first().expect("chain is nonempty").0;
         for pair in chain.windows(2) {
             if pair[1].0 != pair[0].0 + 1 {
+                let missing = pair[0].0 + 1;
                 report.findings.push(Finding {
                     kind: FindingKind::ChainGap,
                     key: self
                         .absolute(&RelKey::Claim {
                             shard,
                             job_id,
-                            generation: (pair[0].0 + 1) as u32,
+                            generation: missing as u32,
                         })
                         .0
                         .clone(),
-                    reason: 0x0010,
+                    reason: 0x0015,
                 });
+                let rel = RelKey::Claim {
+                    shard,
+                    job_id,
+                    generation: missing as u32,
+                };
+                self.write_quarantine(
+                    &rel.to_string(),
+                    0x0015,
+                    pair[0].1.store_time_ns,
+                    Some(missing),
+                    budget,
+                )?;
             }
         }
         if first != 1 {
@@ -2146,8 +2216,17 @@ impl Queue {
                     })
                     .0
                     .clone(),
-                reason: 0x0010,
+                reason: 0x0015,
             });
+            let rel = RelKey::Claim {
+                shard,
+                job_id,
+                generation: first as u32,
+            };
+            // A head gap has no predecessor; the head entry's own store
+            // time is the deterministic choice (records.md).
+            let head_time = chain.first().expect("chain is nonempty").1.store_time_ns;
+            self.write_quarantine(&rel.to_string(), 0x0015, head_time, Some(first), budget)?;
         }
         // Decode every generation; keep (index-aligned) decoded records.
         let mut decoded: Vec<Option<stowq_format::ClaimRecord>> = Vec::with_capacity(chain.len());
@@ -2170,14 +2249,29 @@ impl Queue {
                                 key: abs.0.clone(),
                                 reason: 0x0005,
                             });
+                            self.write_quarantine(
+                                &rel.to_string(),
+                                0x0005,
+                                _meta.store_time_ns,
+                                None,
+                                budget,
+                            )?;
                             decoded.push(None);
                         }
                         Err(e) => {
+                            let reason = record_violation_reason(&e);
                             report.findings.push(Finding {
                                 kind: FindingKind::RecordCorrupt,
                                 key: abs.0.clone(),
-                                reason: record_violation_reason(&e),
+                                reason,
                             });
+                            self.write_quarantine(
+                                &rel.to_string(),
+                                reason,
+                                _meta.store_time_ns,
+                                None,
+                                budget,
+                            )?;
                             decoded.push(None);
                         }
                     }
@@ -2196,13 +2290,13 @@ impl Queue {
                 let custody =
                     rec.worker_id == prev.worker_id && rec.prev_token == Some(prev.worker_token);
                 if !custody {
-                    inadmissible(report, gen);
+                    inadmissible(report, budget, gen)?;
                 }
             } else {
                 let Some(basis) = &rec.basis else {
                     // Unreachable through decode (evidence exclusivity
                     // is enforced at the format layer); defensive.
-                    inadmissible(report, gen);
+                    inadmissible(report, budget, gen)?;
                     continue;
                 };
                 let evidence = basis.prev_store_time_ns == chain[i - 1].1.store_time_ns
@@ -2212,7 +2306,7 @@ impl Queue {
                         .saturating_add(basis.prev_duration_ns)
                         <= basis.observed_watermark_ns;
                 if !evidence {
-                    inadmissible(report, gen);
+                    inadmissible(report, budget, gen)?;
                 }
             }
         }
@@ -2239,17 +2333,15 @@ impl Queue {
             self.list_authoritative(&format!("{}jobs/{shard:04x}/", self.root), budget)?
         {
             report.jobs_scanned += 1;
-            let rel = listing
-                .key
-                .as_str()
-                .strip_prefix(&self.root)
-                .and_then(|s| s.parse().ok());
+            let stripped = listing.key.as_str().strip_prefix(&self.root).unwrap_or("");
+            let rel = stripped.parse().ok();
             let Some(RelKey::Job { job_id, .. }) = rel else {
                 report.findings.push(Finding {
                     kind: FindingKind::KeyGrammar,
                     key: listing.key.0.clone(),
                     reason: 0x0003,
                 });
+                self.write_quarantine(stripped, 0x0003, listing.meta.store_time_ns, None, budget)?;
                 continue;
             };
             job_ids.insert(job_id);
@@ -2259,6 +2351,31 @@ impl Queue {
                     let tag = self.tag_for(&job_rel);
                     match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
                         Ok(Record::Job(j)) => {
+                            // 0x0014: a detached job whose payload object
+                            // is absent (the referenced-payload half of
+                            // the orphan story; gc owns the other half).
+                            if let Some(pk) = j.payload_key.clone() {
+                                let abs_payload = Key::new(format!("{}{}", self.root, pk));
+                                budget.spend()?;
+                                match self.store.head(&abs_payload) {
+                                    Ok(_) => {}
+                                    Err(StoreError::NotFound) => {
+                                        report.findings.push(Finding {
+                                            kind: FindingKind::PayloadMissing,
+                                            key: abs_payload.0.clone(),
+                                            reason: 0x0014,
+                                        });
+                                        self.write_quarantine(
+                                            &pk,
+                                            0x0014,
+                                            listing.meta.store_time_ns,
+                                            None,
+                                            budget,
+                                        )?;
+                                    }
+                                    Err(e) => return Err(e.into()),
+                                }
+                            }
                             if let Some(nb) = j.not_before_ns {
                                 if let Some(bucket) = stowq_math::bucket_number(
                                     nb,
@@ -2275,16 +2392,35 @@ impl Queue {
                                 }
                             }
                         }
-                        Ok(_) => report.findings.push(Finding {
-                            kind: FindingKind::RecordCorrupt,
-                            key: listing.key.0.clone(),
-                            reason: 0x0005,
-                        }),
-                        Err(e) => report.findings.push(Finding {
-                            kind: FindingKind::RecordCorrupt,
-                            key: listing.key.0.clone(),
-                            reason: record_violation_reason(&e),
-                        }),
+                        Ok(_) => {
+                            report.findings.push(Finding {
+                                kind: FindingKind::RecordCorrupt,
+                                key: listing.key.0.clone(),
+                                reason: 0x0005,
+                            });
+                            self.write_quarantine(
+                                &job_rel.to_string(),
+                                0x0005,
+                                listing.meta.store_time_ns,
+                                None,
+                                budget,
+                            )?;
+                        }
+                        Err(e) => {
+                            let reason = record_violation_reason(&e);
+                            report.findings.push(Finding {
+                                kind: FindingKind::RecordCorrupt,
+                                key: listing.key.0.clone(),
+                                reason,
+                            });
+                            self.write_quarantine(
+                                &job_rel.to_string(),
+                                reason,
+                                listing.meta.store_time_ns,
+                                None,
+                                budget,
+                            )?;
+                        }
                     }
                 }
                 // Listed but gone: GC raced between LIST and GET; the
@@ -2314,6 +2450,8 @@ impl Queue {
                     key: listing.key.0.clone(),
                     reason: 0x0003,
                 });
+                let stripped = listing.key.as_str().strip_prefix(&self.root).unwrap_or("");
+                self.write_quarantine(stripped, 0x0003, listing.meta.store_time_ns, None, budget)?;
                 continue;
             };
             chains
@@ -2323,7 +2461,8 @@ impl Queue {
         }
         for (job_id, mut chain) in chains {
             report.claim_chains_scanned += 1;
-            if !job_ids.contains(&job_id) {
+            let orphaned = !job_ids.contains(&job_id);
+            if orphaned {
                 report.findings.push(Finding {
                     kind: FindingKind::ClaimWithoutJob,
                     key: self.absolute(&RelKey::Job { shard, job_id }).0.clone(),
@@ -2335,6 +2474,17 @@ impl Queue {
             chain.sort_by_key(|(g, _)| *g);
             let (tail_gen, tail_meta, tail_duration) =
                 self.audit_claim_chain(shard, job_id, &chain, report, budget)?;
+            if orphaned {
+                // Convention: the chain tail's store time (records.md).
+                let job_rel = RelKey::Job { shard, job_id };
+                self.write_quarantine(
+                    &job_rel.to_string(),
+                    0x0005,
+                    tail_meta.store_time_ns,
+                    None,
+                    budget,
+                )?;
+            }
             let duration = tail_duration;
             if let Some(bucket) = stowq_math::bucket_number(
                 tail_meta.store_time_ns.saturating_add(duration),
@@ -2355,8 +2505,8 @@ impl Queue {
         // Terminals: termidx regeneration plus the receipt-and-dead
         // mutual-exclusion finding (the check-then-act window's residue;
         // the repair scan owns it per the recovery errata).
-        let mut receipt_jobs: HashSet<[u8; 16]> = HashSet::new();
-        let mut dead_jobs: HashSet<[u8; 16]> = HashSet::new();
+        let mut receipt_jobs: HashMap<[u8; 16], u64> = HashMap::new();
+        let mut dead_jobs: HashMap<[u8; 16], u64> = HashMap::new();
         for (kind_char, prefix, set) in [
             (
                 'r',
@@ -2384,11 +2534,19 @@ impl Queue {
                             key: listing.key.0.clone(),
                             reason: 0x0003,
                         });
+                        let stripped = listing.key.as_str().strip_prefix(&self.root).unwrap_or("");
+                        self.write_quarantine(
+                            stripped,
+                            0x0003,
+                            listing.meta.store_time_ns,
+                            None,
+                            budget,
+                        )?;
                         continue;
                     }
                 };
                 let _ = kind_char;
-                set.insert(job_id);
+                set.insert(job_id, listing.meta.store_time_ns);
                 if let Some(bucket) = stowq_math::bucket_number(
                     listing.meta.store_time_ns,
                     self.format.terminal_bucket_width_ns,
@@ -2405,18 +2563,27 @@ impl Queue {
                 }
             }
         }
-        for job_id in receipt_jobs.intersection(&dead_jobs) {
+        let duplicates: Vec<[u8; 16]> = receipt_jobs
+            .keys()
+            .filter(|j| dead_jobs.contains_key(*j))
+            .copied()
+            .collect();
+        for job_id in duplicates {
             report.findings.push(Finding {
                 kind: FindingKind::DuplicateTerminal,
-                key: self
-                    .absolute(&RelKey::Receipt {
-                        shard,
-                        job_id: *job_id,
-                    })
-                    .0
-                    .clone(),
+                key: self.absolute(&RelKey::Receipt { shard, job_id }).0.clone(),
                 reason: 0x0007,
             });
+            // Convention: the receipts/ key with the receipt's store
+            // time (records.md).
+            let rel = RelKey::Receipt { shard, job_id };
+            self.write_quarantine(
+                &rel.to_string(),
+                0x0007,
+                receipt_jobs[&job_id],
+                None,
+                budget,
+            )?;
         }
         Ok(())
     }

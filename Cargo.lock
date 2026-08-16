@@ -1724,6 +1724,7 @@ dependencies = [
  "sha2 0.10.9",
  "stowq-core",
  "stowq-format",
+ "stowq-keys",
  "stowq-store",
  "stowq-testkit",
  "thiserror",
