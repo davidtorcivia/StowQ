@@ -1,4 +1,4 @@
-//! Bucket arithmetic, retry backoff with full jitter, and checked time
+//! Bucket arithmetic, retry backoff with equal jitter, and checked time
 //! conversions for StowQ/1.
 //!
 //! All timestamps are store-time nanoseconds. All division-based helpers

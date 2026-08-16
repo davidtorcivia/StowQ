@@ -100,7 +100,6 @@ fn primitives_certification() {
         panic!()
     };
     let stale = stowq_store::Version("deadbeef".into());
-    let _ = &k2;
     assert_eq!(
         s.cas(&k2, Bytes::from_static(b"x"), digest(b"x"), &stale)
             .unwrap(),
