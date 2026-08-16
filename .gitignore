@@ -3,6 +3,9 @@ stowq-spec.md
 stowq-implementation.md
 HANDOFF.md
 
+# Secrets
+.stowq-r2-env
+
 # Rust
 /target
 
