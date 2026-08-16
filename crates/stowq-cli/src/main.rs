@@ -111,7 +111,7 @@ fn run(command: Command) -> Result<(), String> {
                 lease_bucket_width_ns: 1_000,
                 delayed_bucket_width_ns: 1_000,
                 terminal_bucket_width_ns: 1_000,
-                inline_limit: 4_096,
+                inline_limit: 65_536,
                 required_feature_bits: 0,
             };
             let _q = Queue::init(Box::new(store), &queue, &OpenOptions::new([1; 16]), &format)

@@ -36,7 +36,7 @@ impl OpenOptions {
             worker_id: "worker-1".into(),
             retry: RetryPolicy::new(100, 60_000, true, None).expect("valid default policy"),
             skew_guard_ns: 0,
-            max_inline_payload: 4_096,
+            max_inline_payload: 65_536,
         }
     }
 }
@@ -633,7 +633,11 @@ impl Queue {
         let job_id = input.job_id.unwrap_or_else(|| fresh_token(input.payload));
         let shard = compute_shard(&self.opts.queue_id, &job_id, self.format.shard_count.max(1));
         let payload_digest: Digest = Sha256::digest(input.payload).into();
-        let inline = (input.payload.len() as u64) <= self.opts.max_inline_payload;
+        // The queue's FORMAT declares the inline bound for all clients
+        // (it bounds claim-scan amplification queue-wide); a client may
+        // configure lower, never above the queue's limit.
+        let inline_limit = self.opts.max_inline_payload.min(self.format.inline_limit);
+        let inline = (input.payload.len() as u64) <= inline_limit;
 
         let (payload_inline, payload_key) = if inline {
             (Some(input.payload.to_vec()), None)
