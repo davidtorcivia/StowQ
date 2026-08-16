@@ -1,5 +1,5 @@
 //! Test kit: logical oracle, differential driver, fault-injecting
-//! harness, and (later) the deterministic interleaving executor.
+//! harness, and the interleaving lab.
 
 pub mod driver;
 pub mod interleaving;
