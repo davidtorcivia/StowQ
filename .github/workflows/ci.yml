@@ -49,7 +49,8 @@ jobs:
             minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
             server /data
           for i in $(seq 30); do
-            curl -sf -o /dev/null http://localhost:9000/minio/health/ready && break
+            ready=http://localhost:9000/minio/health/ready
+            curl -sf -o /dev/null "$ready" && break
             sleep 2
           done
           curl -sf -o /dev/null http://localhost:9000/minio/health/ready
