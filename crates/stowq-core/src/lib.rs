@@ -120,6 +120,76 @@ pub struct Claim {
     payload: PayloadRef,
 }
 
+impl Claim {
+    /// Builds a claim handle whose payload reference is reconstructed
+    /// from the job record: inline bytes come from the record; a
+    /// detached payload is fetched by its key and verified against the
+    /// record's digest. For tooling that rebuilds handles from
+    /// persisted state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detached_or_inline(
+        job_id: [u8; 16],
+        shard: u16,
+        generation: u64,
+        attempt: u64,
+        worker_token: [u8; 16],
+        lease_duration_ns: u64,
+        claim_store_time_ns: u64,
+        queue_root: &str,
+        store: &dyn ObjectStore,
+    ) -> Result<Claim, Error> {
+        let rel = RelKey::Job { shard, job_id };
+        let abs = Key::new(format!("{queue_root}/{}", rel));
+        let tag = stowq_keys::key_tag(&QUEUE_ID_FOR_TOOLING, &rel.to_string());
+        let obj = match store.get(&abs, None) {
+            Ok(obj) => obj,
+            Err(StoreError::NotFound) => {
+                return Err(Error::Record("job record not found for handle".into()))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let job = match stowq_format::decode(&obj.body, &QUEUE_ID_FOR_TOOLING, &tag)? {
+            Record::Job(j) => j,
+            _ => return Err(Error::Record("job key holds a non-job record".into())),
+        };
+        let payload = match (&job.payload_inline, &job.payload_key) {
+            (Some(b), _) => PayloadRef::Inline(Bytes::from(b.clone())),
+            (None, Some(k)) => {
+                let key = Key::new(format!("{queue_root}/{k}"));
+                let obj = store.get(&key, None)?;
+                let got: Digest = Sha256::digest(&obj.body).into();
+                if got != job.payload_digest || obj.body.len() as u64 != job.payload_length {
+                    return Err(Error::PayloadCorrupt);
+                }
+                PayloadRef::Detached {
+                    key,
+                    digest: job.payload_digest,
+                    length: job.payload_length,
+                }
+            }
+            _ => return Err(Error::Record("job payload reference invalid".into())),
+        };
+        Ok(Claim {
+            job_id,
+            shard,
+            generation,
+            attempt,
+            worker_token,
+            lease_duration_ns,
+            claim_store_time_ns,
+            payload,
+        })
+    }
+
+    /// The inline payload bytes, when the claim carries them.
+    pub fn payload_preview(&self) -> Option<&[u8]> {
+        match &self.payload {
+            PayloadRef::Inline(b) => Some(b),
+            PayloadRef::Detached { .. } => None,
+        }
+    }
+}
+
 impl std::fmt::Debug for Claim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Claim")
@@ -264,6 +334,10 @@ struct FloorCache {
 const FLOOR_STALENESS: std::time::Duration = std::time::Duration::from_secs(30);
 
 const RETRY_TRANSPORT_MAX: usize = 4;
+
+/// Queue id for handle-reconstruction tooling built on the dev
+/// convention (OpenOptions::new([1; 16])).
+const QUEUE_ID_FOR_TOOLING: [u8; 16] = [1; 16];
 
 impl Queue {
     /// Opens an initialized queue: reads and verifies `meta/FORMAT`.
@@ -1819,5 +1893,94 @@ mod tests {
         };
         let err = q.ack(&claim, &mut budget).unwrap_err();
         assert!(matches!(err, Error::ReceiptEvidenceMismatch));
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+    use stowq_store::MemoryStore;
+
+    fn format() -> stowq_format::FormatRecord {
+        stowq_format::FormatRecord {
+            shard_count: 1,
+            lease_bucket_width_ns: 1_000,
+            delayed_bucket_width_ns: 1_000,
+            terminal_bucket_width_ns: 1_000,
+            inline_limit: 4,
+            required_feature_bits: 0,
+        }
+    }
+
+    fn detached_queue() -> (Queue, MemoryStore) {
+        let store = MemoryStore::new();
+        let mut opts = OpenOptions::new([1; 16]);
+        opts.max_inline_payload = 4;
+        let q = Queue::init(Box::new(store.clone()), "q", &opts, &format()).unwrap();
+        (q, store)
+    }
+
+    #[test]
+    fn detached_handle_reconstruction_verifies_payload() {
+        let (q, store) = detached_queue();
+        let mut b = OpBudget::new(64);
+        let payload = vec![7u8; 64];
+        let EnqueueOutcome::Committed { job_id } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([3; 16]),
+                    payload: &payload,
+                    content_type: "application/octet-stream".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut b,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let claim =
+            Claim::detached_or_inline(job_id, 0, 1, 1, [9; 16], 1_000, 0, "q", &store).unwrap();
+        assert_eq!(&claim.payload(&store).unwrap()[..], &payload[..]);
+        // A stale (pre-write) handle for an absent job errors.
+        let err = Claim::detached_or_inline([4; 16], 0, 1, 1, [9; 16], 1_000, 0, "q", &store)
+            .unwrap_err();
+        assert!(matches!(err, Error::Record(_)));
+    }
+
+    #[test]
+    fn detached_handle_reconstruction_rejects_tampered_payload() {
+        let (q, store) = detached_queue();
+        let mut b = OpBudget::new(64);
+        let payload = vec![7u8; 64];
+        let EnqueueOutcome::Committed { job_id } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([5; 16]),
+                    payload: &payload,
+                    content_type: "application/octet-stream".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut b,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        // Corrupt the detached payload object in place.
+        let jhex: String = job_id.iter().map(|x| format!("{x:02x}")).collect();
+        let prefix = format!("q/payloads/{jhex}/");
+        let page = store.list(&prefix, None, 10).unwrap();
+        let key = page.items[0].key.clone();
+        let digest: Digest = Sha256::digest(vec![0u8; 64].as_slice()).into();
+        let _ = store.delete(&key);
+        store
+            .put_if_absent(&key, bytes::Bytes::from(vec![0u8; 64]), digest)
+            .unwrap();
+        let err =
+            Claim::detached_or_inline(job_id, 0, 1, 1, [9; 16], 1_000, 0, "q", &store).unwrap_err();
+        assert!(matches!(err, Error::PayloadCorrupt));
     }
 }
