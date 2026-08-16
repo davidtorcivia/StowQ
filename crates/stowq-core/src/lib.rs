@@ -1477,6 +1477,8 @@ pub struct GcReport {
     pub jobs_deleted: usize,
     /// Clock beacons deleted.
     pub beacons_deleted: usize,
+    /// Orphan payloads deleted past the enqueue horizon.
+    pub orphans_deleted: usize,
 }
 
 /// One repair-scan finding: a violation with its quarantine reason
@@ -1788,17 +1790,66 @@ impl Queue {
     /// against the authoritative terminal key, delete the graph in
     /// strict order (indexes, fails, claims, payloads, jobs, terminal
     /// last) when the terminal record's store time is older than
-    /// `retention_ns` relative to `now_ns`. Stale beacons are also
-    /// collected. Orphan-payload collection past the enqueue horizon is
-    /// not yet implemented.
+    /// `retention_ns` relative to `now_ns`. Stale beacons are collected,
+    /// and orphan payloads (a payload whose job record is absent, older
+    /// than `orphan_horizon_ns` relative to `now_ns` — the crash window
+    /// between payload PUT and job-record PUT) are deleted.
     pub fn gc(
         &self,
         now_ns: u64,
         retention_ns: u64,
+        orphan_horizon_ns: u64,
         budget: &mut OpBudget,
     ) -> Result<GcReport, Error> {
         let mut report = GcReport::default();
         let cutoff = now_ns.saturating_sub(retention_ns);
+        let orphan_cutoff = now_ns.saturating_sub(orphan_horizon_ns);
+
+        // Orphan payloads: the payload key carries the job id; the job
+        // record lives at jobs/<shard>/<job> with the shard derived
+        // from the queue identity. Referenced payloads are never
+        // touched; a job record present at any later time wins over
+        // the horizon (the enqueue is in flight, not orphaned).
+        let payload_prefix = format!("{}payloads/", self.root);
+        let mut after: Option<Key> = None;
+        loop {
+            budget.spend()?;
+            let page = self.store.list(&payload_prefix, after.as_ref(), 64)?;
+            if page.items.is_empty() {
+                break;
+            }
+            for item in &page.items {
+                if item.meta.store_time_ns >= orphan_cutoff {
+                    continue;
+                }
+                let rel = item
+                    .key
+                    .as_str()
+                    .strip_prefix(&self.root)
+                    .and_then(|s| s.parse().ok());
+                let Some(RelKey::Payload { job_id, .. }) = rel else {
+                    continue; // repair owns quarantine findings
+                };
+                let shard = compute_shard(&self.opts.queue_id, &job_id, self.format.shard_count);
+                budget.spend()?;
+                match self
+                    .store
+                    .head(&self.absolute(&RelKey::Job { shard, job_id }))
+                {
+                    Ok(_) => {}
+                    Err(StoreError::NotFound) => {
+                        budget.spend()?;
+                        let _ = self.store.delete(&item.key);
+                        report.orphans_deleted += 1;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            match page.next_after {
+                Some(k) => after = Some(k),
+                None => break,
+            }
+        }
 
         // Beacons: metadata is tiny; collect those older than 10x the
         // floor staleness window.
