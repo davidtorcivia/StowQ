@@ -1195,3 +1195,23 @@ fn repair_resumes_on_budget_boundary() {
     assert_eq!(report2.shards_scanned, 1);
     assert!(resume2.is_none());
 }
+
+#[test]
+fn repair_terminates_across_the_full_shard_space() {
+    // shard_count 65536 is the validated maximum: the scan must
+    // complete the space and report no resume point. A u16 loop
+    // counter overflows on the final increment (debug: panic;
+    // release: wrap to an infinite rescan).
+    let mut f = format();
+    f.shard_count = 65_536;
+    let q = Queue::init(
+        Box::new(MemoryStore::new()),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &f,
+    )
+    .unwrap();
+    let (report, resume) = q.repair_scan(65_530, &mut OpBudget::new(512)).unwrap();
+    assert_eq!(report.shards_scanned, 6);
+    assert!(resume.is_none());
+}

@@ -1529,17 +1529,18 @@ impl Queue {
     ) -> Result<(RepairReport, Option<u16>), Error> {
         let shard_count = self.format.shard_count;
         let mut report = RepairReport::default();
-        let mut next = start_shard;
-        while (next as u32) < shard_count {
-            let shard = next;
-            self.repair_shard(shard, &mut report, budget)?;
+        // u32 counter: shard_count may be 65536, where a u16 counter
+        // overflows on the final increment.
+        let mut next = start_shard as u32;
+        while next < shard_count {
+            self.repair_shard(next as u16, &mut report, budget)?;
             report.shards_scanned += 1;
             next += 1;
             if budget.max_ops <= 4 {
                 break;
             }
         }
-        let resume = ((next as u32) < shard_count).then_some(next);
+        let resume = (next < shard_count).then_some(next as u16);
         Ok((report, resume))
     }
 
