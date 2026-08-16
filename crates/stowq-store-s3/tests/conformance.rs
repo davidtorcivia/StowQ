@@ -132,9 +132,12 @@ fn primitives_certification() {
         .all(|l| l.key.as_str() > format!("conformance/prim/{run}/p1").as_str()));
 
     // Range contract (trait get): half-open [start, end), strictly
-    // start < end <= size, identically on every backend.
+    // start < end <= size, identically on every backend. meta.size is
+    // the full object size even on a ranged read (the part length is
+    // not the object size; 1..2 has part length 1, object size 2).
     let obj = s.get(&k2, Some(1..2)).unwrap();
     assert_eq!(&obj.body[..], b"2");
+    assert_eq!(obj.meta.size, 2);
     // Boundary end == size returns the tail through EOF.
     let tail = s.get(&k2, Some(0..2)).unwrap();
     assert_eq!(&tail.body[..], b"v2");

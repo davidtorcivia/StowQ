@@ -222,13 +222,33 @@ impl ObjectStore for S3Store {
             }
             match req.send().await {
                 Ok(out) => {
+                    // On a ranged read the store's Content-Length is the
+                    // part length; the object's full size comes from
+                    // Content-Range ("bytes 0-1/11") so meta.size means
+                    // the same thing on every backend. An absent header
+                    // is a whole-object response (a store that ignored
+                    // the range), where Content-Length is already the
+                    // full size — the length check below still catches
+                    // strict-subset ignores.
+                    let size = match (&range, out.content_range()) {
+                        (Some(_), Some(cr)) => cr
+                            .rsplit('/')
+                            .next()
+                            .and_then(|t| t.parse::<u64>().ok())
+                            .ok_or_else(|| {
+                                StoreError::ProfileViolation(format!(
+                                    "malformed content-range: {cr}"
+                                ))
+                            })?,
+                        _ => out.content_length.unwrap_or(0) as u64,
+                    };
                     let meta = Meta {
                         version: Version(out.e_tag.clone().unwrap_or_default()),
                         store_time_ns: out
                             .last_modified
                             .map(|t| quantize(t.as_nanos()))
                             .unwrap_or(0),
-                        size: out.content_length.unwrap_or(0) as u64,
+                        size,
                     };
                     let body = out
                         .body
