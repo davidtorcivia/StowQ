@@ -484,8 +484,10 @@ impl Queue {
         // backwards: the watermark only ever holds buckets derived from
         // earlier floors. Fail closed; the skew guard absorbs the
         // profile's timestamp dispersion and granularity (skew_guard
-        // >= G). The watermark read is best-effort — its absence is not
-        // a regression.
+        // >= G). The gate runs on the RAW beacon — before the raise
+        // below — so raising can never mask a regression. The
+        // watermark read is best-effort — its absence is not a
+        // regression.
         if let Some(w) = self.watermark(budget)? {
             let wm_ns = w
                 .highest_observed_wall_bucket
@@ -495,6 +497,17 @@ impl Queue {
                     "store time regression".into(),
                 )));
             }
+            // Raise to the watermark bucket (time.md): the bucket was
+            // derived from an earlier proven floor, so it is itself a
+            // proven lower bound on store time, and the max of two
+            // lower bounds is a lower bound. The gate above bounded
+            // the gap to skew_guard, so the raise is at most that.
+            floor_ns = stowq_math::effective_floor(
+                floor_ns,
+                w.highest_observed_wall_bucket,
+                self.format.delayed_bucket_width_ns,
+            )
+            .ok_or_else(|| Error::Internal("floor raise overflow".into()))?;
         }
         *self.floor.lock().unwrap() = FloorCache {
             floor_ns,

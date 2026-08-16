@@ -13,6 +13,13 @@ the participant just created. Beacons carry no protocol state. Participants
 MAY reuse a floor for a configured staleness window; floors are lower
 bounds, so staleness only delays work, never delivers early.
 
+A floor MAY be raised to the stored watermark bucket
+(`max(floor, bucket × width)`): the bucket was derived from an earlier
+proven floor, so it is a proven lower bound on store time, and the max
+of two lower bounds is a lower bound. Regression detection compares
+the fresh beacon before any raise, so raising never masks a
+regression; the raise is bounded by the skew guard.
+
 ## Expiry semantics
 
 A lease is expired when `floor ≥ claim_store_time + lease_duration_ns +
