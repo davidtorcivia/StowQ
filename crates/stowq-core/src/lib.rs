@@ -249,6 +249,14 @@ pub enum AckOutcome {
     SupersededByDead,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuryOutcome {
+    /// The dead record committed.
+    Buried,
+    /// A receipt terminalized the job first; the bury refused.
+    SupersededByReceipt,
+}
+
 #[derive(Debug, Clone)]
 pub enum RenewOutcome {
     /// The continuation claim committed.
@@ -1214,7 +1222,24 @@ impl Queue {
 
     // ---------- bury ----------
 
-    pub fn bury(&self, claim: &Claim, reason: u64, budget: &mut OpBudget) -> Result<(), Error> {
+    pub fn bury(
+        &self,
+        claim: &Claim,
+        reason: u64,
+        budget: &mut OpBudget,
+    ) -> Result<BuryOutcome, Error> {
+        // A receipt terminalized the job first; refuse so at most one
+        // terminal record per job ever exists — the symmetric guard to
+        // ack's dead check.
+        budget.spend()?;
+        match self.store.head(&self.absolute(&RelKey::Receipt {
+            shard: claim.shard,
+            job_id: claim.job_id,
+        })) {
+            Ok(_) => return Ok(BuryOutcome::SupersededByReceipt),
+            Err(StoreError::NotFound) => {}
+            Err(e) => return Err(e.into()),
+        }
         let record = Record::Dead(DeadRecord {
             job_id: claim.job_id,
             generation: claim.generation,
@@ -1239,7 +1264,7 @@ impl Queue {
                     claim.job_id,
                     budget,
                 );
-                Ok(())
+                Ok(BuryOutcome::Buried)
             }
             Resolved::Lost => {
                 // First-wins: an existing dead record for the same job
@@ -1248,7 +1273,7 @@ impl Queue {
                 let obj = self.store.get(&abs, None)?;
                 let tag = self.tag_for(&rel);
                 match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
-                    Record::Dead(d) if d.job_id == claim.job_id => Ok(()),
+                    Record::Dead(d) if d.job_id == claim.job_id => Ok(BuryOutcome::Buried),
                     _ => Err(Error::Record("dead key holds conflicting evidence".into())),
                 }
             }
