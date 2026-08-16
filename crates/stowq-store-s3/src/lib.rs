@@ -212,18 +212,43 @@ impl ObjectStore for S3Store {
                 .bucket(&self.bucket)
                 .key(key.as_str());
             if let Some(r) = &range {
-                // Inclusive end byte.
-                req = req.range(format!("bytes={}-{}", r.start, r.end.saturating_sub(1)));
+                // Strict half-open contract (see the trait): empty and
+                // inverted ranges are absence, never sent to the store.
+                if r.start >= r.end {
+                    return Err(StoreError::NotFound);
+                }
+                // Inclusive end byte; start < end guarantees end >= 1.
+                req = req.range(format!("bytes={}-{}", r.start, r.end - 1));
             }
             match req.send().await {
                 Ok(out) => {
+                    // On a ranged read the store's Content-Length is the
+                    // part length; the object's full size comes from
+                    // Content-Range ("bytes 0-1/11") so meta.size means
+                    // the same thing on every backend. An absent header
+                    // is a whole-object response (a store that ignored
+                    // the range), where Content-Length is already the
+                    // full size — the length check below still catches
+                    // strict-subset ignores.
+                    let size = match (&range, out.content_range()) {
+                        (Some(_), Some(cr)) => cr
+                            .rsplit('/')
+                            .next()
+                            .and_then(|t| t.parse::<u64>().ok())
+                            .ok_or_else(|| {
+                                StoreError::ProfileViolation(format!(
+                                    "malformed content-range: {cr}"
+                                ))
+                            })?,
+                        _ => out.content_length.unwrap_or(0) as u64,
+                    };
                     let meta = Meta {
                         version: Version(out.e_tag.clone().unwrap_or_default()),
                         store_time_ns: out
                             .last_modified
                             .map(|t| quantize(t.as_nanos()))
                             .unwrap_or(0),
-                        size: out.content_length.unwrap_or(0) as u64,
+                        size,
                     };
                     let body = out
                         .body
@@ -231,6 +256,14 @@ impl ObjectStore for S3Store {
                         .await
                         .map_err(|_| StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))?
                         .into_bytes();
+                    // A store that clamps a past-EOF end (HTTP 206
+                    // partial) returns fewer bytes than requested:
+                    // report absence rather than a short slice.
+                    if let Some(r) = &range {
+                        if body.len() as u64 != r.end - r.start {
+                            return Err(StoreError::NotFound);
+                        }
+                    }
                     Ok(Object { meta, body })
                 }
                 Err(e) => Err(read_err(e)),

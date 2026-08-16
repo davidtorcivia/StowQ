@@ -23,6 +23,18 @@ A conforming profile additionally declares, normatively:
    surface MUST be quantized down to `G` before use, so mixed-surface reads
    cannot move an object across a bucket or expiry boundary.
 
+## Ranged reads
+
+Stores offering ranged GET support the implementation's read contract:
+a range is half-open `[start, end)` with `start < end <= size`; empty,
+inverted, and past-EOF ranges are absence. Stores that clamp past-EOF
+ends to a partial response (RFC 9110 range semantics) remain conforming
+— the implementation detects the clamp by returned length and reports
+absence. A certified store MUST NOT ignore a Range header on a
+strict-subset request (the conformance suite pins the returned slice),
+and the full object size is reported alongside a ranged read, never the
+part length.
+
 ## Certification profiles
 
 Informative. The gate for adding a store to this table is a passing
