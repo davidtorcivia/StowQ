@@ -226,7 +226,7 @@ impl ObjectStore for MemoryStore {
             if !k.starts_with(prefix) {
                 // Keys are sorted; a miss past the prefix range can stop
                 // the scan only when k > prefix's upper bound, but a
-                // simple startsWith filter is correct and cheap enough
+                // simple starts_with filter is correct and cheap enough
                 // for a fake.
                 continue;
             }

@@ -157,7 +157,7 @@ impl<S: ObjectStore> Injector<S> {
 }
 
 #[async_trait]
-impl<S: ObjectStore + Sync> ObjectStore for Injector<S> {
+impl<S: ObjectStore> ObjectStore for Injector<S> {
     async fn put_if_absent(
         &self,
         key: &Key,
