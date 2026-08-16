@@ -888,3 +888,310 @@ fn enqueue_rejects_zero_maximum_attempts() {
         Ok(_) => panic!("expected a Record error, got success"),
     }
 }
+
+// ---------- Repair scan ----------
+
+use stowq_core::{FindingKind as RK, RepairReport};
+
+fn repair_all(q: &Queue) -> (RepairReport, Option<u16>) {
+    q.repair_scan(0, &mut OpBudget::new(4096)).unwrap()
+}
+
+#[test]
+fn repair_regenerates_missing_delayed_index() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([13; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: Some(5_000_000),
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let delayed = list_all(&q, "q/delayed/");
+    assert_eq!(delayed.len(), 1);
+    q.store().delete(&Key::new(delayed[0].clone())).unwrap();
+    let (report, resume) = repair_all(&q);
+    assert!(resume.is_none());
+    assert_eq!(report.indexes_regenerated, 1);
+    let regen = list_all(&q, "q/delayed/");
+    assert_eq!(regen.len(), 1);
+    assert_eq!(regen[0], delayed[0]);
+    // Idempotent: a second run regenerates nothing.
+    let (report2, _) = repair_all(&q);
+    assert_eq!(report2.indexes_regenerated, 0);
+    assert!(report2.findings.is_empty());
+}
+
+#[test]
+fn repair_regenerates_missing_lease_index() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([14; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(_) = q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    let leases = list_all(&q, "q/leases/");
+    assert_eq!(leases.len(), 1);
+    q.store().delete(&Key::new(leases[0].clone())).unwrap();
+    let (report, _) = repair_all(&q);
+    assert_eq!(report.indexes_regenerated, 1);
+    let regen = list_all(&q, "q/leases/");
+    assert_eq!(regen.len(), 1);
+    assert_eq!(regen[0], leases[0]);
+}
+
+#[test]
+fn repair_regenerates_missing_termidx() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([15; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(claim) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    q.ack(&claim, &mut budget).unwrap();
+    let termidx = list_all(&q, "q/termidx/");
+    assert_eq!(termidx.len(), 1);
+    q.store().delete(&Key::new(termidx[0].clone())).unwrap();
+    let (report, _) = repair_all(&q);
+    assert_eq!(report.indexes_regenerated, 1);
+    let regen = list_all(&q, "q/termidx/");
+    assert_eq!(regen.len(), 1);
+    assert_eq!(regen[0], termidx[0]);
+}
+
+#[test]
+fn repair_reports_grammar_violation_and_skips() {
+    let q = make_queue();
+    let garbage = Key::new("q/jobs/0000/not-hex-at-all");
+    let digest: [u8; 32] = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(b"junk").into()
+    };
+    q.store()
+        .put_if_absent(&garbage, bytes::Bytes::from_static(b"junk"), digest)
+        .unwrap();
+    let (report, _) = repair_all(&q);
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.kind == RK::KeyGrammar && f.reason == 0x0003));
+}
+
+#[test]
+fn repair_reports_claim_without_job() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([16; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(claim) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    // The job record vanishes without GC's ordered deletion (a torn or
+    // foreign delete): the chain is orphaned and the scan must say so.
+    q.store()
+        .delete(&Key::new(format!(
+            "q/jobs/0000/{}",
+            claim
+                .job_id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )))
+        .unwrap();
+    let (report, _) = repair_all(&q);
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.kind == RK::ClaimWithoutJob && f.reason == 0x0005));
+}
+
+#[test]
+fn repair_reports_duplicate_terminal() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([17; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    // The check-then-act window's residue (recovery errata): both
+    // terminal records present. Written directly, as the window would.
+    use sha2::Digest as _;
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    for (rel, record) in [
+        (
+            format!("q/receipts/0000/{jhex}"),
+            stowq_format::Record::Receipt(stowq_format::ReceiptRecord {
+                job_id,
+                generation: 1,
+                attempt: 1,
+                worker_id: "w".into(),
+                worker_token: [1; 16],
+                payload_digest: [2; 32],
+                output_digests: vec![],
+            }),
+        ),
+        (
+            format!("q/dead/0000/{jhex}"),
+            stowq_format::Record::Dead(stowq_format::DeadRecord {
+                job_id,
+                generation: 1,
+                attempt: 1,
+                reason: 0x0003,
+            }),
+        ),
+    ] {
+        let tag = stowq_keys::key_tag(&[1; 16], rel.trim_start_matches("q/"));
+        let body = bytes::Bytes::from(stowq_format::encode(&record, &[1; 16], &tag));
+        let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
+        q.store()
+            .put_if_absent(&Key::new(rel), body, digest)
+            .unwrap();
+    }
+    let (report, _) = repair_all(&q);
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.kind == RK::DuplicateTerminal && f.reason == 0x0007));
+}
+
+#[test]
+fn repair_reports_inadmissible_takeover_basis() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([18; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let stowq_core::ClaimOutcome::Claimed(first) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    // A misbehaving-but-trusted writer takes over at generation 2 with
+    // fabricated basis evidence: the recorded prev_store_time does not
+    // match generation 1's actual store time (the tag verifies, the
+    // digest verifies; only the evidence contradicts the record).
+    use sha2::Digest as _;
+    let rel = format!(
+        "q/claims/0000/{}/00000002",
+        job_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let tag = stowq_keys::key_tag(&[1; 16], rel.trim_start_matches("q/"));
+    let takeover = stowq_format::Record::Claim(stowq_format::ClaimRecord {
+        job_id,
+        generation: 2,
+        attempt: 2,
+        worker_id: "rogue".into(),
+        worker_token: [9; 16],
+        lease_duration_ns: 1_000,
+        continuation: false,
+        basis: Some(stowq_format::ClaimBasis {
+            prev_store_time_ns: first.claim_store_time_ns + 5_000, // fabricated
+            prev_duration_ns: 1_000,
+            observed_watermark_ns: first.claim_store_time_ns + 6_000,
+        }),
+        prev_token: None,
+    });
+    let body = bytes::Bytes::from(stowq_format::encode(&takeover, &[1; 16], &tag));
+    let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
+    q.store()
+        .put_if_absent(&Key::new(rel), body, digest)
+        .unwrap();
+    let (report, _) = repair_all(&q);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::InadmissibleClaim && f.reason == 0x0010),
+        "findings: {:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn repair_resumes_on_budget_boundary() {
+    // A two-shard FORMAT with a budget that covers only the first
+    // shard (an empty shard costs four list ops: jobs, claims,
+    // receipts, dead): the scan returns a resume point, and continuing
+    // from it covers the second shard.
+    let mut f = format();
+    f.shard_count = 2;
+    let (q, _store) = {
+        let store = MemoryStore::new();
+        let q = Queue::init(Box::new(store.clone()), "q", &OpenOptions::new([1; 16]), &f).unwrap();
+        (q, store)
+    };
+    let mut budget = OpBudget::new(5);
+    let (report, resume) = q.repair_scan(0, &mut budget).unwrap();
+    assert_eq!(report.shards_scanned, 1);
+    assert_eq!(resume, Some(1));
+    let (report2, resume2) = q
+        .repair_scan(resume.unwrap(), &mut OpBudget::new(64))
+        .unwrap();
+    assert_eq!(report2.shards_scanned, 1);
+    assert!(resume2.is_none());
+}

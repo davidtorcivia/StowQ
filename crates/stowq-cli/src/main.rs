@@ -76,6 +76,8 @@ enum Command {
     },
     /// Print a job's object graph.
     Inspect { queue: String, job_id: String },
+    /// Regenerate missing advisory indexes; report violations.
+    Repair { queue: String },
 }
 
 fn main() {
@@ -277,6 +279,30 @@ fn run(command: Command) -> Result<(), String> {
                 "{} jobs deleted, {} beacons collected",
                 report.jobs_deleted, report.beacons_deleted
             );
+            persist(&queue, &store)?;
+        }
+        Command::Repair { queue } => {
+            let (q, store) = open(&queue)?;
+            let (report, resume) = q
+                .repair_scan(0, &mut OpBudget::new(8192))
+                .map_err(|e| e.to_string())?;
+            println!(
+                "shards: {}, jobs: {}, claim chains: {}, indexes regenerated: {}, findings: {}",
+                report.shards_scanned,
+                report.jobs_scanned,
+                report.claim_chains_scanned,
+                report.indexes_regenerated,
+                report.findings.len()
+            );
+            for f in &report.findings {
+                println!(
+                    "finding {:?} reason {:#06x} key {}",
+                    f.kind, f.reason, f.key
+                );
+            }
+            if let Some(next) = resume {
+                println!("budget boundary: resume from shard {next}");
+            }
             persist(&queue, &store)?;
         }
         Command::Inspect { queue, job_id } => {
