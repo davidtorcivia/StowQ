@@ -27,8 +27,10 @@ not interact with the invariants below.
 - `AdmissibleContinuationCustody`: every continuation continues the
   previous generation's holder.
 - `AttemptWithinLimit`
-- `DeadFollowsExhaustion`: dead records appear only through exhaustion
-  of a maximum-attempt expired tail.
+- `DeadFollowsExhaustion`: within this model's action set, dead records
+  appear only through exhaustion of a maximum-attempt expired tail
+  (bury writes dead at any attempt; the terminal model covers that
+  path).
 
 ## Configuration
 

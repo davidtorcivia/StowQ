@@ -13,12 +13,19 @@ is structural: no action does either.
 ## Invariants checked
 
 - `TypeOK`
-- `AtMostOneTerminalRecord`: receipt and dead never coexist — the load-
-  bearing mutual exclusion, both directions (ack refuses under dead;
-  bury refuses under receipt).
+- `AtMostOneTerminalRecord`: receipt and dead never coexist under the
+  model's atomic transitions — the guard discipline, both directions
+  (ack refuses under dead; bury refuses under receipt). The store-level
+  property has a check-then-act window the model's atomicity cannot
+  represent: ack and bury write different keys, both put-if-absent, so
+  the pre-write checks minimize but cannot close it. A pair produced by
+  the window is a repair-scan quarantine finding (see
+  ../recovery.md errata).
 - `OutputsPrecedeReceipt`: a receipt implies its outputs exist — the
   commit rule's visibility half.
-- `ClaimsBoundedByTerminal`: claims never outlive terminalization.
+- `ClaimsBoundedByTerminal`: within this model's horizon, claims never
+  outlive terminalization (retention GC deletes claims before the
+  terminal record in the full protocol).
 
 ## Configuration
 

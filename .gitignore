@@ -12,3 +12,6 @@ stowq-implementation.md
 /fuzz/target
 /fuzz/artifacts
 /fuzz/coverage
+
+# TLA+ model checker output
+model/*/states/
