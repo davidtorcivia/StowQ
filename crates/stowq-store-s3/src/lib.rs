@@ -115,6 +115,22 @@ impl S3Store {
             .unwrap_or_else(|| s3.region.clone());
         let mut builder = aws_sdk_s3::config::Builder::from(config)
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            // The default checksum behavior validates GET response
+            // bodies against the object's stored checksum. On a ranged
+            // GET the store returns the FULL-object checksum beside
+            // the PARTIAL body, so every ranged read of a checksummed
+            // object fails validation mid-stream (observed on R2 and
+            // true of S3 proper). Automatic checksums off in both
+            // directions: the explicit per-PUT checksum stays (an
+            // operation-level setting), and P7 integrity is guaranteed
+            // by digest verification on read-back, the profile's
+            // documented stance.
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            )
             .region(aws_sdk_s3::config::Region::new(region))
             .timeout_config(
                 aws_sdk_s3::config::timeout::TimeoutConfig::builder()
