@@ -1615,3 +1615,123 @@ fn repair_flags_generation_gap() {
         report.findings
     );
 }
+
+#[test]
+fn repair_flags_headless_chain() {
+    // Foreign delete of generation 1: the chain's first listed
+    // generation is not 1 — the head branch of the gap check, distinct
+    // from the mid-chain windows branch.
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([27; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 5,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(first) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).unwrap() else {
+        panic!("renew")
+    };
+    let jhex: String = second.job_id.iter().map(|b| format!("{b:02x}")).collect();
+    q.store()
+        .delete(&Key::new(format!("q/claims/0000/{jhex}/00000001")))
+        .unwrap();
+    let (report, _) = repair_all(&q);
+    let head = report
+        .findings
+        .iter()
+        .find(|f| f.kind == RK::ChainGap)
+        .expect("head gap must be flagged");
+    assert!(
+        head.key.ends_with("/00000002"),
+        "keyed at the head: {}",
+        head.key
+    );
+    // The remaining 2..=2 chain is otherwise sound: continuation
+    // evidence still matches, no InadmissibleClaim.
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::InadmissibleClaim),
+        "findings: {:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn repair_audits_around_a_corrupt_middle_generation() {
+    // An undecodable middle record must not produce spurious
+    // inadmissibility on its neighbors: the evidence check skips
+    // pairs with an undecoded side, and the chain audits around the
+    // corruption (the corrupt record itself is a RecordCorrupt
+    // finding).
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([28; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 5,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(first) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).unwrap() else {
+        panic!("renew")
+    };
+    let later = second.claim_store_time_ns + 2_000;
+    let stowq_core::ClaimOutcome::Claimed(third) =
+        q.claim(&claim_opts(later, 1_000), &mut budget).unwrap()
+    else {
+        panic!("takeover")
+    };
+    assert_eq!(third.generation, 3);
+    let jhex: String = third.job_id.iter().map(|b| format!("{b:02x}")).collect();
+    // Corrupt generation 2's body in place: delete, then write garbage
+    // with a self-consistent digest (the store verifies PUT digests).
+    let k = Key::new(format!("q/claims/0000/{jhex}/00000002"));
+    q.store().delete(&k).unwrap();
+    use sha2::Digest as _;
+    let junk = bytes::Bytes::from_static(b"garbage-not-a-record");
+    let digest: [u8; 32] = sha2::Sha256::digest(&junk).into();
+    q.store().put_if_absent(&k, junk, digest).unwrap();
+    let (report, _) = repair_all(&q);
+    // The corruption is named...
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::RecordCorrupt && f.key.ends_with("/00000002")),
+        "findings: {:?}",
+        report.findings
+    );
+    // ...and nothing spurious fires around it: the takeover at
+    // generation 3 has an undecoded predecessor, so its evidence is
+    // skipped, not judged.
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::InadmissibleClaim),
+        "findings: {:?}",
+        report.findings
+    );
+}
