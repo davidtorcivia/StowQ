@@ -748,3 +748,36 @@ fn gc_interruption_leaves_terminal_record_last() {
         "some trial must complete the deletion to exercise the ordering assert"
     );
 }
+
+#[test]
+fn zombie_bury_after_ack_is_refused() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([11; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(claim) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    q.ack(&claim, &mut budget).unwrap();
+    // The zombie holder buries late: refused, no second terminal record.
+    let out = q.bury(&claim, 0x0003, &mut budget).unwrap();
+    assert_eq!(out, stowq_core::BuryOutcome::SupersededByReceipt);
+    let jhex: String = claim.job_id.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(
+        q.store()
+            .head(&Key::new(format!("q/dead/0000/{jhex}")))
+            .is_err(),
+        "no dead record may coexist with a receipt"
+    );
+}

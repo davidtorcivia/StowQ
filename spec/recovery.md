@@ -59,3 +59,9 @@ automatically.
 - Orphan-payload collection past the enqueue horizon is required
   before the retention story is complete; implementations may defer it
   while payloads remain amortized storage cost only.
+- Terminal mutual exclusion has a check-then-act window: ack and bury
+  write different keys, both put-if-absent, so no store primitive can
+  arbitrate between them. The pre-write terminal checks in each path
+  minimize the window but cannot close it; a receipt-and-dead pair
+  produced by the window is a `duplicate_state_conflict` quarantine
+  finding owned by the repair scan.

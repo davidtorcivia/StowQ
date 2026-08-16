@@ -236,9 +236,13 @@ fn run(command: Command) -> Result<(), String> {
             let (q, store) = open(&queue)?;
             let handle: state::Handle = serde_json::from_str(&handle).map_err(|e| e.to_string())?;
             let claim = handle.to_claim(&store, &queue)?;
-            q.bury(&claim, reason, &mut OpBudget::new(128))
-                .map_err(|e| e.to_string())?;
-            println!("buried");
+            match q.bury(&claim, reason, &mut OpBudget::new(128)) {
+                Ok(stowq_core::BuryOutcome::Buried) => println!("buried"),
+                Ok(stowq_core::BuryOutcome::SupersededByReceipt) => {
+                    return Err("superseded by receipt".into())
+                }
+                Err(e) => return Err(e.to_string()),
+            }
             persist(&queue, &store)?;
         }
         Command::Sweep { queue } => {
