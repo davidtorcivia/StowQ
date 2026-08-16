@@ -1508,6 +1508,8 @@ pub enum FindingKind {
     InadmissibleClaim,
     /// Both a receipt and a dead record exist for one job.
     DuplicateTerminal,
+    /// A claim chain missing generations (a gap or a nonzero head).
+    ChainGap,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2069,6 +2071,146 @@ impl Queue {
         }
     }
 
+    /// Full-chain admissibility audit (spec records.md, Admissibility):
+    /// decodes every generation and verifies the type-appropriate
+    /// evidence against the store-time record — a takeover's basis must
+    /// name the previous generation's actual store time and lease
+    /// duration with prev_store_time + prev_duration <= observed
+    /// watermark; a continuation's worker_id and prev_token must match
+    /// the previous generation. Generation gaps are impossible-state
+    /// findings. Undecodable records are reported and skipped; the
+    /// chain still audits around them. Costs one GET per generation —
+    /// budget exhaustion propagates and the shard reruns idempotently.
+    /// Returns (tail_generation, tail_meta, tail_lease_duration); the
+    /// duration is 0 when the tail record is unavailable.
+    fn audit_claim_chain(
+        &self,
+        shard: u16,
+        job_id: [u8; 16],
+        chain: &[(u64, Meta)],
+        report: &mut RepairReport,
+        budget: &mut OpBudget,
+    ) -> Result<(u64, Meta, u64), Error> {
+        let inadmissible = |report: &mut RepairReport, gen: u64| {
+            let key = self.absolute(&RelKey::Claim {
+                shard,
+                job_id,
+                generation: gen as u32,
+            });
+            report.findings.push(Finding {
+                kind: FindingKind::InadmissibleClaim,
+                key: key.0.clone(),
+                reason: 0x0010,
+            });
+        };
+        // Contiguity: generations must run 1..=tail with no gaps (a gap
+        // is a missing object — foreign deletion or corruption).
+        let first = chain.first().expect("chain is nonempty").0;
+        for pair in chain.windows(2) {
+            if pair[1].0 != pair[0].0 + 1 {
+                report.findings.push(Finding {
+                    kind: FindingKind::ChainGap,
+                    key: self
+                        .absolute(&RelKey::Claim {
+                            shard,
+                            job_id,
+                            generation: (pair[0].0 + 1) as u32,
+                        })
+                        .0
+                        .clone(),
+                    reason: 0x0010,
+                });
+            }
+        }
+        if first != 1 {
+            report.findings.push(Finding {
+                kind: FindingKind::ChainGap,
+                key: self
+                    .absolute(&RelKey::Claim {
+                        shard,
+                        job_id,
+                        generation: first as u32,
+                    })
+                    .0
+                    .clone(),
+                reason: 0x0010,
+            });
+        }
+        // Decode every generation; keep (index-aligned) decoded records.
+        let mut decoded: Vec<Option<stowq_format::ClaimRecord>> = Vec::with_capacity(chain.len());
+        for (g, _meta) in chain {
+            let rel = RelKey::Claim {
+                shard,
+                job_id,
+                generation: *g as u32,
+            };
+            let abs = self.absolute(&rel);
+            budget.spend()?;
+            match self.store.get(&abs, None) {
+                Ok(obj) => {
+                    let tag = self.tag_for(&rel);
+                    match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
+                        Ok(Record::Claim(c)) => decoded.push(Some(c)),
+                        Ok(_) => {
+                            report.findings.push(Finding {
+                                kind: FindingKind::RecordCorrupt,
+                                key: abs.0.clone(),
+                                reason: 0x0005,
+                            });
+                            decoded.push(None);
+                        }
+                        Err(e) => {
+                            report.findings.push(Finding {
+                                kind: FindingKind::RecordCorrupt,
+                                key: abs.0.clone(),
+                                reason: record_violation_reason(&e),
+                            });
+                            decoded.push(None);
+                        }
+                    }
+                }
+                Err(StoreError::NotFound) => decoded.push(None),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // Evidence: each generation above 1 vs its predecessor.
+        for i in 1..chain.len() {
+            let (Some(rec), Some(prev)) = (&decoded[i], &decoded[i - 1]) else {
+                continue;
+            };
+            let gen = chain[i].0;
+            if rec.continuation {
+                let custody =
+                    rec.worker_id == prev.worker_id && rec.prev_token == Some(prev.worker_token);
+                if !custody {
+                    inadmissible(report, gen);
+                }
+            } else {
+                let Some(basis) = &rec.basis else {
+                    // Unreachable through decode (evidence exclusivity
+                    // is enforced at the format layer); defensive.
+                    inadmissible(report, gen);
+                    continue;
+                };
+                let evidence = basis.prev_store_time_ns == chain[i - 1].1.store_time_ns
+                    && basis.prev_duration_ns == prev.lease_duration_ns
+                    && basis
+                        .prev_store_time_ns
+                        .saturating_add(basis.prev_duration_ns)
+                        <= basis.observed_watermark_ns;
+                if !evidence {
+                    inadmissible(report, gen);
+                }
+            }
+        }
+        let (tail_gen, tail_meta) = chain.last().expect("chain is nonempty");
+        let tail_duration = decoded
+            .last()
+            .and_then(|c| c.as_ref())
+            .map_or(0, |c| c.lease_duration_ns);
+        Ok((*tail_gen, tail_meta.clone(), tail_duration))
+    }
+
     fn repair_shard(
         &self,
         shard: u16,
@@ -2176,59 +2318,11 @@ impl Queue {
                 });
             }
             // Generations are fixed-width hex: listing order is
-            // numeric order, so the last entry is the tail.
+            // numeric order, so ascending sort yields the chain.
             chain.sort_by_key(|(g, _)| *g);
-            let (tail_gen, tail_meta) = chain.last().expect("chain is nonempty").clone();
-            let tail_rel = RelKey::Claim {
-                shard,
-                job_id,
-                generation: tail_gen as u32,
-            };
-            let duration = match self.store.get(&self.absolute(&tail_rel), None) {
-                Ok(obj) => {
-                    let tag = self.tag_for(&tail_rel);
-                    match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
-                        Ok(Record::Claim(c)) => {
-                            // Basis evidence vs the store-time record:
-                            // a takeover's recorded prev_store_time must
-                            // match the previous generation's actual
-                            // store time (free from the listing).
-                            if !c.continuation {
-                                if let Some(prev) = chain.iter().find(|(g, _)| *g + 1 == tail_gen) {
-                                    if c.basis.as_ref().is_none_or(|b| {
-                                        b.prev_store_time_ns != prev.1.store_time_ns
-                                    }) {
-                                        report.findings.push(Finding {
-                                            kind: FindingKind::InadmissibleClaim,
-                                            key: self.absolute(&tail_rel).0.clone(),
-                                            reason: 0x0010,
-                                        });
-                                    }
-                                }
-                            }
-                            c.lease_duration_ns
-                        }
-                        Ok(_) => {
-                            report.findings.push(Finding {
-                                kind: FindingKind::RecordCorrupt,
-                                key: self.absolute(&tail_rel).0.clone(),
-                                reason: 0x0005,
-                            });
-                            0
-                        }
-                        Err(e) => {
-                            report.findings.push(Finding {
-                                kind: FindingKind::RecordCorrupt,
-                                key: self.absolute(&tail_rel).0.clone(),
-                                reason: record_violation_reason(&e),
-                            });
-                            0
-                        }
-                    }
-                }
-                Err(StoreError::NotFound) => 0,
-                Err(e) => return Err(e.into()),
-            };
+            let (tail_gen, tail_meta, tail_duration) =
+                self.audit_claim_chain(shard, job_id, &chain, report, budget)?;
+            let duration = tail_duration;
             if let Some(bucket) = stowq_math::bucket_number(
                 tail_meta.store_time_ns.saturating_add(duration),
                 self.format.lease_bucket_width_ns,
