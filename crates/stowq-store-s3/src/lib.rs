@@ -212,8 +212,13 @@ impl ObjectStore for S3Store {
                 .bucket(&self.bucket)
                 .key(key.as_str());
             if let Some(r) = &range {
-                // Inclusive end byte.
-                req = req.range(format!("bytes={}-{}", r.start, r.end.saturating_sub(1)));
+                // Strict half-open contract (see the trait): empty and
+                // inverted ranges are absence, never sent to the store.
+                if r.start >= r.end {
+                    return Err(StoreError::NotFound);
+                }
+                // Inclusive end byte; start < end guarantees end >= 1.
+                req = req.range(format!("bytes={}-{}", r.start, r.end - 1));
             }
             match req.send().await {
                 Ok(out) => {
@@ -231,6 +236,14 @@ impl ObjectStore for S3Store {
                         .await
                         .map_err(|_| StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))?
                         .into_bytes();
+                    // A store that clamps a past-EOF end (HTTP 206
+                    // partial) returns fewer bytes than requested:
+                    // report absence rather than a short slice.
+                    if let Some(r) = &range {
+                        if body.len() as u64 != r.end - r.start {
+                            return Err(StoreError::NotFound);
+                        }
+                    }
                     Ok(Object { meta, body })
                 }
                 Err(e) => Err(read_err(e)),

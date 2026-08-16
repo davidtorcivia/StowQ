@@ -131,12 +131,21 @@ fn primitives_certification() {
         .iter()
         .all(|l| l.key.as_str() > format!("conformance/prim/{run}/p1").as_str()));
 
-    // Ranged GET.
+    // Range contract (trait get): half-open [start, end), strictly
+    // start < end <= size, identically on every backend.
     let obj = s.get(&k2, Some(1..2)).unwrap();
     assert_eq!(&obj.body[..], b"2");
-    // An unsatisfiable range (start past EOF) is absence of the slice,
-    // matching the memory fake's out-of-bounds semantics.
+    // Boundary end == size returns the tail through EOF.
+    let tail = s.get(&k2, Some(0..2)).unwrap();
+    assert_eq!(&tail.body[..], b"v2");
+    // Past-EOF end: the store clamps to a 206 partial; the backend
+    // reports absence rather than a short slice.
+    assert_eq!(s.get(&k2, Some(0..3)).unwrap_err(), StoreError::NotFound);
+    // Start past EOF is an unsatisfiable range (416).
     assert_eq!(s.get(&k2, Some(5..6)).unwrap_err(), StoreError::NotFound);
+    // Empty and inverted ranges are absence, rejected before the wire.
+    assert_eq!(s.get(&k2, Some(1..1)).unwrap_err(), StoreError::NotFound);
+    assert_eq!(s.get(&k2, Some(1..0)).unwrap_err(), StoreError::NotFound);
     // Zero-limit listing is an empty terminal page on every backend.
     let zero = s
         .list(&format!("conformance/prim/{run}/"), None, 0)

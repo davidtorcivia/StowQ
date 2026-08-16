@@ -177,7 +177,10 @@ impl ObjectStore for MemoryStore {
         let body = match range {
             None => stored.body.clone(),
             Some(r) => {
-                if r.start >= size || r.end > size || r.start > r.end {
+                // Strict half-open contract: start < end <= size. This
+                // subsumes start-past-EOF (end would exceed size) and
+                // rejects empty and inverted ranges.
+                if r.start >= r.end || r.end > size {
                     return Err(StoreError::NotFound);
                 }
                 stored.body.slice(r.start as usize..r.end as usize)
@@ -464,23 +467,29 @@ mod tests {
                 digest(b"hello stowq"),
             )
             .unwrap();
-        // Empty slice within bounds is fine.
-        assert_eq!(&store.get(&k, Some(5..5)).unwrap().body[..], b"");
-        // Empty slice at EOF: only the start-past-size guard rejects it.
+        // The range contract is start < end <= size: empty, inverted,
+        // and past-EOF ranges are all absence.
+        assert_eq!(store.get(&k, Some(5..5)).unwrap_err(), StoreError::NotFound);
         assert_eq!(
             store.get(&k, Some(11..11)).unwrap_err(),
             StoreError::NotFound
         );
-        // start past size.
         assert_eq!(
             store.get(&k, Some(12..12)).unwrap_err(),
             StoreError::NotFound
         );
-        // inverted range.
         assert_eq!(
             store.get(&k, Some(Range { start: 5, end: 2 })).unwrap_err(),
             StoreError::NotFound
         );
+        assert_eq!(
+            store.get(&k, Some(0..12)).unwrap_err(),
+            StoreError::NotFound
+        );
+        // The boundary end == size returns the tail through EOF.
+        let obj = store.get(&k, Some(6..11)).unwrap();
+        assert_eq!(&obj.body[..], b"stowq");
+        assert_eq!(obj.meta.size, 11);
     }
 
     #[test]

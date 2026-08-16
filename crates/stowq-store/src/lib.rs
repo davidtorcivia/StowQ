@@ -146,6 +146,12 @@ pub trait ObjectStore: Send + Sync {
         if_match: &Version,
     ) -> StoreResult<PutOutcome>;
 
+    /// Reads the object, or a byte range of it. The range is half-open
+    /// `[start, end)` and must satisfy `start < end <= size`: an
+    /// empty, inverted, or past-EOF range is `NotFound`, on every
+    /// backend. A backend that would clamp a past-EOF end (an HTTP
+    /// 206 partial) reports `NotFound` rather than returning fewer
+    /// bytes than requested.
     fn get(&self, key: &Key, range: Option<Range<u64>>) -> StoreResult<Object>;
 
     fn head(&self, key: &Key) -> StoreResult<Meta>;
