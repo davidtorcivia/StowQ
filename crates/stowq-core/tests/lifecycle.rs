@@ -1220,7 +1220,6 @@ fn repair_terminates_across_the_full_shard_space() {
     assert_eq!(report.shards_scanned, 6);
     assert!(resume.is_none());
 }
-||||||| parent of 5535d68 (feat(core): collect orphan payloads past the enqueue horizon)
 
 #[test]
 fn gc_collects_orphan_payload_past_horizon() {
@@ -1297,5 +1296,71 @@ fn gc_never_collects_referenced_payloads() {
     // Horizon 0 with the job record present: the payload is referenced.
     let report = q.gc(u64::MAX / 4, 1_000, 0, &mut budget).unwrap();
     assert_eq!(report.orphans_deleted, 0);
+    assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).len(), 1);
+}
+
+#[test]
+fn gc_skips_non_parseable_payload_keys_without_collecting() {
+    // A stray object under payloads/ that does not parse is a repair
+    // finding, not an orphan: the pass skips it (no delete) and spends
+    // no HEAD on it, whatever its age.
+    let q = make_queue();
+    use sha2::Digest as _;
+    let junk = Key::new("q/payloads/deadbeef/not-hex");
+    let body = bytes::Bytes::from_static(b"junk");
+    let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
+    q.store().put_if_absent(&junk, body, digest).unwrap();
+    let mut budget = OpBudget::new(256);
+    let report = q.gc(u64::MAX / 4, 1_000, 0, &mut budget).unwrap();
+    assert_eq!(report.orphans_deleted, 0);
+    assert!(
+        q.store().head(&junk).is_ok(),
+        "non-parseable keys are left in place"
+    );
+}
+
+#[test]
+fn gc_orphan_pass_propagates_head_errors() {
+    // The orphan HEAD failing with anything but NotFound aborts gc
+    // loudly rather than treating the error as absence.
+    use stowq_store::{Fault, FaultPlan, Injector, Op};
+    let inner = MemoryStore::new();
+    let injector = Injector::new(
+        inner,
+        vec![FaultPlan::new(Op::Head, Fault::PostTransmit, [0])],
+    );
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.max_inline_payload = 4;
+    let q = Queue::init(Box::new(injector), "q", &opts, &format()).unwrap();
+    let mut budget = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([21; 16]),
+                payload: b"detached-orphan",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    q.store()
+        .delete(&Key::new(format!("q/jobs/0000/{jhex}")))
+        .unwrap();
+    // Now 0 with a zero horizon: the payload is due, the first orphan
+    // HEAD is faulted post-transmit, and gc must surface the unknown
+    // outcome instead of deleting anything.
+    let result = q.gc(u64::MAX / 4, 1_000, 0, &mut OpBudget::new(256));
+    match result {
+        Err(stowq_core::Error::Store(stowq_store::StoreError::OutcomeUnknown(_))) => {}
+        other => panic!("expected OutcomeUnknown, got {other:?}"),
+    }
+    // The payload is untouched: absence of the job record was never
+    // proven with a clean read.
     assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).len(), 1);
 }
