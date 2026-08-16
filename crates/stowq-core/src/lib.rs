@@ -375,6 +375,7 @@ impl Queue {
         let Record::Format(format) = record else {
             return Err(Error::Record("meta/FORMAT is not a format record".into()));
         };
+        format.validate()?;
         q.format = format;
         Ok(q)
     }
@@ -388,6 +389,7 @@ impl Queue {
         opts: &OpenOptions,
         format: &stowq_format::FormatRecord,
     ) -> Result<Self, Error> {
+        format.validate()?;
         let root = format!("{}/", root.trim_end_matches('/'));
         let key = format!("{root}meta/FORMAT");
         let key = Key::new(key);
@@ -604,6 +606,11 @@ impl Queue {
         input: EnqueueInput<'_>,
         budget: &mut OpBudget,
     ) -> Result<EnqueueOutcome, Error> {
+        // A zero-attempt job would be dead on its first claim scan; the
+        // producer gets the error instead.
+        if input.maximum_attempts == 0 {
+            return Err(Error::Record("maximum_attempts must be positive".into()));
+        }
         let job_id = input.job_id.unwrap_or_else(|| fresh_token(input.payload));
         let shard = compute_shard(&self.opts.queue_id, &job_id, self.format.shard_count.max(1));
         let payload_digest: Digest = Sha256::digest(input.payload).into();
@@ -617,12 +624,12 @@ impl Queue {
                 digest: payload_digest,
             };
             let abs = self.absolute(&rel);
-            budget.spend()?;
             let body = Bytes::copy_from_slice(input.payload);
-            // Content-addressed: losing this race means identical bytes.
-            match self.store.put_if_absent(&abs, body, payload_digest)? {
-                PutOutcome::Committed { .. } | PutOutcome::Rejected => {}
-            }
+            // Content-addressed: losing this race means identical bytes,
+            // and an unknown outcome resolves by presence — the key
+            // embeds the digest and the store verified the body hash at
+            // PUT, so present at the key means the payload is in place.
+            self.put_bytes_resolving(&abs, body, payload_digest, budget)?;
             (None, Some(rel.to_string()))
         };
 
@@ -675,6 +682,68 @@ impl Queue {
                     Ok(found) if found == record => Ok(EnqueueOutcome::Committed { job_id }),
                     _ => Ok(EnqueueOutcome::IdTaken { job_id }),
                 }
+            }
+        }
+    }
+
+    /// The outcome-unknown resolver for content-addressed payload
+    /// writes: transport retries and unknown outcomes never escape.
+    /// Presence at the key proves the payload is in place (the store
+    /// verified the body hash at PUT; the key embeds the digest).
+    fn put_bytes_resolving(
+        &self,
+        abs: &Key,
+        body: Bytes,
+        digest: Digest,
+        budget: &mut OpBudget,
+    ) -> Result<(), Error> {
+        let mut transport_retries = 0;
+        loop {
+            budget.spend()?;
+            match self.store.put_if_absent(abs, body.clone(), digest) {
+                Ok(PutOutcome::Committed { .. }) | Ok(PutOutcome::Rejected) => return Ok(()),
+                Err(StoreError::Transport(_)) => {
+                    transport_retries += 1;
+                    if transport_retries > RETRY_TRANSPORT_MAX {
+                        return Err(Error::TransportExhausted);
+                    }
+                    continue;
+                }
+                Err(StoreError::OutcomeUnknown(_)) => {
+                    match self.resolve_presence(abs, budget)? {
+                        // Present means committed (possibly by us before
+                        // the response was lost); absent means retry.
+                        true => return Ok(()),
+                        false => {
+                            transport_retries += 1;
+                            if transport_retries > RETRY_TRANSPORT_MAX {
+                                return Err(Error::TransportExhausted);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Head-only presence probe with transport retries.
+    fn resolve_presence(&self, abs: &Key, budget: &mut OpBudget) -> Result<bool, Error> {
+        let mut transport_retries = 0;
+        loop {
+            budget.spend()?;
+            match self.store.head(abs) {
+                Ok(_) => return Ok(true),
+                Err(StoreError::NotFound) => return Ok(false),
+                Err(StoreError::Transport(_)) => {
+                    transport_retries += 1;
+                    if transport_retries > RETRY_TRANSPORT_MAX {
+                        return Err(Error::TransportExhausted);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -958,7 +1027,6 @@ impl Queue {
             return Err(Error::Internal("generation space exhausted".into()));
         }
         let worker_token = fresh_token(&job_id);
-        let continuation = false;
         let record = Record::Claim(ClaimRecord {
             job_id,
             generation: tail_gen + 1,
@@ -966,7 +1034,7 @@ impl Queue {
             worker_id: self.opts.worker_id.clone(),
             worker_token,
             lease_duration_ns: opts.lease_duration_ns,
-            continuation,
+            continuation: false,
             basis: Some(ClaimBasis {
                 prev_store_time_ns: tail_meta.store_time_ns,
                 prev_duration_ns: tail_duration,
@@ -1176,15 +1244,18 @@ impl Queue {
         floor_ns: u64,
         budget: &mut OpBudget,
     ) -> Result<(), Error> {
+        // The policy hashes the attempt into its jitter stream, so a
+        // u64 attempt beyond the u32 policy domain is clamped, never
+        // wrapped (a wrapped attempt would shrink the backoff).
         let delay_ms = stowq_math::retry_delay_ms(
             &self.opts.queue_id,
             &claim.job_id,
-            claim.attempt as u32,
+            claim.attempt.min(u32::MAX as u64) as u32,
             &self.opts.retry,
         )
         .map_err(|e| Error::Internal(e.to_string()))?;
         let not_before = stowq_math::retry_not_before(floor_ns, delay_ms * 1_000_000)
-            .ok_or(Error::BudgetExhausted)?;
+            .ok_or_else(|| Error::Internal("retry_not_before overflow".into()))?;
         let record = Record::Fail(FailRecord {
             job_id: claim.job_id,
             generation: claim.generation,
@@ -1336,11 +1407,10 @@ enum Resolved {
 
 fn parse_generation(key: &Key) -> Option<u64> {
     let segment = key.as_str().rsplit('/').next()?;
-    let hexseg = segment.strip_suffix(".idx").unwrap_or(segment);
-    if hexseg.len() != 8 || !hexseg.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if segment.len() != 8 || !segment.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    u64::from_str_radix(hexseg, 16).ok()
+    u64::from_str_radix(segment, 16).ok()
 }
 
 // ---------- Sweeping, repair, and GC ----------

@@ -229,3 +229,45 @@ fn watermark_unknown_outcome_resolves() {
     let w = q.watermark(&mut budget).unwrap().unwrap();
     assert_eq!(w.highest_observed_wall_bucket, floor / 1_000);
 }
+
+#[test]
+fn detached_payload_unknown_outcome_resolves() {
+    // Put calls: FORMAT(0) during init, payload(1) during enqueue. The
+    // payload write is committed-but-response-lost: enqueue must
+    // resolve by presence (the key embeds the digest) and the payload
+    // must be in place for the claim to deliver.
+    let injector = Injector::new(
+        MemoryStore::new(),
+        vec![FaultPlan::new(
+            Op::PutIfAbsent,
+            Fault::PostTransmitAfter,
+            [1],
+        )],
+    );
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.max_inline_payload = 4;
+    let q = Queue::init(Box::new(injector), "q", &opts, &format()).unwrap();
+    let mut budget = OpBudget::new(64);
+    let out = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([3; 16]),
+                payload: b"detached-payload",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap();
+    assert!(matches!(out, EnqueueOutcome::Committed { .. }));
+    let jhex: String = (0..16).map(|_| "03").collect::<String>();
+    let page = q
+        .store()
+        .list(&format!("q/payloads/{jhex}/"), None, 10)
+        .unwrap();
+    assert!(
+        !page.items.is_empty(),
+        "resolved payload write must be present"
+    );
+}
