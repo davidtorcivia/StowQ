@@ -55,6 +55,8 @@ jobs:
         run: |
           url=https://dl.min.io/client/mc/release/linux-amd64
           curl -fsSL "$url/mc" -o /tmp/mc
+          sum=01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
+          echo "$sum  /tmp/mc" | sha256sum --check --strict
           chmod +x /tmp/mc
           /tmp/mc alias set ci http://localhost:9000 minioadmin minioadmin
           /tmp/mc mb --ignore-existing ci/stowq-conformance

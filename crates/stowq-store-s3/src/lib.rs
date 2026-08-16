@@ -73,6 +73,18 @@ fn status_of<E>(e: &SdkError<E>) -> Option<u16> {
     }
 }
 
+/// Read-path errors: 404 is absence; 5xx is transient server state on
+/// an idempotent operation (unknown — callers re-read); other service
+/// errors are protocol failures; the rest classify by transport class.
+fn read_err<E>(e: SdkError<E>) -> StoreError {
+    match status_of(&e) {
+        Some(404) => StoreError::NotFound,
+        Some(status) if status >= 500 => StoreError::OutcomeUnknown(Ambiguity::AmbiguousResponse),
+        Some(_) => StoreError::ProfileViolation(format!("read rejected: {e}")),
+        None => classify_send_err(&e),
+    }
+}
+
 fn classify_send_err<E>(e: &SdkError<E>) -> StoreError {
     match e {
         // The request was transmitted and no verdict arrived: unknown.
@@ -218,10 +230,7 @@ impl ObjectStore for S3Store {
                         .into_bytes();
                     Ok(Object { meta, body })
                 }
-                Err(e) => match status_of(&e) {
-                    Some(404) => Err(StoreError::NotFound),
-                    _ => Err(classify_send_err(&e)),
-                },
+                Err(e) => Err(read_err(e)),
             }
         })
     }
@@ -244,10 +253,7 @@ impl ObjectStore for S3Store {
                         .unwrap_or(0),
                     size: out.content_length.unwrap_or(0) as u64,
                 }),
-                Err(e) => match status_of(&e) {
-                    Some(404) => Err(StoreError::NotFound),
-                    _ => Err(classify_send_err(&e)),
-                },
+                Err(e) => Err(read_err(e)),
             }
         })
     }
@@ -313,7 +319,7 @@ impl ObjectStore for S3Store {
                 Ok(_) => Ok(()),
                 Err(e) => match status_of(&e) {
                     Some(404) => Ok(()),
-                    _ => Err(classify_send_err(&e)),
+                    _ => Err(read_err(e)),
                 },
             }
         })
