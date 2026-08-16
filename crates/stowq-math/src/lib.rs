@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn delay_with_jitter_stays_in_upper_half() {
         let p = policy(100, 1_600, true);
-        // Full jitter: delay lies in [ceiling/2, ceiling].
+        // Equal jitter: delay lies in [ceiling/2, ceiling].
         assert_eq!(retry_delay_ms(&Q, &J, 0, &p).unwrap(), 0);
         let d1 = retry_delay_ms(&Q, &J, 1, &p).unwrap();
         assert!((50..=100).contains(&d1), "attempt 1 delay {d1}");
