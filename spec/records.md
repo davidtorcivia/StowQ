@@ -21,7 +21,9 @@ key_tag       = first_8_bytes(SHA256("StowQ-1-key\0" || queue_id || key))
 `magic` is the u64 `0x53544f5751312d00`. `major` is 1 and `minor` is 0.
 `queue_id` is a 16-byte string, `key_tag` an 8-byte string (see
 namespace.md). `record_type`: 1 format, 2 job, 3 claim, 4 fail, 5 receipt,
-6 dead, 7 watermark. `fields` is a map with text keys; absent optional
+6 dead, 7 watermark (v1); 8 quarantine (v1.1). Feature bits are
+numbered from the least significant: bit 1 is
+`required_feature_bits = 1`. `fields` is a map with text keys; absent optional
 fields are omitted entirely. Unknown fields are rejected in v1;
 `required_feature_bits` gates evolution.
 
@@ -115,6 +117,12 @@ gap names the missing generation's key with the predecessor's store
 time (a head gap — no predecessor — uses the head entry's own store
 time); a missing referenced payload (0x0014) names the payload key with
 the referencing job record's store time.
+
+A v1.1-aware writer MUST NOT write quarantine records to a queue
+whose FORMAT does not demand bit 1 (the reference implementation
+enforces this in its scan writer). A type-8 record encountered under a
+v1 queue's prefix is a quarantine finding itself for that queue's
+scan: evidence of a version-mismatched writer.
 
 Quarantine records are never collected by GC. A finding that is
 repaired and later recurs is not re-recorded (the key exists);
