@@ -9,6 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 stowq-store.workspace = true
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "default-https-client"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
@@ -16,7 +17,6 @@ aws-credential-types = "1"
 bytes.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [features]
 conformance = []
@@ -26,4 +26,4 @@ stowq-testkit.workspace = true
 stowq-core.workspace = true
 stowq-format.workspace = true
 stowq-keys.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

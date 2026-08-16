@@ -16,3 +16,6 @@ stowq-math.workspace = true
 stowq-store.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

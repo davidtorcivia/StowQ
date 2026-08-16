@@ -82,17 +82,19 @@ enum Command {
     Repair { queue: String },
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
-    if let Err(e) = run(cli.command) {
+    if let Err(e) = run(cli.command).await {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-fn open(queue: &str) -> Result<(Queue, MemoryStore), String> {
+async fn open(queue: &str) -> Result<(Queue, MemoryStore), String> {
     let store = state::load(queue).map_err(|e| e.to_string())?;
     let q = Queue::open(Box::new(store.clone()), queue, OpenOptions::new([1; 16]))
+        .await
         .map_err(|e| e.to_string())?;
     Ok((q, store))
 }
@@ -101,7 +103,7 @@ fn persist(queue: &str, store: &MemoryStore) -> Result<(), String> {
     state::save(queue, store).map_err(|e| e.to_string())
 }
 
-fn run(command: Command) -> Result<(), String> {
+async fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Init { queue, shard_count } => {
             let store = state::load(&queue).map_err(|e| e.to_string())?;
@@ -115,6 +117,7 @@ fn run(command: Command) -> Result<(), String> {
                 required_feature_bits: 0,
             };
             let _q = Queue::init(Box::new(store), &queue, &OpenOptions::new([1; 16]), &format)
+                .await
                 .map_err(|e| e.to_string())?;
             persist(&queue, &shared)?;
             println!("initialized {queue}");
@@ -126,7 +129,7 @@ fn run(command: Command) -> Result<(), String> {
             maximum_attempts,
             job_id,
         } => {
-            let (q, store) = open(&queue)?;
+            let (q, store) = open(&queue).await?;
             let body = if payload == "-" {
                 let mut buf = Vec::new();
                 std::io::stdin()
@@ -149,6 +152,7 @@ fn run(command: Command) -> Result<(), String> {
                     },
                     &mut budget,
                 )
+                .await
                 .map_err(|e| e.to_string())?;
             match out {
                 EnqueueOutcome::Committed { job_id } => {
@@ -164,9 +168,10 @@ fn run(command: Command) -> Result<(), String> {
             }
         }
         Command::Claim { queue, lease_ns } => {
-            let (q, store) = open(&queue)?;
+            let (q, store) = open(&queue).await?;
             let floor = q
                 .establish_floor(&mut OpBudget::new(16))
+                .await
                 .map_err(|e| e.to_string())?;
             let shard_count = q.format().shard_count.max(1);
             let mut outcome = ClaimOutcome::Empty;
@@ -178,6 +183,7 @@ fn run(command: Command) -> Result<(), String> {
                 };
                 outcome = q
                     .claim(&opts, &mut OpBudget::new(512))
+                    .await
                     .map_err(|e| e.to_string())?;
                 if matches!(outcome, ClaimOutcome::Claimed(_)) {
                     break;
@@ -203,10 +209,10 @@ fn run(command: Command) -> Result<(), String> {
             }
         }
         Command::Ack { queue, handle } => {
-            let (q, store) = open(&queue)?;
+            let (q, store) = open(&queue).await?;
             let handle: state::Handle = serde_json::from_str(&handle).map_err(|e| e.to_string())?;
-            let claim = handle.to_claim(&store, &queue)?;
-            match q.ack(&claim, &mut OpBudget::new(128)) {
+            let claim = handle.to_claim(&store, &queue).await?;
+            match q.ack(&claim, &mut OpBudget::new(128)).await {
                 Ok(AckOutcome::Acked) => {
                     println!("acked");
                     persist(&queue, &store)?;
@@ -221,13 +227,15 @@ fn run(command: Command) -> Result<(), String> {
             handle,
             reason,
         } => {
-            let (q, store) = open(&queue)?;
+            let (q, store) = open(&queue).await?;
             let handle: state::Handle = serde_json::from_str(&handle).map_err(|e| e.to_string())?;
-            let claim = handle.to_claim(&store, &queue)?;
+            let claim = handle.to_claim(&store, &queue).await?;
             let floor = q
                 .establish_floor(&mut OpBudget::new(16))
+                .await
                 .map_err(|e| e.to_string())?;
             q.nack(&claim, reason, floor, &mut OpBudget::new(128))
+                .await
                 .map_err(|e| e.to_string())?;
             println!("nacked");
             persist(&queue, &store)?;
@@ -237,10 +245,10 @@ fn run(command: Command) -> Result<(), String> {
             handle,
             reason,
         } => {
-            let (q, store) = open(&queue)?;
+            let (q, store) = open(&queue).await?;
             let handle: state::Handle = serde_json::from_str(&handle).map_err(|e| e.to_string())?;
-            let claim = handle.to_claim(&store, &queue)?;
-            match q.bury(&claim, reason, &mut OpBudget::new(128)) {
+            let claim = handle.to_claim(&store, &queue).await?;
+            match q.bury(&claim, reason, &mut OpBudget::new(128)).await {
                 Ok(stowq_core::BuryOutcome::Buried) => println!("buried"),
                 Ok(stowq_core::BuryOutcome::SupersededByReceipt) => {
                     return Err("superseded by receipt".into())
@@ -250,15 +258,18 @@ fn run(command: Command) -> Result<(), String> {
             persist(&queue, &store)?;
         }
         Command::Sweep { queue } => {
-            let (q, store) = open(&queue)?;
+            let (q, store) = open(&queue).await?;
             let floor = q
                 .establish_floor(&mut OpBudget::new(16))
+                .await
                 .map_err(|e| e.to_string())?;
             let leases = q
                 .sweep_expired_leases(floor, &mut OpBudget::new(1024))
+                .await
                 .map_err(|e| e.to_string())?;
             let delayed = q
                 .sweep_delayed(floor, &mut OpBudget::new(1024))
+                .await
                 .map_err(|e| e.to_string())?;
             println!(
                 "leases: {} entries, {} reclaimed; delayed: {} entries, {} promoted",
@@ -271,9 +282,10 @@ fn run(command: Command) -> Result<(), String> {
             retention_ns,
             orphan_horizon_ns,
         } => {
-            let (q, store) = open(&queue)?;
+            let (q, store) = open(&queue).await?;
             let floor = q
                 .establish_floor(&mut OpBudget::new(16))
+                .await
                 .map_err(|e| e.to_string())?;
             let report = q
                 .gc(
@@ -282,6 +294,7 @@ fn run(command: Command) -> Result<(), String> {
                     orphan_horizon_ns,
                     &mut OpBudget::new(4096),
                 )
+                .await
                 .map_err(|e| e.to_string())?;
             println!(
                 "{} jobs deleted, {} beacons collected",
@@ -290,9 +303,10 @@ fn run(command: Command) -> Result<(), String> {
             persist(&queue, &store)?;
         }
         Command::Repair { queue } => {
-            let (q, store) = open(&queue)?;
+            let (q, store) = open(&queue).await?;
             let (report, resume) = q
                 .repair_scan(0, &mut OpBudget::new(8192))
+                .await
                 .map_err(|e| e.to_string())?;
             println!(
                 "shards: {}, jobs: {}, claim chains: {}, indexes regenerated: {}, findings: {}",
@@ -314,9 +328,10 @@ fn run(command: Command) -> Result<(), String> {
             persist(&queue, &store)?;
         }
         Command::Inspect { queue, job_id } => {
-            let (q, _store) = open(&queue)?;
+            let (q, _store) = open(&queue).await?;
             let id = parse_job_id(&job_id)?;
             let out = state::inspect(q.store(), &queue, id, q.format().shard_count.max(1))
+                .await
                 .map_err(|e| e.to_string())?;
             println!("{out}");
         }

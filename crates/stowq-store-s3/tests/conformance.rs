@@ -35,11 +35,8 @@ fn run_id() -> String {
     format!("{}-{}", std::process::id(), n)
 }
 
-fn store() -> S3Store {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let sdk = rt.block_on(aws_config::load_defaults(
-        aws_config::BehaviorVersion::latest(),
-    ));
+async fn store() -> S3Store {
+    let sdk = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let config = S3Config {
         region: std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".into()),
         endpoint: endpoint(),
@@ -66,35 +63,39 @@ fn format() -> FormatRecord {
 }
 
 /// P1/P2/P5/P6/P7 certification at the primitive level.
-#[test]
-fn primitives_certification() {
+#[tokio::test]
+async fn primitives_certification() {
     let Some(_) = endpoint() else { return };
-    let s = store();
+    let s = store().await;
     let run = run_id();
     let k = Key::new(format!("conformance/prim/{run}/p1"));
 
     // P1: put-if-absent is atomic; second write rejects.
     let a = s
         .put_if_absent(&k, Bytes::from_static(b"a"), digest(b"a"))
+        .await
         .unwrap();
     let b = s
         .put_if_absent(&k, Bytes::from_static(b"b"), digest(b"b"))
+        .await
         .unwrap();
     assert!(matches!(a, PutOutcome::Committed { .. }));
     assert_eq!(b, PutOutcome::Rejected);
-    assert_eq!(&s.get(&k, None).unwrap().body[..], b"a");
+    assert_eq!(&s.get(&k, None).await.unwrap().body[..], b"a");
 
     // P1 integrity: digest mismatch refuses without writing.
     let k2 = Key::new(format!("conformance/prim/{run}/p1-mismatch"));
     let err = s
         .put_if_absent(&k2, Bytes::from_static(b"x"), digest(b"y"))
+        .await
         .unwrap_err();
     assert!(matches!(err, StoreError::IntegrityViolation(_)));
-    assert_eq!(s.head(&k2).unwrap_err(), StoreError::NotFound);
+    assert_eq!(s.head(&k2).await.unwrap_err(), StoreError::NotFound);
 
     // P2: CAS against the current version commits; stale rejects.
     let PutOutcome::Committed { version } = s
         .put_if_absent(&k2, Bytes::from_static(b"v1"), digest(b"v1"))
+        .await
         .unwrap()
     else {
         panic!()
@@ -102,29 +103,33 @@ fn primitives_certification() {
     let stale = stowq_store::Version("deadbeef".into());
     assert_eq!(
         s.cas(&k2, Bytes::from_static(b"x"), digest(b"x"), &stale)
+            .await
             .unwrap(),
         PutOutcome::Rejected
     );
     assert!(matches!(
         s.cas(&k2, Bytes::from_static(b"v2"), digest(b"v2"), &version)
+            .await
             .unwrap(),
         PutOutcome::Committed { .. }
     ));
-    assert_eq!(&s.get(&k2, None).unwrap().body[..], b"v2");
+    assert_eq!(&s.get(&k2, None).await.unwrap().body[..], b"v2");
 
     // P3/P6: read-after-write with a nonzero store time.
-    let meta = s.head(&k).unwrap();
+    let meta = s.head(&k).await.unwrap();
     assert!(meta.store_time_ns > 0, "P6: server-assigned time");
     assert_eq!(meta.size, 1);
 
     // P4: listing sees the write; after-marker is exclusive.
     let page = s
         .list(&format!("conformance/prim/{run}/"), None, 10)
+        .await
         .unwrap();
     assert!(page.items.iter().any(|l| l.key.as_str().ends_with("p1")));
     let after = Key::new(format!("conformance/prim/{run}/p1"));
     let next = s
         .list(&format!("conformance/prim/{run}/"), Some(&after), 10)
+        .await
         .unwrap();
     assert!(next
         .items
@@ -135,42 +140,57 @@ fn primitives_certification() {
     // start < end <= size, identically on every backend. meta.size is
     // the full object size even on a ranged read (the part length is
     // not the object size; 1..2 has part length 1, object size 2).
-    let obj = s.get(&k2, Some(1..2)).unwrap();
+    let obj = s.get(&k2, Some(1..2)).await.unwrap();
     assert_eq!(&obj.body[..], b"2");
     assert_eq!(obj.meta.size, 2);
     // Boundary end == size returns the tail through EOF.
-    let tail = s.get(&k2, Some(0..2)).unwrap();
+    let tail = s.get(&k2, Some(0..2)).await.unwrap();
     assert_eq!(&tail.body[..], b"v2");
     // Past-EOF end: the store clamps to a 206 partial; the backend
     // reports absence rather than a short slice.
-    assert_eq!(s.get(&k2, Some(0..3)).unwrap_err(), StoreError::NotFound);
+    assert_eq!(
+        s.get(&k2, Some(0..3)).await.unwrap_err(),
+        StoreError::NotFound
+    );
     // Start past EOF is an unsatisfiable range (416).
-    assert_eq!(s.get(&k2, Some(5..6)).unwrap_err(), StoreError::NotFound);
+    assert_eq!(
+        s.get(&k2, Some(5..6)).await.unwrap_err(),
+        StoreError::NotFound
+    );
     // Empty and inverted ranges are absence, rejected before the wire.
-    assert_eq!(s.get(&k2, Some(1..1)).unwrap_err(), StoreError::NotFound);
-    assert_eq!(s.get(&k2, Some(1..0)).unwrap_err(), StoreError::NotFound);
+    assert_eq!(
+        s.get(&k2, Some(1..1)).await.unwrap_err(),
+        StoreError::NotFound
+    );
+    assert_eq!(
+        s.get(&k2, Some(std::ops::Range { start: 1, end: 0 }))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound
+    );
     // Zero-limit listing is an empty terminal page on every backend.
     let zero = s
         .list(&format!("conformance/prim/{run}/"), None, 0)
+        .await
         .unwrap();
     assert!(zero.items.is_empty());
     assert_eq!(zero.next_after, None);
 }
 
 /// The full queue lifecycle over the endpoint.
-#[test]
-fn lifecycle_certification() {
+#[tokio::test]
+async fn lifecycle_certification() {
     let Some(_) = endpoint() else { return };
-    let s = store();
     // Unique root per run to avoid cross-run interference.
     let root = format!("cq-{}", std::process::id());
 
     let q = Queue::init(
-        Box::new(store()),
+        Box::new(store().await),
         &root,
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
 
     let mut b = OpBudget::new(256);
@@ -185,13 +205,14 @@ fn lifecycle_certification() {
             },
             &mut b,
         )
+        .await
         .unwrap();
     let EnqueueOutcome::Committed { job_id } = out else {
         panic!()
     };
 
     // Claim across the shard space.
-    let floor = q.establish_floor(&mut OpBudget::new(16)).unwrap();
+    let floor = q.establish_floor(&mut OpBudget::new(16)).await.unwrap();
     let mut claimed = None;
     for shard in 0..4 {
         let opts = ClaimOptions {
@@ -199,32 +220,33 @@ fn lifecycle_certification() {
             floor_ns: floor,
             lease_duration_ns: 60_000_000_000,
         };
-        if let ClaimOutcome::Claimed(c) = q.claim(&opts, &mut OpBudget::new(512)).unwrap() {
+        if let ClaimOutcome::Claimed(c) = q.claim(&opts, &mut OpBudget::new(512)).await.unwrap() {
             claimed = Some(c);
             break;
         }
     }
     let claim = claimed.expect("job claimable");
     assert_eq!(claim.job_id, job_id);
-    assert_eq!(&claim.payload(q.store()).unwrap()[..], b"conformance");
+    assert_eq!(&claim.payload(q.store()).await.unwrap()[..], b"conformance");
 
-    let ack = q.ack(&claim, &mut b).unwrap();
+    let ack = q.ack(&claim, &mut b).await.unwrap();
     assert_eq!(ack, AckOutcome::Acked);
-    let reack = q.ack(&claim, &mut b).unwrap();
+    let reack = q.ack(&claim, &mut b).await.unwrap();
     assert_eq!(reack, AckOutcome::AlreadyAcked);
 }
 
 /// Idempotent enqueue and takeover-after-expiry over the endpoint.
-#[test]
-fn idempotence_and_takeover_certification() {
+#[tokio::test]
+async fn idempotence_and_takeover_certification() {
     let Some(_) = endpoint() else { return };
     let root = format!("cq-idem-{}", std::process::id());
     let q = Queue::init(
-        Box::new(store()),
+        Box::new(store().await),
         &root,
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
 
     let mut b = OpBudget::new(256);
@@ -241,13 +263,14 @@ fn idempotence_and_takeover_certification() {
                 },
                 &mut b,
             )
+            .await
             .unwrap();
         assert!(matches!(out, EnqueueOutcome::Committed { .. }));
     }
 
     // Claim with a lease within the second-quantized store clock, then
     // take over after expiry.
-    let floor = q.establish_floor(&mut OpBudget::new(16)).unwrap();
+    let floor = q.establish_floor(&mut OpBudget::new(16)).await.unwrap();
     let mut claimed = None;
     for shard in 0..4 {
         let opts = ClaimOptions {
@@ -255,7 +278,7 @@ fn idempotence_and_takeover_certification() {
             floor_ns: floor,
             lease_duration_ns: 1_000_000_000,
         };
-        if let ClaimOutcome::Claimed(c) = q.claim(&opts, &mut OpBudget::new(512)).unwrap() {
+        if let ClaimOutcome::Claimed(c) = q.claim(&opts, &mut OpBudget::new(512)).await.unwrap() {
             claimed = Some(c);
             break;
         }
@@ -267,13 +290,14 @@ fn idempotence_and_takeover_certification() {
     drop(q);
     std::thread::sleep(std::time::Duration::from_secs(2));
     let q = Queue::init(
-        Box::new(store()),
+        Box::new(store().await),
         &root,
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
-    let later = q.establish_floor(&mut OpBudget::new(16)).unwrap();
+    let later = q.establish_floor(&mut OpBudget::new(16)).await.unwrap();
     let mut takeover = None;
     for shard in 0..4 {
         let opts = ClaimOptions {
@@ -281,7 +305,7 @@ fn idempotence_and_takeover_certification() {
             floor_ns: later,
             lease_duration_ns: 60_000_000_000,
         };
-        if let ClaimOutcome::Claimed(c) = q.claim(&opts, &mut OpBudget::new(512)).unwrap() {
+        if let ClaimOutcome::Claimed(c) = q.claim(&opts, &mut OpBudget::new(512)).await.unwrap() {
             takeover = Some(c);
             break;
         }
@@ -296,8 +320,8 @@ fn idempotence_and_takeover_certification() {
 /// skew guard, and inline-vs-detached enqueue+deliver cost to pick the
 /// inline threshold. Print-only (the CI lane runs --nocapture, so the
 /// log is the record); assertions are sanity bounds only.
-#[test]
-fn calibration_measurements() {
+#[tokio::test]
+async fn calibration_measurements() {
     let Some(_) = endpoint() else { return };
     use std::time::Instant;
 
@@ -306,22 +330,25 @@ fn calibration_measurements() {
     // between successive beacon writes — the quantity the guard
     // absorbs; a single sequential client still probes whatever
     // frontends the load balancer selects).
-    let s = store();
+    let s = store().await;
     let run = run_id();
     let empty: [u8; 32] = Sha256::digest([]).into();
     let mut max_divergence_ns: u64 = 0;
     let mut times: Vec<u64> = Vec::with_capacity(16);
     for i in 0..16 {
         let k = Key::new(format!("conformance/cal/{run}/beacon-{i}"));
-        let PutOutcome::Committed { .. } =
-            s.put_if_absent(&k, Bytes::from_static(b""), empty).unwrap()
+        let PutOutcome::Committed { .. } = s
+            .put_if_absent(&k, Bytes::from_static(b""), empty)
+            .await
+            .unwrap()
         else {
             panic!("beacon {i}")
         };
-        let head = s.head(&k).unwrap();
+        let head = s.head(&k).await.unwrap();
         times.push(head.store_time_ns);
         let list_page = s
             .list(&format!("conformance/cal/{run}/"), None, 64)
+            .await
             .unwrap();
         let listed = list_page
             .items
@@ -404,11 +431,12 @@ fn calibration_measurements() {
             let mut opts = OpenOptions::new([1; 16]);
             opts.max_inline_payload = inline_limit;
             let q = Queue::init(
-                Box::new(store()),
+                Box::new(store().await),
                 &format!("{root}-{idx}-{arm}"),
                 &opts,
                 &cal_format,
             )
+            .await
             .unwrap();
             let mut b = OpBudget::new(256);
             let start = Instant::now();
@@ -423,11 +451,12 @@ fn calibration_measurements() {
                     },
                     &mut b,
                 )
+                .await
                 .unwrap()
             else {
                 panic!()
             };
-            let floor = q.establish_floor(&mut OpBudget::new(16)).unwrap();
+            let floor = q.establish_floor(&mut OpBudget::new(16)).await.unwrap();
             let ClaimOutcome::Claimed(claim) = q
                 .claim(
                     &ClaimOptions {
@@ -437,11 +466,12 @@ fn calibration_measurements() {
                     },
                     &mut OpBudget::new(512),
                 )
+                .await
                 .unwrap()
             else {
                 panic!("claim {idx}/{inline_limit}")
             };
-            let got = claim.payload(q.store()).unwrap();
+            let got = claim.payload(q.store()).await.unwrap();
             assert_eq!(got.len(), payload.len());
             assert_eq!(claim.job_id, job_id);
             let ns = start.elapsed().as_nanos() as u64;
@@ -469,8 +499,8 @@ fn calibration_measurements() {
 
 /// v1.1 quarantine round-trip: the repair scan writes durable,
 /// deterministic findings on a live endpoint, and they decode.
-#[test]
-fn quarantine_certification() {
+#[tokio::test]
+async fn quarantine_certification() {
     let Some(_) = endpoint() else { return };
     let root = format!("cq-v11-{}", std::process::id());
     let f = FormatRecord {
@@ -478,12 +508,21 @@ fn quarantine_certification() {
         required_feature_bits: 1,
         ..format()
     };
-    let q = Queue::init(Box::new(store()), &root, &OpenOptions::new([1; 16]), &f).unwrap();
+    let q = Queue::init(
+        Box::new(store().await),
+        &root,
+        &OpenOptions::new([1; 16]),
+        &f,
+    )
+    .await
+    .unwrap();
 
     // A detached job whose payload is deleted: the 0x0014 finding.
     let mut opts = OpenOptions::new([1; 16]);
     opts.max_inline_payload = 4;
-    let q_det = Queue::init(Box::new(store()), &format!("{root}-det"), &opts, &f).unwrap();
+    let q_det = Queue::init(Box::new(store().await), &format!("{root}-det"), &opts, &f)
+        .await
+        .unwrap();
     let mut b = OpBudget::new(256);
     let EnqueueOutcome::Committed { job_id } = q_det
         .enqueue(
@@ -496,21 +535,26 @@ fn quarantine_certification() {
             },
             &mut b,
         )
+        .await
         .unwrap()
     else {
         panic!()
     };
     let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
     // Find and delete the payload object directly.
-    let s = store();
+    let s = store().await;
     let page = s
         .list(&format!("{root}-det/payloads/{jhex}/"), None, 10)
+        .await
         .unwrap();
     assert_eq!(page.items.len(), 1);
     let payload_key = page.items[0].key.clone();
-    s.delete(&payload_key).unwrap();
+    s.delete(&payload_key).await.unwrap();
 
-    let (report, resume) = q_det.repair_scan(0, &mut OpBudget::new(4096)).unwrap();
+    let (report, resume) = q_det
+        .repair_scan(0, &mut OpBudget::new(4096))
+        .await
+        .unwrap();
     assert!(resume.is_none());
     assert!(
         report.findings.iter().any(|f| f.reason == 0x0014),
@@ -520,6 +564,7 @@ fn quarantine_certification() {
     // The durable entry exists on the live store and decodes.
     let qpage = s
         .list(&format!("{root}-det/quarantine/"), None, 10)
+        .await
         .unwrap();
     assert_eq!(qpage.items.len(), 1, "one durable finding");
     let rel: stowq_keys::Key = qpage.items[0]
@@ -529,7 +574,7 @@ fn quarantine_certification() {
         .parse()
         .unwrap();
     let tag = stowq_keys::key_tag(&[1; 16], &rel.to_string());
-    let obj = s.get(&qpage.items[0].key.clone(), None).unwrap();
+    let obj = s.get(&qpage.items[0].key.clone(), None).await.unwrap();
     match stowq_format::decode(&obj.body, &[1; 16], &tag).unwrap() {
         stowq_format::Record::Quarantine(r) => {
             assert_eq!(r.reason, 0x0014);
@@ -543,9 +588,13 @@ fn quarantine_certification() {
         other => panic!("expected quarantine, got {other:?}"),
     }
     // Rescan converges: nothing new written.
-    let (report2, _) = q_det.repair_scan(0, &mut OpBudget::new(4096)).unwrap();
+    let _ = q_det
+        .repair_scan(0, &mut OpBudget::new(4096))
+        .await
+        .unwrap();
     let qpage2 = s
         .list(&format!("{root}-det/quarantine/"), None, 10)
+        .await
         .unwrap();
     assert_eq!(qpage2.items.len(), 1, "rescan writes nothing new");
     let _ = q;

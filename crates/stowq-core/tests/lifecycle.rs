@@ -16,17 +16,18 @@ fn format() -> FormatRecord {
     }
 }
 
-fn make_queue() -> Queue {
+async fn make_queue() -> Queue {
     Queue::init(
         Box::new(MemoryStore::new()),
         "q",
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap()
 }
 
-fn make_shared() -> (Queue, MemoryStore) {
+async fn make_shared() -> (Queue, MemoryStore) {
     let store = MemoryStore::new();
     let q = Queue::init(
         Box::new(store.clone()),
@@ -34,6 +35,7 @@ fn make_shared() -> (Queue, MemoryStore) {
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
     (q, store)
 }
@@ -46,9 +48,9 @@ fn claim_opts(floor_ns: u64, lease_ns: u64) -> ClaimOptions {
     }
 }
 
-#[test]
-fn init_idempotent_then_rejects_conflicting_format() {
-    let (q, store) = make_shared();
+#[tokio::test]
+async fn init_idempotent_then_rejects_conflicting_format() {
+    let (q, store) = make_shared().await;
     // Identical format over the same prefix: accepted.
     Queue::init(
         Box::new(store.clone()),
@@ -56,6 +58,7 @@ fn init_idempotent_then_rejects_conflicting_format() {
         &OpenOptions::new([1; 16]),
         &format(),
     )
+    .await
     .unwrap();
     // Conflicting format: rejected.
     let different = FormatRecord {
@@ -67,7 +70,8 @@ fn init_idempotent_then_rejects_conflicting_format() {
         "q",
         &OpenOptions::new([1; 16]),
         &different,
-    );
+    )
+    .await;
     match result {
         Err(stowq_core::Error::QueueIdMismatch) => {}
         _ => panic!("expected QueueIdMismatch"),
@@ -75,9 +79,9 @@ fn init_idempotent_then_rejects_conflicting_format() {
     drop(q);
 }
 
-#[test]
-fn enqueue_claim_ack_lifecycle() {
-    let q = make_queue();
+#[tokio::test]
+async fn enqueue_claim_ack_lifecycle() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(64);
     let out = q
         .enqueue(
@@ -90,6 +94,7 @@ fn enqueue_claim_ack_lifecycle() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
     let EnqueueOutcome::Committed { job_id } = out else {
         panic!("commit")
@@ -97,6 +102,7 @@ fn enqueue_claim_ack_lifecycle() {
 
     let claimed = q
         .claim(&claim_opts(0, 60_000_000_000), &mut budget)
+        .await
         .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) = claimed else {
         panic!("claim")
@@ -104,34 +110,38 @@ fn enqueue_claim_ack_lifecycle() {
     assert_eq!(claim.job_id, job_id);
     assert_eq!(claim.generation, 1);
     assert_eq!(claim.attempt, 1);
-    let payload = claim.payload(q.store()).unwrap();
+    let payload = claim.payload(q.store()).await.unwrap();
     assert_eq!(&payload[..], b"hello");
 
     // Lease held: a second claim at the same floor finds nothing.
     let again = q
         .claim(&claim_opts(0, 60_000_000_000), &mut budget)
+        .await
         .unwrap();
     assert!(matches!(again, stowq_core::ClaimOutcome::Empty));
 
-    let ack = q.ack(&claim, &mut budget).unwrap();
+    let ack = q.ack(&claim, &mut budget).await.unwrap();
     assert_eq!(ack, stowq_core::AckOutcome::Acked);
 
     // Idempotent re-ack verifies existing evidence.
-    let reack = q.ack(&claim, &mut budget).unwrap();
+    let reack = q.ack(&claim, &mut budget).await.unwrap();
     assert_eq!(reack, stowq_core::AckOutcome::AlreadyAcked);
 
     // Terminal: no further claims.
     let post = q
         .claim(&claim_opts(u64::MAX / 4, 60_000_000_000), &mut budget)
+        .await
         .unwrap();
     assert!(matches!(post, stowq_core::ClaimOutcome::Empty));
 }
 
-#[test]
-fn detached_payload_round_trips() {
+#[tokio::test]
+async fn detached_payload_round_trips() {
     let mut opts = OpenOptions::new([1; 16]);
     opts.max_inline_payload = 4;
-    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format()).unwrap();
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format())
+        .await
+        .unwrap();
     let mut budget = OpBudget::new(64);
     let big = vec![7u8; 100];
     q.enqueue(
@@ -144,19 +154,21 @@ fn detached_payload_round_trips() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) = q
         .claim(&claim_opts(0, 60_000_000_000), &mut budget)
+        .await
         .unwrap()
     else {
         panic!("claim")
     };
-    assert_eq!(&claim.payload(q.store()).unwrap()[..], &big[..]);
+    assert_eq!(&claim.payload(q.store()).await.unwrap()[..], &big[..]);
 }
 
-#[test]
-fn idempotent_enqueue_and_id_taken() {
-    let q = make_queue();
+#[tokio::test]
+async fn idempotent_enqueue_and_id_taken() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(64);
     let jid = [9; 16];
     let out = q
@@ -170,6 +182,7 @@ fn idempotent_enqueue_and_id_taken() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
     assert!(matches!(out, EnqueueOutcome::Committed { .. }));
     // Identical retry: committed (our own record already present).
@@ -184,6 +197,7 @@ fn idempotent_enqueue_and_id_taken() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
     assert!(matches!(out2, EnqueueOutcome::Committed { .. }));
     // Different payload under the same id: taken.
@@ -198,13 +212,14 @@ fn idempotent_enqueue_and_id_taken() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
     assert!(matches!(out3, EnqueueOutcome::IdTaken { .. }));
 }
 
-#[test]
-fn takeover_after_expiry_increments_generation_and_attempt() {
-    let q = make_queue();
+#[tokio::test]
+async fn takeover_after_expiry_increments_generation_and_attempt() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(128);
     q.enqueue(
         EnqueueInput {
@@ -216,9 +231,10 @@ fn takeover_after_expiry_increments_generation_and_attempt() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(first) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("first claim")
     };
@@ -226,11 +242,14 @@ fn takeover_after_expiry_increments_generation_and_attempt() {
     let expiry = first.claim_store_time_ns + 1_000;
     let held = q
         .claim(&claim_opts(expiry - 1, 1_000), &mut budget)
+        .await
         .unwrap();
     assert!(matches!(held, stowq_core::ClaimOutcome::Empty));
     // At and past expiry: takeover (floor >= expiry is expired).
-    let stowq_core::ClaimOutcome::Claimed(second) =
-        q.claim(&claim_opts(expiry, 1_000), &mut budget).unwrap()
+    let stowq_core::ClaimOutcome::Claimed(second) = q
+        .claim(&claim_opts(expiry, 1_000), &mut budget)
+        .await
+        .unwrap()
     else {
         panic!("takeover")
     };
@@ -239,9 +258,9 @@ fn takeover_after_expiry_increments_generation_and_attempt() {
     assert_ne!(second.worker_token, first.worker_token);
 }
 
-#[test]
-fn renew_extends_and_loses_to_takeover() {
-    let q = make_queue();
+#[tokio::test]
+async fn renew_extends_and_loses_to_takeover() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(128);
     q.enqueue(
         EnqueueInput {
@@ -253,13 +272,15 @@ fn renew_extends_and_loses_to_takeover() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
-    let stowq_core::RenewOutcome::Renewed(renewed) = q.renew(&claim, &mut budget).unwrap() else {
+    let stowq_core::RenewOutcome::Renewed(renewed) = q.renew(&claim, &mut budget).await.unwrap()
+    else {
         panic!("renew")
     };
     assert_eq!(renewed.generation, 2);
@@ -269,16 +290,17 @@ fn renew_extends_and_loses_to_takeover() {
     let old_expiry = claim.claim_store_time_ns + 1_000;
     let held = q
         .claim(&claim_opts(old_expiry, 1_000), &mut budget)
+        .await
         .unwrap();
     assert!(matches!(held, stowq_core::ClaimOutcome::Empty));
     // Renewal of the stale claim loses to generation 2 existing.
-    let lost = q.renew(&claim, &mut budget).unwrap();
+    let lost = q.renew(&claim, &mut budget).await.unwrap();
     assert!(matches!(lost, stowq_core::RenewOutcome::LeaseLost));
 }
 
-#[test]
-fn nack_gates_claim_until_backoff_elapses() {
-    let q = make_queue();
+#[tokio::test]
+async fn nack_gates_claim_until_backoff_elapses() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -290,18 +312,23 @@ fn nack_gates_claim_until_backoff_elapses() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
-    q.nack(&claim, 0x0001, 0, &mut budget).unwrap();
+    q.nack(&claim, 0x0001, 0, &mut budget).await.unwrap();
     // Backoff delay at attempt 1 with default policy: 50-100ms.
-    let early = q.claim(&claim_opts(1_000_000, 1_000), &mut budget).unwrap();
+    let early = q
+        .claim(&claim_opts(1_000_000, 1_000), &mut budget)
+        .await
+        .unwrap();
     assert!(matches!(early, stowq_core::ClaimOutcome::Empty));
     let late = q
         .claim(&claim_opts(200_000_000, 1_000), &mut budget)
+        .await
         .unwrap();
     let stowq_core::ClaimOutcome::Claimed(takeover) = late else {
         panic!("takeover")
@@ -310,9 +337,9 @@ fn nack_gates_claim_until_backoff_elapses() {
     assert_eq!(takeover.attempt, 2);
 }
 
-#[test]
-fn attempts_exhausted_writes_dead() {
-    let q = make_queue();
+#[tokio::test]
+async fn attempts_exhausted_writes_dead() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     let out = q
         .enqueue(
@@ -325,18 +352,22 @@ fn attempts_exhausted_writes_dead() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
     let EnqueueOutcome::Committed { job_id } = out else {
         panic!()
     };
     let stowq_core::ClaimOutcome::Claimed(claim) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
     // Expire; the next claim attempt must write dead, not claim.
     let floor = claim.claim_store_time_ns + 2_000;
-    let out2 = q.claim(&claim_opts(floor, 1_000), &mut budget).unwrap();
+    let out2 = q
+        .claim(&claim_opts(floor, 1_000), &mut budget)
+        .await
+        .unwrap();
     assert!(matches!(out2, stowq_core::ClaimOutcome::Empty));
     let dead_key = Key::new(format!(
         "q/dead/0000/{}",
@@ -345,18 +376,19 @@ fn attempts_exhausted_writes_dead() {
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     ));
-    let meta = q.store().head(&dead_key).unwrap();
+    let meta = q.store().head(&dead_key).await.unwrap();
     assert!(meta.size > 0);
     // And the job is terminal thereafter.
     let out3 = q
         .claim(&claim_opts(u64::MAX / 4, 1_000), &mut budget)
+        .await
         .unwrap();
     assert!(matches!(out3, stowq_core::ClaimOutcome::Empty));
 }
 
-#[test]
-fn bury_makes_job_unclaimable() {
-    let q = make_queue();
+#[tokio::test]
+async fn bury_makes_job_unclaimable() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(64);
     q.enqueue(
         EnqueueInput {
@@ -368,23 +400,26 @@ fn bury_makes_job_unclaimable() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) = q
         .claim(&claim_opts(0, 60_000_000_000), &mut budget)
+        .await
         .unwrap()
     else {
         panic!("claim")
     };
-    q.bury(&claim, 0x0003, &mut budget).unwrap();
+    q.bury(&claim, 0x0003, &mut budget).await.unwrap();
     let post = q
         .claim(&claim_opts(u64::MAX / 4, 60_000_000_000), &mut budget)
+        .await
         .unwrap();
     assert!(matches!(post, stowq_core::ClaimOutcome::Empty));
 }
 
-#[test]
-fn delayed_job_not_claimable_before_floor() {
-    let q = make_queue();
+#[tokio::test]
+async fn delayed_job_not_claimable_before_floor() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(64);
     q.enqueue(
         EnqueueInput {
@@ -396,22 +431,27 @@ fn delayed_job_not_claimable_before_floor() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let early = q
         .claim(&claim_opts(9_999_999_999, 1_000), &mut budget)
+        .await
         .unwrap();
     assert!(matches!(early, stowq_core::ClaimOutcome::Empty));
     let late = q
         .claim(&claim_opts(10_000_000_000, 1_000), &mut budget)
+        .await
         .unwrap();
     assert!(matches!(late, stowq_core::ClaimOutcome::Claimed(_)));
 }
 
-#[test]
-fn tiny_budget_exhausts() {
+#[tokio::test]
+async fn tiny_budget_exhausts() {
     let mut opts = OpenOptions::new([1; 16]);
     opts.max_inline_payload = 4;
-    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format()).unwrap();
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format())
+        .await
+        .unwrap();
     // Budget 1: the detached payload write spends it before the record.
     let mut budget = OpBudget::new(1);
     let err = q
@@ -425,13 +465,14 @@ fn tiny_budget_exhausts() {
             },
             &mut budget,
         )
+        .await
         .unwrap_err();
     assert!(matches!(err, Error::BudgetExhausted));
 }
 
-#[test]
-fn open_rejects_missing_format() {
-    let result = Queue::open(Box::new(MemoryStore::new()), "q", OpenOptions::new([1; 16]));
+#[tokio::test]
+async fn open_rejects_missing_format() {
+    let result = Queue::open(Box::new(MemoryStore::new()), "q", OpenOptions::new([1; 16])).await;
     match result {
         Err(Error::Store(StoreError::NotFound)) => {}
         Err(other) => panic!("expected NotFound, got {other:?}"),
@@ -439,9 +480,9 @@ fn open_rejects_missing_format() {
     }
 }
 
-#[test]
-fn renew_and_ack_refuse_after_exhaustion_dead() {
-    let q = make_queue();
+#[tokio::test]
+async fn renew_and_ack_refuse_after_exhaustion_dead() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -453,62 +494,69 @@ fn renew_and_ack_refuse_after_exhaustion_dead() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
     // Expire; another claimant writes dead at exhaustion.
     let floor = claim.claim_store_time_ns + 2_000;
-    let out = q.claim(&claim_opts(floor, 1_000), &mut budget).unwrap();
+    let out = q
+        .claim(&claim_opts(floor, 1_000), &mut budget)
+        .await
+        .unwrap();
     assert!(matches!(out, stowq_core::ClaimOutcome::Empty));
     // The zombie holder cannot extend custody or ack over the dead job.
-    let renewed = q.renew(&claim, &mut budget).unwrap();
+    let renewed = q.renew(&claim, &mut budget).await.unwrap();
     assert!(matches!(renewed, stowq_core::RenewOutcome::LeaseLost));
-    let acked = q.ack(&claim, &mut budget).unwrap();
+    let acked = q.ack(&claim, &mut budget).await.unwrap();
     assert_eq!(acked, stowq_core::AckOutcome::SupersededByDead);
     // And no receipt exists.
     let jhex: String = [6u8; 16].iter().map(|b| format!("{b:02x}")).collect();
-    let receipt = q.store().head(&Key::new(format!("q/receipts/0000/{jhex}")));
+    let receipt = q
+        .store()
+        .head(&Key::new(format!("q/receipts/0000/{jhex}")))
+        .await;
     assert!(receipt.is_err());
 }
 
-#[test]
-fn floor_and_watermark_lifecycle() {
-    let q = make_queue();
+#[tokio::test]
+async fn floor_and_watermark_lifecycle() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(64);
     // Floor: beacon write + read-back, monotone across refreshes.
-    let f1 = q.establish_floor(&mut budget).unwrap();
+    let f1 = q.establish_floor(&mut budget).await.unwrap();
     assert!(f1 > 0);
-    let f2 = q.establish_floor(&mut budget).unwrap();
+    let f2 = q.establish_floor(&mut budget).await.unwrap();
     assert_eq!(f1, f2, "cached floor is reused until stale");
     // Watermark: absent -> create; advance; lower bucket is a no-op.
-    assert!(q.watermark(&mut budget).unwrap().is_none());
+    assert!(q.watermark(&mut budget).await.unwrap().is_none());
     // The method bucketizes with the delayed width (1000 ns here).
-    q.advance_watermark(10_000, &mut budget).unwrap();
-    let w = q.watermark(&mut budget).unwrap().unwrap();
+    q.advance_watermark(10_000, &mut budget).await.unwrap();
+    let w = q.watermark(&mut budget).await.unwrap().unwrap();
     assert_eq!(w.highest_observed_wall_bucket, 10);
     assert_eq!(w.sequence, 0);
-    q.advance_watermark(12_000, &mut budget).unwrap();
-    let w = q.watermark(&mut budget).unwrap().unwrap();
+    q.advance_watermark(12_000, &mut budget).await.unwrap();
+    let w = q.watermark(&mut budget).await.unwrap().unwrap();
     assert_eq!(w.highest_observed_wall_bucket, 12);
     assert_eq!(w.sequence, 1);
     // Same bucket is a no-op.
-    q.advance_watermark(12_500, &mut budget).unwrap();
-    let w = q.watermark(&mut budget).unwrap().unwrap();
+    q.advance_watermark(12_500, &mut budget).await.unwrap();
+    let w = q.watermark(&mut budget).await.unwrap().unwrap();
     assert_eq!(w.sequence, 1);
     // A lower bucket than stored is a lost race or a stale floor: the
     // watermark already covers it; proceed as a no-op.
-    q.advance_watermark(5_000, &mut budget).unwrap();
-    let w = q.watermark(&mut budget).unwrap().unwrap();
+    q.advance_watermark(5_000, &mut budget).await.unwrap();
+    let w = q.watermark(&mut budget).await.unwrap().unwrap();
     assert_eq!(w.highest_observed_wall_bucket, 12);
     assert_eq!(w.sequence, 1);
 }
 
-#[test]
-fn sweeps_evaluate_and_prune_index_entries() {
-    let q = make_queue();
+#[tokio::test]
+async fn sweeps_evaluate_and_prune_index_entries() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -520,24 +568,26 @@ fn sweeps_evaluate_and_prune_index_entries() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
     // The lease index entry exists (written at claim).
-    let leases = list_all(&q, "q/leases/");
+    let leases = list_all(&q, "q/leases/").await;
     assert_eq!(leases.len(), 1, "claim writes its lease index entry");
 
     // Before expiry: the entry's expiry bucket is ahead of the floor
     // bucket, so the sweep skips it entirely.
     let report = q
         .sweep_expired_leases(claim.claim_store_time_ns, &mut budget)
+        .await
         .unwrap();
     assert_eq!(report.entries, 0);
     assert_eq!(
-        list_all(&q, "q/leases/").len(),
+        list_all(&q, "q/leases/").await.len(),
         1,
         "not-yet-due entries are left in place"
     );
@@ -545,15 +595,19 @@ fn sweeps_evaluate_and_prune_index_entries() {
     // After expiry: the entry is due, the tail is genuinely expired, and
     // the consumed entry is deleted.
     let after_expiry = claim.claim_store_time_ns + 1_000;
-    let report = q.sweep_expired_leases(after_expiry, &mut budget).unwrap();
+    let report = q
+        .sweep_expired_leases(after_expiry, &mut budget)
+        .await
+        .unwrap();
     assert_eq!(report.entries, 1);
     assert_eq!(report.reclaimed, 1);
     assert!(
-        list_all(&q, "q/leases/").is_empty(),
+        list_all(&q, "q/leases/").await.is_empty(),
         "sweep deletes consumed entries"
     );
     let retake = q
         .claim(&claim_opts(after_expiry, 1_000), &mut budget)
+        .await
         .unwrap();
     let stowq_core::ClaimOutcome::Claimed(second) = retake else {
         panic!("takeover after sweep")
@@ -561,9 +615,9 @@ fn sweeps_evaluate_and_prune_index_entries() {
     assert_eq!(second.generation, 2);
 }
 
-#[test]
-fn delayed_sweep_promotes_due_jobs() {
-    let q = make_queue();
+#[tokio::test]
+async fn delayed_sweep_promotes_due_jobs() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -575,22 +629,26 @@ fn delayed_sweep_promotes_due_jobs() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
-    assert_eq!(list_all(&q, "q/delayed/").len(), 1);
+    assert_eq!(list_all(&q, "q/delayed/").await.len(), 1);
     // Before due: entry examined, not promoted, deleted.
-    let report = q.sweep_delayed(4_000_000, &mut budget).unwrap();
+    let report = q.sweep_delayed(4_000_000, &mut budget).await.unwrap();
     assert_eq!(report.entries, 0, "future bucket entries are skipped");
     // Due: promoted (the job's not_before has passed).
-    let report = q.sweep_delayed(5_000_000, &mut budget).unwrap();
+    let report = q.sweep_delayed(5_000_000, &mut budget).await.unwrap();
     assert!(report.promoted >= 1);
     // The job is claimable at the due floor.
-    let claimed = q.claim(&claim_opts(5_000_000, 1_000), &mut budget).unwrap();
+    let claimed = q
+        .claim(&claim_opts(5_000_000, 1_000), &mut budget)
+        .await
+        .unwrap();
     assert!(matches!(claimed, stowq_core::ClaimOutcome::Claimed(_)));
 }
 
-#[test]
-fn gc_deletes_terminal_graphs_and_honors_retention() {
-    let q = make_queue();
+#[tokio::test]
+async fn gc_deletes_terminal_graphs_and_honors_retention() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(1_024);
     q.enqueue(
         EnqueueInput {
@@ -602,13 +660,14 @@ fn gc_deletes_terminal_graphs_and_honors_retention() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
-    q.ack(&claim, &mut budget).unwrap();
+    q.ack(&claim, &mut budget).await.unwrap();
 
     // Within retention: nothing deleted.
     let report = q
@@ -618,35 +677,39 @@ fn gc_deletes_terminal_graphs_and_honors_retention() {
             60_000_000_000,
             &mut budget,
         )
+        .await
         .unwrap();
     assert_eq!(report.jobs_deleted, 0);
     let jhex: String = claim.job_id.iter().map(|b| format!("{b:02x}")).collect();
     assert!(q
         .store()
         .head(&Key::new(format!("q/receipts/0000/{jhex}")))
+        .await
         .is_ok());
 
     // Past retention: the whole graph goes, terminal last.
-    let report = q.gc(u64::MAX / 4, 1_000, 1_000, &mut budget).unwrap();
+    let report = q.gc(u64::MAX / 4, 1_000, 1_000, &mut budget).await.unwrap();
     assert_eq!(report.jobs_deleted, 1);
     assert!(q
         .store()
         .head(&Key::new(format!("q/receipts/0000/{jhex}")))
+        .await
         .is_err());
     assert!(q
         .store()
         .head(&Key::new(format!("q/jobs/0000/{jhex}")))
+        .await
         .is_err());
-    assert!(list_all(&q, "q/termidx/").is_empty());
-    assert!(list_all(&q, "q/claims/").is_empty());
-    assert!(list_all(&q, "q/fails/").is_empty());
+    assert!(list_all(&q, "q/termidx/").await.is_empty());
+    assert!(list_all(&q, "q/claims/").await.is_empty());
+    assert!(list_all(&q, "q/fails/").await.is_empty());
 }
 
-fn list_all(q: &Queue, prefix: &str) -> Vec<String> {
+async fn list_all(q: &Queue, prefix: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut after: Option<Key> = None;
     loop {
-        let page = q.store().list(prefix, after.as_ref(), 100).unwrap();
+        let page = q.store().list(prefix, after.as_ref(), 100).await.unwrap();
         if page.items.is_empty() {
             break;
         }
@@ -661,9 +724,9 @@ fn list_all(q: &Queue, prefix: &str) -> Vec<String> {
     out
 }
 
-#[test]
-fn fresh_floor_below_watermark_fails_closed() {
-    let q = make_queue();
+#[tokio::test]
+async fn fresh_floor_below_watermark_fails_closed() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(64);
     // A watermark record far in the future, written directly (as a
     // legitimate earlier participant would have advanced it).
@@ -680,10 +743,11 @@ fn fresh_floor_below_watermark_fails_closed() {
     };
     q.store()
         .put_if_absent(&Key::new(format!("q/{rel}")), body, digest)
+        .await
         .unwrap();
     // bucket * delayed_width = 1e9 * 1000 = 1e12 ns ahead of any store
     // time the fake can produce soon; a fresh floor must fail closed.
-    let result = q.establish_floor(&mut budget);
+    let result = q.establish_floor(&mut budget).await;
     match result {
         Err(Error::Store(stowq_store::StoreError::ProfileViolation(msg))) => {
             assert!(msg.contains("regression"), "unexpected violation: {msg}");
@@ -692,8 +756,8 @@ fn fresh_floor_below_watermark_fails_closed() {
     }
 }
 
-#[test]
-fn gc_interruption_leaves_terminal_record_last() {
+#[tokio::test]
+async fn gc_interruption_leaves_terminal_record_last() {
     // Starve the graph deletion mid-flight: each trial runs against a
     // FRESH fixture (partial deletions consume the termidx discovery
     // path, so cumulative trials strand the graph — recovery from that
@@ -704,7 +768,7 @@ fn gc_interruption_leaves_terminal_record_last() {
     let jhex: String = [9u8; 16].iter().map(|b| format!("{b:02x}")).collect();
     let mut completed = false;
     for trial in 1..=24 {
-        let q = make_queue();
+        let q = make_queue().await;
         let mut budget = OpBudget::new(1_024);
         q.enqueue(
             EnqueueInput {
@@ -716,23 +780,28 @@ fn gc_interruption_leaves_terminal_record_last() {
             },
             &mut budget,
         )
+        .await
         .unwrap();
         let stowq_core::ClaimOutcome::Claimed(claim) =
-            q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+            q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
         else {
             panic!("claim")
         };
-        q.ack(&claim, &mut budget).unwrap();
+        q.ack(&claim, &mut budget).await.unwrap();
 
         let mut small = OpBudget::new(trial);
-        let _ = q.gc(u64::MAX / 4, 1_000, 1_000, &mut small);
-        let receipt = q.store().head(&Key::new(format!("q/receipts/0000/{jhex}")));
+        let _ = q.gc(u64::MAX / 4, 1_000, 1_000, &mut small).await;
+        let receipt = q
+            .store()
+            .head(&Key::new(format!("q/receipts/0000/{jhex}")))
+            .await;
         if receipt.is_err() {
             // Deletion completed on this trial: the terminal record is
             // gone because it went LAST; the job must be gone too.
             assert!(
                 q.store()
                     .head(&Key::new(format!("q/jobs/0000/{jhex}")))
+                    .await
                     .is_err(),
                 "job record must not outlive the terminal record"
             );
@@ -742,6 +811,7 @@ fn gc_interruption_leaves_terminal_record_last() {
         // Still mid-deletion: terminal record present, job unclaimable.
         let claimed = q
             .claim(&claim_opts(u64::MAX / 4, 1_000), &mut OpBudget::new(64))
+            .await
             .unwrap();
         assert!(
             matches!(claimed, stowq_core::ClaimOutcome::Empty),
@@ -754,9 +824,9 @@ fn gc_interruption_leaves_terminal_record_last() {
     );
 }
 
-#[test]
-fn zombie_bury_after_ack_is_refused() {
-    let q = make_queue();
+#[tokio::test]
+async fn zombie_bury_after_ack_is_refused() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -768,31 +838,33 @@ fn zombie_bury_after_ack_is_refused() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
-    q.ack(&claim, &mut budget).unwrap();
+    q.ack(&claim, &mut budget).await.unwrap();
     // The zombie holder buries late: refused, no second terminal record.
-    let out = q.bury(&claim, 0x0003, &mut budget).unwrap();
+    let out = q.bury(&claim, 0x0003, &mut budget).await.unwrap();
     assert_eq!(out, stowq_core::BuryOutcome::SupersededByReceipt);
     let jhex: String = claim.job_id.iter().map(|b| format!("{b:02x}")).collect();
     assert!(
         q.store()
             .head(&Key::new(format!("q/dead/0000/{jhex}")))
+            .await
             .is_err(),
         "no dead record may coexist with a receipt"
     );
 }
 
-#[test]
-fn tail_holder_bury_after_exhaustion_dead_verifies() {
+#[tokio::test]
+async fn tail_holder_bury_after_exhaustion_dead_verifies() {
     // The exhaustion-dead try_claim writes carries the tail claim's
     // (generation, attempt): the tail holder's late bury must hit the
     // Lost branch and verify as Buried, not conflicting evidence.
-    let q = make_queue();
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -804,23 +876,27 @@ fn tail_holder_bury_after_exhaustion_dead_verifies() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
     let floor = claim.claim_store_time_ns + 2_000;
-    let out = q.claim(&claim_opts(floor, 1_000), &mut budget).unwrap();
+    let out = q
+        .claim(&claim_opts(floor, 1_000), &mut budget)
+        .await
+        .unwrap();
     assert!(matches!(out, stowq_core::ClaimOutcome::Empty));
     // The tail holder buries over the exhaustion-dead record: the
     // evidence (generation, attempt) matches, so success.
-    let bury = q.bury(&claim, 0x0003, &mut budget).unwrap();
+    let bury = q.bury(&claim, 0x0003, &mut budget).await.unwrap();
     assert_eq!(bury, stowq_core::BuryOutcome::Buried);
 }
 
-#[test]
-fn init_rejects_non_power_of_two_shard_count() {
+#[tokio::test]
+async fn init_rejects_non_power_of_two_shard_count() {
     let mut f = format();
     f.shard_count = 100;
     let result = Queue::init(
@@ -828,7 +904,8 @@ fn init_rejects_non_power_of_two_shard_count() {
         "q",
         &OpenOptions::new([1; 16]),
         &f,
-    );
+    )
+    .await;
     match result {
         Err(Error::Record(_)) => {}
         Err(other) => panic!("expected Record error, got {other:?}"),
@@ -842,11 +919,12 @@ fn init_rejects_non_power_of_two_shard_count() {
         &OpenOptions::new([1; 16]),
         &f,
     )
+    .await
     .unwrap();
 }
 
-#[test]
-fn open_rejects_format_with_unknown_required_features() {
+#[tokio::test]
+async fn open_rejects_format_with_unknown_required_features() {
     use sha2::{Digest as _, Sha256};
     use stowq_store::ObjectStore as _;
 
@@ -865,8 +943,9 @@ fn open_rejects_format_with_unknown_required_features() {
     let digest: [u8; 32] = Sha256::digest(&body).into();
     store
         .put_if_absent(&Key::new("q/meta/FORMAT"), body, digest)
+        .await
         .unwrap();
-    let result = Queue::open(Box::new(store), "q", OpenOptions::new([1; 16]));
+    let result = Queue::open(Box::new(store), "q", OpenOptions::new([1; 16])).await;
     match result {
         Err(Error::Record(_)) => {}
         Err(other) => panic!("expected Record error, got {other:?}"),
@@ -874,20 +953,22 @@ fn open_rejects_format_with_unknown_required_features() {
     }
 }
 
-#[test]
-fn enqueue_rejects_zero_maximum_attempts() {
-    let q = make_queue();
+#[tokio::test]
+async fn enqueue_rejects_zero_maximum_attempts() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(64);
-    let result = q.enqueue(
-        EnqueueInput {
-            job_id: None,
-            payload: b"x",
-            content_type: "text/plain".into(),
-            maximum_attempts: 0,
-            not_before_ns: None,
-        },
-        &mut budget,
-    );
+    let result = q
+        .enqueue(
+            EnqueueInput {
+                job_id: None,
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 0,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .await;
     match result {
         Err(Error::Record(_)) => {}
         Err(other) => panic!("expected Record error, got {other:?}"),
@@ -899,13 +980,13 @@ fn enqueue_rejects_zero_maximum_attempts() {
 
 use stowq_core::{FindingKind as RK, RepairReport};
 
-fn repair_all(q: &Queue) -> (RepairReport, Option<u16>) {
-    q.repair_scan(0, &mut OpBudget::new(4096)).unwrap()
+async fn repair_all(q: &Queue) -> (RepairReport, Option<u16>) {
+    q.repair_scan(0, &mut OpBudget::new(4096)).await.unwrap()
 }
 
-#[test]
-fn repair_regenerates_missing_delayed_index() {
-    let q = make_queue();
+#[tokio::test]
+async fn repair_regenerates_missing_delayed_index() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -917,25 +998,29 @@ fn repair_regenerates_missing_delayed_index() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
-    let delayed = list_all(&q, "q/delayed/");
+    let delayed = list_all(&q, "q/delayed/").await;
     assert_eq!(delayed.len(), 1);
-    q.store().delete(&Key::new(delayed[0].clone())).unwrap();
-    let (report, resume) = repair_all(&q);
+    q.store()
+        .delete(&Key::new(delayed[0].clone()))
+        .await
+        .unwrap();
+    let (report, resume) = repair_all(&q).await;
     assert!(resume.is_none());
     assert_eq!(report.indexes_regenerated, 1);
-    let regen = list_all(&q, "q/delayed/");
+    let regen = list_all(&q, "q/delayed/").await;
     assert_eq!(regen.len(), 1);
     assert_eq!(regen[0], delayed[0]);
     // Idempotent: a second run regenerates nothing.
-    let (report2, _) = repair_all(&q);
+    let (report2, _) = repair_all(&q).await;
     assert_eq!(report2.indexes_regenerated, 0);
     assert!(report2.findings.is_empty());
 }
 
-#[test]
-fn repair_regenerates_missing_lease_index() {
-    let q = make_queue();
+#[tokio::test]
+async fn repair_regenerates_missing_lease_index() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -947,24 +1032,29 @@ fn repair_regenerates_missing_lease_index() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
-    let stowq_core::ClaimOutcome::Claimed(_) = q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    let stowq_core::ClaimOutcome::Claimed(_) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
-    let leases = list_all(&q, "q/leases/");
+    let leases = list_all(&q, "q/leases/").await;
     assert_eq!(leases.len(), 1);
-    q.store().delete(&Key::new(leases[0].clone())).unwrap();
-    let (report, _) = repair_all(&q);
+    q.store()
+        .delete(&Key::new(leases[0].clone()))
+        .await
+        .unwrap();
+    let (report, _) = repair_all(&q).await;
     assert_eq!(report.indexes_regenerated, 1);
-    let regen = list_all(&q, "q/leases/");
+    let regen = list_all(&q, "q/leases/").await;
     assert_eq!(regen.len(), 1);
     assert_eq!(regen[0], leases[0]);
 }
 
-#[test]
-fn repair_regenerates_missing_termidx() {
-    let q = make_queue();
+#[tokio::test]
+async fn repair_regenerates_missing_termidx() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -976,26 +1066,30 @@ fn repair_regenerates_missing_termidx() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
-    q.ack(&claim, &mut budget).unwrap();
-    let termidx = list_all(&q, "q/termidx/");
+    q.ack(&claim, &mut budget).await.unwrap();
+    let termidx = list_all(&q, "q/termidx/").await;
     assert_eq!(termidx.len(), 1);
-    q.store().delete(&Key::new(termidx[0].clone())).unwrap();
-    let (report, _) = repair_all(&q);
+    q.store()
+        .delete(&Key::new(termidx[0].clone()))
+        .await
+        .unwrap();
+    let (report, _) = repair_all(&q).await;
     assert_eq!(report.indexes_regenerated, 1);
-    let regen = list_all(&q, "q/termidx/");
+    let regen = list_all(&q, "q/termidx/").await;
     assert_eq!(regen.len(), 1);
     assert_eq!(regen[0], termidx[0]);
 }
 
-#[test]
-fn repair_reports_grammar_violation_and_skips() {
-    let q = make_queue();
+#[tokio::test]
+async fn repair_reports_grammar_violation_and_skips() {
+    let q = make_queue().await;
     let garbage = Key::new("q/jobs/0000/not-hex-at-all");
     let digest: [u8; 32] = {
         use sha2::Digest as _;
@@ -1003,17 +1097,18 @@ fn repair_reports_grammar_violation_and_skips() {
     };
     q.store()
         .put_if_absent(&garbage, bytes::Bytes::from_static(b"junk"), digest)
+        .await
         .unwrap();
-    let (report, _) = repair_all(&q);
+    let (report, _) = repair_all(&q).await;
     assert!(report
         .findings
         .iter()
         .any(|f| f.kind == RK::KeyGrammar && f.reason == 0x0003));
 }
 
-#[test]
-fn repair_reports_claim_without_job() {
-    let q = make_queue();
+#[tokio::test]
+async fn repair_reports_claim_without_job() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -1025,9 +1120,10 @@ fn repair_reports_claim_without_job() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(claim) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
@@ -1042,17 +1138,18 @@ fn repair_reports_claim_without_job() {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         )))
+        .await
         .unwrap();
-    let (report, _) = repair_all(&q);
+    let (report, _) = repair_all(&q).await;
     assert!(report
         .findings
         .iter()
         .any(|f| f.kind == RK::ClaimWithoutJob && f.reason == 0x0005));
 }
 
-#[test]
-fn repair_reports_duplicate_terminal() {
-    let q = make_queue();
+#[tokio::test]
+async fn repair_reports_duplicate_terminal() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     let EnqueueOutcome::Committed { job_id } = q
         .enqueue(
@@ -1065,6 +1162,7 @@ fn repair_reports_duplicate_terminal() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!()
@@ -1101,18 +1199,19 @@ fn repair_reports_duplicate_terminal() {
         let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
         q.store()
             .put_if_absent(&Key::new(rel), body, digest)
+            .await
             .unwrap();
     }
-    let (report, _) = repair_all(&q);
+    let (report, _) = repair_all(&q).await;
     assert!(report
         .findings
         .iter()
         .any(|f| f.kind == RK::DuplicateTerminal && f.reason == 0x0007));
 }
 
-#[test]
-fn repair_reports_inadmissible_takeover_basis() {
-    let q = make_queue();
+#[tokio::test]
+async fn repair_reports_inadmissible_takeover_basis() {
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     let EnqueueOutcome::Committed { job_id } = q
         .enqueue(
@@ -1125,12 +1224,13 @@ fn repair_reports_inadmissible_takeover_basis() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!()
     };
     let stowq_core::ClaimOutcome::Claimed(first) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
@@ -1166,8 +1266,9 @@ fn repair_reports_inadmissible_takeover_basis() {
     let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
     q.store()
         .put_if_absent(&Key::new(rel), body, digest)
+        .await
         .unwrap();
-    let (report, _) = repair_all(&q);
+    let (report, _) = repair_all(&q).await;
     assert!(
         report
             .findings
@@ -1178,8 +1279,8 @@ fn repair_reports_inadmissible_takeover_basis() {
     );
 }
 
-#[test]
-fn repair_resumes_on_budget_boundary() {
+#[tokio::test]
+async fn repair_resumes_on_budget_boundary() {
     // A two-shard FORMAT with a budget that covers only the first
     // shard (an empty shard costs four list ops: jobs, claims,
     // receipts, dead): the scan returns a resume point, and continuing
@@ -1188,22 +1289,25 @@ fn repair_resumes_on_budget_boundary() {
     f.shard_count = 2;
     let (q, _store) = {
         let store = MemoryStore::new();
-        let q = Queue::init(Box::new(store.clone()), "q", &OpenOptions::new([1; 16]), &f).unwrap();
+        let q = Queue::init(Box::new(store.clone()), "q", &OpenOptions::new([1; 16]), &f)
+            .await
+            .unwrap();
         (q, store)
     };
     let mut budget = OpBudget::new(5);
-    let (report, resume) = q.repair_scan(0, &mut budget).unwrap();
+    let (report, resume) = q.repair_scan(0, &mut budget).await.unwrap();
     assert_eq!(report.shards_scanned, 1);
     assert_eq!(resume, Some(1));
     let (report2, resume2) = q
         .repair_scan(resume.unwrap(), &mut OpBudget::new(64))
+        .await
         .unwrap();
     assert_eq!(report2.shards_scanned, 1);
     assert!(resume2.is_none());
 }
 
-#[test]
-fn repair_terminates_across_the_full_shard_space() {
+#[tokio::test]
+async fn repair_terminates_across_the_full_shard_space() {
     // shard_count 65536 is the validated maximum: the scan must
     // complete the space and report no resume point. A u16 loop
     // counter overflows on the final increment (debug: panic;
@@ -1216,20 +1320,26 @@ fn repair_terminates_across_the_full_shard_space() {
         &OpenOptions::new([1; 16]),
         &f,
     )
+    .await
     .unwrap();
-    let (report, resume) = q.repair_scan(65_530, &mut OpBudget::new(512)).unwrap();
+    let (report, resume) = q
+        .repair_scan(65_530, &mut OpBudget::new(512))
+        .await
+        .unwrap();
     assert_eq!(report.shards_scanned, 6);
     assert!(resume.is_none());
 }
 
-#[test]
-fn gc_collects_orphan_payload_past_horizon() {
+#[tokio::test]
+async fn gc_collects_orphan_payload_past_horizon() {
     // The crash window between payload PUT and job-record PUT leaves a
     // payload with no referencing job record (job record deleted here
     // to simulate; the payload was written first by enqueue).
     let mut opts = OpenOptions::new([1; 16]);
     opts.max_inline_payload = 4;
-    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format()).unwrap();
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format())
+        .await
+        .unwrap();
     let mut budget = OpBudget::new(256);
     let EnqueueOutcome::Committed { job_id } = q
         .enqueue(
@@ -1242,6 +1352,7 @@ fn gc_collects_orphan_payload_past_horizon() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!()
@@ -1249,34 +1360,41 @@ fn gc_collects_orphan_payload_past_horizon() {
     let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
     q.store()
         .delete(&Key::new(format!("q/jobs/0000/{jhex}")))
+        .await
         .unwrap();
     // Before the horizon: kept (the enqueue may still be in flight).
     // now is the payload's own store time, so nothing is past a
     // 60-second horizon yet.
     let payload_time = {
-        let items = list_all(&q, &format!("q/payloads/{jhex}/"));
+        let items = list_all(&q, &format!("q/payloads/{jhex}/")).await;
         assert_eq!(items.len(), 1);
         q.store()
             .head(&Key::new(items[0].clone()))
+            .await
             .unwrap()
             .store_time_ns
     };
     let report = q
         .gc(payload_time + 1_000, 1_000, 60_000_000_000, &mut budget)
+        .await
         .unwrap();
     assert_eq!(report.orphans_deleted, 0);
-    assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).len(), 1);
+    assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).await.len(), 1);
     // Past the horizon (horizon 0): the orphan goes.
-    let report = q.gc(u64::MAX / 4, 1_000, 0, &mut budget).unwrap();
+    let report = q.gc(u64::MAX / 4, 1_000, 0, &mut budget).await.unwrap();
     assert_eq!(report.orphans_deleted, 1);
-    assert!(list_all(&q, &format!("q/payloads/{jhex}/")).is_empty());
+    assert!(list_all(&q, &format!("q/payloads/{jhex}/"))
+        .await
+        .is_empty());
 }
 
-#[test]
-fn gc_never_collects_referenced_payloads() {
+#[tokio::test]
+async fn gc_never_collects_referenced_payloads() {
     let mut opts = OpenOptions::new([1; 16]);
     opts.max_inline_payload = 4;
-    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format()).unwrap();
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format())
+        .await
+        .unwrap();
     let mut budget = OpBudget::new(256);
     let EnqueueOutcome::Committed { job_id } = q
         .enqueue(
@@ -1289,39 +1407,40 @@ fn gc_never_collects_referenced_payloads() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!()
     };
     let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
     // Horizon 0 with the job record present: the payload is referenced.
-    let report = q.gc(u64::MAX / 4, 1_000, 0, &mut budget).unwrap();
+    let report = q.gc(u64::MAX / 4, 1_000, 0, &mut budget).await.unwrap();
     assert_eq!(report.orphans_deleted, 0);
-    assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).len(), 1);
+    assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).await.len(), 1);
 }
 
-#[test]
-fn gc_skips_non_parseable_payload_keys_without_collecting() {
+#[tokio::test]
+async fn gc_skips_non_parseable_payload_keys_without_collecting() {
     // A stray object under payloads/ that does not parse is a repair
     // finding, not an orphan: the pass skips it (no delete) and spends
     // no HEAD on it, whatever its age.
-    let q = make_queue();
+    let q = make_queue().await;
     use sha2::Digest as _;
     let junk = Key::new("q/payloads/deadbeef/not-hex");
     let body = bytes::Bytes::from_static(b"junk");
     let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
-    q.store().put_if_absent(&junk, body, digest).unwrap();
+    q.store().put_if_absent(&junk, body, digest).await.unwrap();
     let mut budget = OpBudget::new(256);
-    let report = q.gc(u64::MAX / 4, 1_000, 0, &mut budget).unwrap();
+    let report = q.gc(u64::MAX / 4, 1_000, 0, &mut budget).await.unwrap();
     assert_eq!(report.orphans_deleted, 0);
     assert!(
-        q.store().head(&junk).is_ok(),
+        q.store().head(&junk).await.is_ok(),
         "non-parseable keys are left in place"
     );
 }
 
-#[test]
-fn gc_orphan_pass_propagates_head_errors() {
+#[tokio::test]
+async fn gc_orphan_pass_propagates_head_errors() {
     // The orphan HEAD failing with anything but NotFound aborts gc
     // loudly rather than treating the error as absence.
     use stowq_store::{Fault, FaultPlan, Injector, Op};
@@ -1332,7 +1451,9 @@ fn gc_orphan_pass_propagates_head_errors() {
     );
     let mut opts = OpenOptions::new([1; 16]);
     opts.max_inline_payload = 4;
-    let q = Queue::init(Box::new(injector), "q", &opts, &format()).unwrap();
+    let q = Queue::init(Box::new(injector), "q", &opts, &format())
+        .await
+        .unwrap();
     let mut budget = OpBudget::new(256);
     let EnqueueOutcome::Committed { job_id } = q
         .enqueue(
@@ -1345,6 +1466,7 @@ fn gc_orphan_pass_propagates_head_errors() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!()
@@ -1352,22 +1474,23 @@ fn gc_orphan_pass_propagates_head_errors() {
     let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
     q.store()
         .delete(&Key::new(format!("q/jobs/0000/{jhex}")))
+        .await
         .unwrap();
     // Now 0 with a zero horizon: the payload is due, the first orphan
     // HEAD is faulted post-transmit, and gc must surface the unknown
     // outcome instead of deleting anything.
-    let result = q.gc(u64::MAX / 4, 1_000, 0, &mut OpBudget::new(256));
+    let result = q.gc(u64::MAX / 4, 1_000, 0, &mut OpBudget::new(256)).await;
     match result {
         Err(stowq_core::Error::Store(stowq_store::StoreError::OutcomeUnknown(_))) => {}
         other => panic!("expected OutcomeUnknown, got {other:?}"),
     }
     // The payload is untouched: absence of the job record was never
     // proven with a clean read.
-    assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).len(), 1);
+    assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).await.len(), 1);
 }
 
-#[test]
-fn enqueue_caps_inline_at_the_queues_format_limit() {
+#[tokio::test]
+async fn enqueue_caps_inline_at_the_queues_format_limit() {
     // The client's setting is an upper bound request; the queue's
     // FORMAT inline_limit is the contract. A 64 KiB-capable client on
     // a queue declaring 8 bytes must detach anything larger.
@@ -1375,7 +1498,9 @@ fn enqueue_caps_inline_at_the_queues_format_limit() {
     opts.max_inline_payload = 65_536;
     let mut f = format();
     f.inline_limit = 8;
-    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &f).unwrap();
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &f)
+        .await
+        .unwrap();
     let mut budget = OpBudget::new(64);
     let EnqueueOutcome::Committed { job_id } = q
         .enqueue(
@@ -1388,6 +1513,7 @@ fn enqueue_caps_inline_at_the_queues_format_limit() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!()
@@ -1395,7 +1521,7 @@ fn enqueue_caps_inline_at_the_queues_format_limit() {
     let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
     // The payload went detached despite the client's 64 KiB setting.
     assert_eq!(
-        list_all(&q, &format!("q/payloads/{jhex}/")).len(),
+        list_all(&q, &format!("q/payloads/{jhex}/")).await.len(),
         1,
         "payload must detach above the FORMAT inline_limit"
     );
@@ -1403,13 +1529,13 @@ fn enqueue_caps_inline_at_the_queues_format_limit() {
 
 // ---------- Deep admissibility audit ----------
 
-#[test]
-fn repair_audits_a_legitimate_deep_chain_clean() {
+#[tokio::test]
+async fn repair_audits_a_legitimate_deep_chain_clean() {
     // The false-positive guard: claim -> renew -> expiry takeover ->
     // renew, all through the real paths, must produce zero findings —
     // every writer-encoded basis and custody token audited against the
     // store-time record.
-    let q = make_queue();
+    let q = make_queue().await;
     let mut budget = OpBudget::new(512);
     q.enqueue(
         EnqueueInput {
@@ -1421,27 +1547,32 @@ fn repair_audits_a_legitimate_deep_chain_clean() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(first) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
-    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).unwrap() else {
+    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).await.unwrap()
+    else {
         panic!("renew")
     };
     // Expiry takeover by a fresh floor past second's lease.
     let later = second.claim_store_time_ns + 2_000;
-    let stowq_core::ClaimOutcome::Claimed(third) =
-        q.claim(&claim_opts(later, 1_000), &mut budget).unwrap()
+    let stowq_core::ClaimOutcome::Claimed(third) = q
+        .claim(&claim_opts(later, 1_000), &mut budget)
+        .await
+        .unwrap()
     else {
         panic!("takeover")
     };
-    let stowq_core::RenewOutcome::Renewed(fourth) = q.renew(&third, &mut budget).unwrap() else {
+    let stowq_core::RenewOutcome::Renewed(fourth) = q.renew(&third, &mut budget).await.unwrap()
+    else {
         panic!("renew 2")
     };
     assert_eq!(fourth.generation, 4);
-    let (report, _) = repair_all(&q);
+    let (report, _) = repair_all(&q).await;
     assert!(
         report.findings.is_empty(),
         "legitimate chain audited dirty: {:?}",
@@ -1449,12 +1580,12 @@ fn repair_audits_a_legitimate_deep_chain_clean() {
     );
 }
 
-#[test]
-fn repair_flags_forged_continuation_token() {
+#[tokio::test]
+async fn repair_flags_forged_continuation_token() {
     // A continuation whose prev_token does not match the previous
     // generation: inadmissible custody. The old tail-only check never
     // saw this (the tail was a continuation, not a takeover).
-    let q = make_queue();
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     let EnqueueOutcome::Committed { job_id } = q
         .enqueue(
@@ -1467,12 +1598,13 @@ fn repair_flags_forged_continuation_token() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!()
     };
     let stowq_core::ClaimOutcome::Claimed(first) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
@@ -1496,8 +1628,9 @@ fn repair_flags_forged_continuation_token() {
     let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
     q.store()
         .put_if_absent(&Key::new(rel), body, digest)
+        .await
         .unwrap();
-    let (report, _) = repair_all(&q);
+    let (report, _) = repair_all(&q).await;
     assert!(
         report
             .findings
@@ -1508,12 +1641,12 @@ fn repair_flags_forged_continuation_token() {
     );
 }
 
-#[test]
-fn repair_flags_watermark_inequality_in_basis() {
+#[tokio::test]
+async fn repair_flags_watermark_inequality_in_basis() {
     // A takeover whose basis names the correct previous store time and
     // duration, but claims an observed watermark BEFORE that lease
     // expired: inadmissible takeover evidence.
-    let q = make_queue();
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     let EnqueueOutcome::Committed { job_id } = q
         .enqueue(
@@ -1526,12 +1659,13 @@ fn repair_flags_watermark_inequality_in_basis() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!()
     };
     let stowq_core::ClaimOutcome::Claimed(first) =
-        q.claim(&claim_opts(0, 60_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 60_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
@@ -1558,8 +1692,9 @@ fn repair_flags_watermark_inequality_in_basis() {
     let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
     q.store()
         .put_if_absent(&Key::new(rel), body, digest)
+        .await
         .unwrap();
-    let (report, _) = repair_all(&q);
+    let (report, _) = repair_all(&q).await;
     assert!(
         report
             .findings
@@ -1570,11 +1705,11 @@ fn repair_flags_watermark_inequality_in_basis() {
     );
 }
 
-#[test]
-fn repair_flags_generation_gap() {
+#[tokio::test]
+async fn repair_flags_generation_gap() {
     // A foreign delete of a middle generation leaves a gap: an
     // impossible state the audit must name.
-    let q = make_queue();
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -1586,18 +1721,22 @@ fn repair_flags_generation_gap() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(first) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
-    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).unwrap() else {
+    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).await.unwrap()
+    else {
         panic!("renew")
     };
     let later = second.claim_store_time_ns + 2_000;
-    let stowq_core::ClaimOutcome::Claimed(third) =
-        q.claim(&claim_opts(later, 1_000), &mut budget).unwrap()
+    let stowq_core::ClaimOutcome::Claimed(third) = q
+        .claim(&claim_opts(later, 1_000), &mut budget)
+        .await
+        .unwrap()
     else {
         panic!("takeover")
     };
@@ -1605,8 +1744,9 @@ fn repair_flags_generation_gap() {
     let jhex: String = third.job_id.iter().map(|b| format!("{b:02x}")).collect();
     q.store()
         .delete(&Key::new(format!("q/claims/0000/{jhex}/00000002")))
+        .await
         .unwrap();
-    let (report, _) = repair_all(&q);
+    let (report, _) = repair_all(&q).await;
     assert!(
         report
             .findings
@@ -1617,12 +1757,12 @@ fn repair_flags_generation_gap() {
     );
 }
 
-#[test]
-fn repair_flags_headless_chain() {
+#[tokio::test]
+async fn repair_flags_headless_chain() {
     // Foreign delete of generation 1: the chain's first listed
     // generation is not 1 — the head branch of the gap check, distinct
     // from the mid-chain windows branch.
-    let q = make_queue();
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -1634,20 +1774,23 @@ fn repair_flags_headless_chain() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(first) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
-    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).unwrap() else {
+    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).await.unwrap()
+    else {
         panic!("renew")
     };
     let jhex: String = second.job_id.iter().map(|b| format!("{b:02x}")).collect();
     q.store()
         .delete(&Key::new(format!("q/claims/0000/{jhex}/00000001")))
+        .await
         .unwrap();
-    let (report, _) = repair_all(&q);
+    let (report, _) = repair_all(&q).await;
     let head = report
         .findings
         .iter()
@@ -1670,14 +1813,14 @@ fn repair_flags_headless_chain() {
     );
 }
 
-#[test]
-fn repair_audits_around_a_corrupt_middle_generation() {
+#[tokio::test]
+async fn repair_audits_around_a_corrupt_middle_generation() {
     // An undecodable middle record must not produce spurious
     // inadmissibility on its neighbors: the evidence check skips
     // pairs with an undecoded side, and the chain audits around the
     // corruption (the corrupt record itself is a RecordCorrupt
     // finding).
-    let q = make_queue();
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -1689,18 +1832,22 @@ fn repair_audits_around_a_corrupt_middle_generation() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(first) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
-    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).unwrap() else {
+    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).await.unwrap()
+    else {
         panic!("renew")
     };
     let later = second.claim_store_time_ns + 2_000;
-    let stowq_core::ClaimOutcome::Claimed(third) =
-        q.claim(&claim_opts(later, 1_000), &mut budget).unwrap()
+    let stowq_core::ClaimOutcome::Claimed(third) = q
+        .claim(&claim_opts(later, 1_000), &mut budget)
+        .await
+        .unwrap()
     else {
         panic!("takeover")
     };
@@ -1709,12 +1856,12 @@ fn repair_audits_around_a_corrupt_middle_generation() {
     // Corrupt generation 2's body in place: delete, then write garbage
     // with a self-consistent digest (the store verifies PUT digests).
     let k = Key::new(format!("q/claims/0000/{jhex}/00000002"));
-    q.store().delete(&k).unwrap();
+    q.store().delete(&k).await.unwrap();
     use sha2::Digest as _;
     let junk = bytes::Bytes::from_static(b"garbage-not-a-record");
     let digest: [u8; 32] = sha2::Sha256::digest(&junk).into();
-    q.store().put_if_absent(&k, junk, digest).unwrap();
-    let (report, _) = repair_all(&q);
+    q.store().put_if_absent(&k, junk, digest).await.unwrap();
+    let (report, _) = repair_all(&q).await;
     // The corruption is named...
     assert!(
         report
@@ -1739,26 +1886,28 @@ fn repair_audits_around_a_corrupt_middle_generation() {
 
 // ---------- Watermark-raised floors (Option D) ----------
 
-#[test]
-fn establish_floor_raises_to_the_watermark_bucket() {
+#[tokio::test]
+async fn establish_floor_raises_to_the_watermark_bucket() {
     // A watermark above the fresh beacon but within the skew guard:
     // the gate passes on the raw beacon, and the returned floor is
     // raised to the watermark bucket — a proven lower bound, never a
     // regression mask.
     let mut opts = OpenOptions::new([1; 16]);
     opts.skew_guard_ns = 10_000_000_000;
-    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format()).unwrap();
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format())
+        .await
+        .unwrap();
     let mut budget = OpBudget::new(256);
     // delayed width 1000: floor 5_000_000 -> bucket 5000 -> wm 5_000_000.
-    q.advance_watermark(5_000_000, &mut budget).unwrap();
-    let f = q.establish_floor(&mut budget).unwrap();
+    q.advance_watermark(5_000_000, &mut budget).await.unwrap();
+    let f = q.establish_floor(&mut budget).await.unwrap();
     assert_eq!(f, 5_000_000, "floor raised to the watermark bucket");
     // The cached repeat returns the raised value.
-    assert_eq!(q.establish_floor(&mut budget).unwrap(), 5_000_000);
+    assert_eq!(q.establish_floor(&mut budget).await.unwrap(), 5_000_000);
 }
 
-#[test]
-fn raised_floor_evaluates_expiry_as_a_normal_floor() {
+#[tokio::test]
+async fn raised_floor_evaluates_expiry_as_a_normal_floor() {
     // The raised floor is a valid lower bound: a takeover evaluated
     // against it must behave exactly as a beacon floor would, and a
     // fresh handle over the same store inherits the raise. The
@@ -1768,7 +1917,9 @@ fn raised_floor_evaluates_expiry_as_a_normal_floor() {
     let mut opts = OpenOptions::new([1; 16]);
     opts.skew_guard_ns = 1_000_000;
     let store = MemoryStore::new();
-    let q = Queue::init(Box::new(store.clone()), "q", &opts, &format()).unwrap();
+    let q = Queue::init(Box::new(store.clone()), "q", &opts, &format())
+        .await
+        .unwrap();
     let mut budget = OpBudget::new(256);
     q.enqueue(
         EnqueueInput {
@@ -1780,20 +1931,23 @@ fn raised_floor_evaluates_expiry_as_a_normal_floor() {
         },
         &mut budget,
     )
+    .await
     .unwrap();
     let stowq_core::ClaimOutcome::Claimed(first) =
-        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+        q.claim(&claim_opts(0, 1_000), &mut budget).await.unwrap()
     else {
         panic!("claim")
     };
     // Advance store time a lease-length past the claim so the beacon
     // clears T1 + lease; then a watermark 50_000 above the guard.
     store.advance_clock_to(first.claim_store_time_ns + 100_000);
-    q.advance_watermark(1_050_000, &mut budget).unwrap();
-    let raised = q.establish_floor(&mut budget).unwrap();
+    q.advance_watermark(1_050_000, &mut budget).await.unwrap();
+    let raised = q.establish_floor(&mut budget).await.unwrap();
     assert_eq!(raised, 1_050_000);
-    let stowq_core::ClaimOutcome::Claimed(second) =
-        q.claim(&claim_opts(raised, 1_000), &mut budget).unwrap()
+    let stowq_core::ClaimOutcome::Claimed(second) = q
+        .claim(&claim_opts(raised, 1_000), &mut budget)
+        .await
+        .unwrap()
     else {
         panic!("takeover at the raised floor")
     };
@@ -1801,10 +1955,10 @@ fn raised_floor_evaluates_expiry_as_a_normal_floor() {
     // A lower advance is a no-op, and a FRESH handle over the same
     // store still raises to the stored bucket: the watermark is
     // shared state, so floors never go down across participants.
-    q.advance_watermark(1_000, &mut budget).unwrap();
-    let q2 = Queue::open(Box::new(store), "q", opts).unwrap();
+    q.advance_watermark(1_000, &mut budget).await.unwrap();
+    let q2 = Queue::open(Box::new(store), "q", opts).await.unwrap();
     assert_eq!(
-        q2.establish_floor(&mut OpBudget::new(64)).unwrap(),
+        q2.establish_floor(&mut OpBudget::new(64)).await.unwrap(),
         1_050_000
     );
 }
@@ -1817,12 +1971,12 @@ fn v11_format() -> FormatRecord {
     f
 }
 
-fn list_prefix(q: &Queue, prefix: &str) -> Vec<String> {
-    list_all(q, prefix)
+async fn list_prefix(q: &Queue, prefix: &str) -> Vec<String> {
+    list_all(q, prefix).await
 }
 
-#[test]
-fn repair_writes_quarantine_on_v11_queues() {
+#[tokio::test]
+async fn repair_writes_quarantine_on_v11_queues() {
     use sha2::Digest as _;
     let q = Queue::init(
         Box::new(MemoryStore::new()),
@@ -1830,6 +1984,7 @@ fn repair_writes_quarantine_on_v11_queues() {
         &OpenOptions::new([1; 16]),
         &v11_format(),
     )
+    .await
     .unwrap();
     let mut budget = OpBudget::new(256);
     let EnqueueOutcome::Committed { job_id } = q
@@ -1843,6 +1998,7 @@ fn repair_writes_quarantine_on_v11_queues() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!()
@@ -1851,13 +2007,13 @@ fn repair_writes_quarantine_on_v11_queues() {
     // Corrupt the job record in place: delete, write self-consistent
     // garbage (the store verifies PUT digests).
     let k = Key::new(format!("q/jobs/0000/{jhex}"));
-    q.store().delete(&k).unwrap();
+    q.store().delete(&k).await.unwrap();
     let junk = bytes::Bytes::from_static(b"garbage");
     let digest: [u8; 32] = sha2::Sha256::digest(&junk).into();
-    q.store().put_if_absent(&k, junk, digest).unwrap();
-    let garbage_time = q.store().head(&k).unwrap().store_time_ns;
+    q.store().put_if_absent(&k, junk, digest).await.unwrap();
+    let garbage_time = q.store().head(&k).await.unwrap().store_time_ns;
 
-    let (report, _) = repair_all(&q);
+    let (report, _) = repair_all(&q).await;
     assert!(
         report
             .findings
@@ -1867,14 +2023,18 @@ fn repair_writes_quarantine_on_v11_queues() {
         report.findings
     );
     // Exactly one quarantine entry, with the deterministic fields.
-    let entries = list_prefix(&q, "q/quarantine/");
+    let entries = list_prefix(&q, "q/quarantine/").await;
     assert_eq!(entries.len(), 1, "one entry per (source, reason)");
     let rel: stowq_keys::Key = entries[0]
         .trim_start_matches("q/")
         .parse()
         .expect("quarantine key parses");
     let tag = stowq_keys::key_tag(&[1; 16], &rel.to_string());
-    let obj = q.store().get(&Key::new(entries[0].clone()), None).unwrap();
+    let obj = q
+        .store()
+        .get(&Key::new(entries[0].clone()), None)
+        .await
+        .unwrap();
     let rec = match stowq_format::decode(&obj.body, &[1; 16], &tag).unwrap() {
         stowq_format::Record::Quarantine(r) => r,
         other => panic!("expected quarantine, got {other:?}"),
@@ -1897,14 +2057,14 @@ fn repair_writes_quarantine_on_v11_queues() {
         other => panic!("parsed wrong key shape: {other:?}"),
     }
     // Idempotent convergence: a second audit run writes nothing new.
-    let (_, _) = repair_all(&q);
-    assert_eq!(list_prefix(&q, "q/quarantine/").len(), 1);
+    let (_, _) = repair_all(&q).await;
+    assert_eq!(list_prefix(&q, "q/quarantine/").await.len(), 1);
 }
 
-#[test]
-fn repair_writes_nothing_on_v1_queues() {
+#[tokio::test]
+async fn repair_writes_nothing_on_v1_queues() {
     use sha2::Digest as _;
-    let q = make_queue();
+    let q = make_queue().await;
     let mut budget = OpBudget::new(256);
     let EnqueueOutcome::Committed { job_id } = q
         .enqueue(
@@ -1917,29 +2077,32 @@ fn repair_writes_nothing_on_v1_queues() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!()
     };
     let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
     let k = Key::new(format!("q/jobs/0000/{jhex}"));
-    q.store().delete(&k).unwrap();
+    q.store().delete(&k).await.unwrap();
     let junk = bytes::Bytes::from_static(b"garbage");
     let digest: [u8; 32] = sha2::Sha256::digest(&junk).into();
-    q.store().put_if_absent(&k, junk, digest).unwrap();
-    let (report, _) = repair_all(&q);
+    q.store().put_if_absent(&k, junk, digest).await.unwrap();
+    let (report, _) = repair_all(&q).await;
     assert!(report.findings.iter().any(|f| f.kind == RK::RecordCorrupt));
     assert!(
-        list_prefix(&q, "q/quarantine/").is_empty(),
+        list_prefix(&q, "q/quarantine/").await.is_empty(),
         "v1 queues write nothing"
     );
 }
 
-#[test]
-fn repair_reports_and_quarantines_missing_referenced_payload() {
+#[tokio::test]
+async fn repair_reports_and_quarantines_missing_referenced_payload() {
     let mut opts = OpenOptions::new([1; 16]);
     opts.max_inline_payload = 4;
-    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &v11_format()).unwrap();
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &v11_format())
+        .await
+        .unwrap();
     let mut budget = OpBudget::new(256);
     let EnqueueOutcome::Committed { job_id } = q
         .enqueue(
@@ -1952,6 +2115,7 @@ fn repair_reports_and_quarantines_missing_referenced_payload() {
             },
             &mut budget,
         )
+        .await
         .unwrap()
     else {
         panic!()
@@ -1960,17 +2124,22 @@ fn repair_reports_and_quarantines_missing_referenced_payload() {
     // Delete ONLY the payload: the job record references it (0x0014 —
     // distinct from gc's orphan direction, which deletes the job).
     let payload_key = list_prefix(&q, &format!("q/payloads/{jhex}/"))
+        .await
         .into_iter()
         .next()
         .expect("payload exists");
-    q.store().delete(&Key::new(payload_key.clone())).unwrap();
+    q.store()
+        .delete(&Key::new(payload_key.clone()))
+        .await
+        .unwrap();
     let job_time = q
         .store()
         .head(&Key::new(format!("q/jobs/0000/{jhex}")))
+        .await
         .unwrap()
         .store_time_ns;
 
-    let (report, _) = repair_all(&q);
+    let (report, _) = repair_all(&q).await;
     assert!(
         report
             .findings
@@ -1979,11 +2148,15 @@ fn repair_reports_and_quarantines_missing_referenced_payload() {
         "findings: {:?}",
         report.findings
     );
-    let entries = list_prefix(&q, "q/quarantine/");
+    let entries = list_prefix(&q, "q/quarantine/").await;
     assert_eq!(entries.len(), 1);
     let rel: stowq_keys::Key = entries[0].trim_start_matches("q/").parse().unwrap();
     let tag = stowq_keys::key_tag(&[1; 16], &rel.to_string());
-    let obj = q.store().get(&Key::new(entries[0].clone()), None).unwrap();
+    let obj = q
+        .store()
+        .get(&Key::new(entries[0].clone()), None)
+        .await
+        .unwrap();
     let rec = match stowq_format::decode(&obj.body, &[1; 16], &tag).unwrap() {
         stowq_format::Record::Quarantine(r) => r,
         other => panic!("expected quarantine, got {other:?}"),

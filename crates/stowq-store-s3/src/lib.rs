@@ -9,11 +9,11 @@
 //! the profile granularity for consistency. Lease arithmetic is in
 //! nanoseconds; `skew_guard >= G` absorbs the quantization.
 //!
-//! The bridge is synchronous over the async SDK through a dedicated
-//! runtime: do not construct `S3Store` from an async context on the
-//! same runtime thread. The CLI and the conformance harness are sync
-//! callers.
+//! The trait is async; the SDK's futures are awaited directly. No
+//! runtime is embedded — the caller brings one (the CLI uses tokio's
+//! multi-thread runtime).
 
+use async_trait::async_trait;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use std::ops::Range;
@@ -35,7 +35,6 @@ pub struct S3Config {
 pub struct S3Store {
     client: aws_sdk_s3::Client,
     bucket: String,
-    runtime: tokio::runtime::Runtime,
 }
 
 fn quantize(nanos: i128) -> u64 {
@@ -144,11 +143,6 @@ impl S3Store {
         S3Store {
             client: aws_sdk_s3::Client::from_conf(builder.build()),
             bucket: bucket.into(),
-            runtime: tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("tokio runtime"),
         }
     }
 
@@ -198,119 +192,113 @@ impl S3Store {
     }
 }
 
+#[async_trait]
 impl ObjectStore for S3Store {
-    fn put_if_absent(
+    async fn put_if_absent(
         &self,
         key: &Key,
         body: bytes::Bytes,
         sha256: Digest,
     ) -> StoreResult<PutOutcome> {
-        self.runtime
-            .block_on(self.put_conditional(key, body, &sha256, None))
+        self.put_conditional(key, body, &sha256, None).await
     }
 
-    fn cas(
+    async fn cas(
         &self,
         key: &Key,
         body: bytes::Bytes,
         sha256: Digest,
         if_match: &Version,
     ) -> StoreResult<PutOutcome> {
-        self.runtime
-            .block_on(self.put_conditional(key, body, &sha256, Some(if_match)))
+        self.put_conditional(key, body, &sha256, Some(if_match))
+            .await
     }
 
-    fn get(&self, key: &Key, range: Option<Range<u64>>) -> StoreResult<Object> {
-        self.runtime.block_on(async {
-            let mut req = self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(key.as_str());
-            if let Some(r) = &range {
-                // Strict half-open contract (see the trait): empty and
-                // inverted ranges are absence, never sent to the store.
-                if r.start >= r.end {
-                    return Err(StoreError::NotFound);
-                }
-                // Inclusive end byte; start < end guarantees end >= 1.
-                req = req.range(format!("bytes={}-{}", r.start, r.end - 1));
+    async fn get(&self, key: &Key, range: Option<Range<u64>>) -> StoreResult<Object> {
+        let mut req = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key.as_str());
+        if let Some(r) = &range {
+            // Strict half-open contract (see the trait): empty and
+            // inverted ranges are absence, never sent to the store.
+            if r.start >= r.end {
+                return Err(StoreError::NotFound);
             }
-            match req.send().await {
-                Ok(out) => {
-                    // On a ranged read the store's Content-Length is the
-                    // part length; the object's full size comes from
-                    // Content-Range ("bytes 0-1/11") so meta.size means
-                    // the same thing on every backend. An absent header
-                    // is a whole-object response (a store that ignored
-                    // the range), where Content-Length is already the
-                    // full size — the length check below still catches
-                    // strict-subset ignores.
-                    let size = match (&range, out.content_range()) {
-                        (Some(_), Some(cr)) => cr
-                            .rsplit('/')
-                            .next()
-                            .and_then(|t| t.parse::<u64>().ok())
-                            .ok_or_else(|| {
-                                StoreError::ProfileViolation(format!(
-                                    "malformed content-range: {cr}"
-                                ))
-                            })?,
-                        _ => out.content_length.unwrap_or(0) as u64,
-                    };
-                    let meta = Meta {
-                        version: Version(out.e_tag.clone().unwrap_or_default()),
-                        store_time_ns: out
-                            .last_modified
-                            .map(|t| quantize(t.as_nanos()))
-                            .unwrap_or(0),
-                        size,
-                    };
-                    let body = out
-                        .body
-                        .collect()
-                        .await
-                        .map_err(|_| StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))?
-                        .into_bytes();
-                    // A store that clamps a past-EOF end (HTTP 206
-                    // partial) returns fewer bytes than requested:
-                    // report absence rather than a short slice.
-                    if let Some(r) = &range {
-                        if body.len() as u64 != r.end - r.start {
-                            return Err(StoreError::NotFound);
-                        }
-                    }
-                    Ok(Object { meta, body })
-                }
-                Err(e) => Err(read_err(e)),
-            }
-        })
-    }
-
-    fn head(&self, key: &Key) -> StoreResult<Meta> {
-        self.runtime.block_on(async {
-            match self
-                .client
-                .head_object()
-                .bucket(&self.bucket)
-                .key(key.as_str())
-                .send()
-                .await
-            {
-                Ok(out) => Ok(Meta {
+            // Inclusive end byte; start < end guarantees end >= 1.
+            req = req.range(format!("bytes={}-{}", r.start, r.end - 1));
+        }
+        match req.send().await {
+            Ok(out) => {
+                // On a ranged read the store's Content-Length is the
+                // part length; the object's full size comes from
+                // Content-Range ("bytes 0-1/11") so meta.size means
+                // the same thing on every backend. An absent header
+                // is a whole-object response (a store that ignored
+                // the range), where Content-Length is already the
+                // full size — the length check below still catches
+                // strict-subset ignores.
+                let size = match (&range, out.content_range()) {
+                    (Some(_), Some(cr)) => cr
+                        .rsplit('/')
+                        .next()
+                        .and_then(|t| t.parse::<u64>().ok())
+                        .ok_or_else(|| {
+                            StoreError::ProfileViolation(format!("malformed content-range: {cr}"))
+                        })?,
+                    _ => out.content_length.unwrap_or(0) as u64,
+                };
+                let meta = Meta {
                     version: Version(out.e_tag.clone().unwrap_or_default()),
                     store_time_ns: out
                         .last_modified
                         .map(|t| quantize(t.as_nanos()))
                         .unwrap_or(0),
-                    size: out.content_length.unwrap_or(0) as u64,
-                }),
-                Err(e) => Err(read_err(e)),
+                    size,
+                };
+                let body = out
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|_| StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))?
+                    .into_bytes();
+                // A store that clamps a past-EOF end (HTTP 206
+                // partial) returns fewer bytes than requested:
+                // report absence rather than a short slice.
+                if let Some(r) = &range {
+                    if body.len() as u64 != r.end - r.start {
+                        return Err(StoreError::NotFound);
+                    }
+                }
+                Ok(Object { meta, body })
             }
-        })
+            Err(e) => Err(read_err(e)),
+        }
     }
 
-    fn list(&self, prefix: &str, after: Option<&Key>, limit: usize) -> StoreResult<Page> {
+    async fn head(&self, key: &Key) -> StoreResult<Meta> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key.as_str())
+            .send()
+            .await
+        {
+            Ok(out) => Ok(Meta {
+                version: Version(out.e_tag.clone().unwrap_or_default()),
+                store_time_ns: out
+                    .last_modified
+                    .map(|t| quantize(t.as_nanos()))
+                    .unwrap_or(0),
+                size: out.content_length.unwrap_or(0) as u64,
+            }),
+            Err(e) => Err(read_err(e)),
+        }
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&Key>, limit: usize) -> StoreResult<Page> {
         if limit == 0 {
             // The contract's zero-limit page is empty and terminal;
             // S3 would otherwise return one key.
@@ -319,69 +307,65 @@ impl ObjectStore for S3Store {
                 next_after: None,
             });
         }
-        self.runtime.block_on(async {
-            let mut req = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(prefix)
-                .max_keys((limit as i32).clamp(1, 1000));
-            if let Some(a) = after {
-                req = req.start_after(a.as_str());
-            }
-            match req.send().await {
-                Ok(out) => {
-                    let mut items = Vec::new();
-                    for o in out.contents() {
-                        let Some(k) = o.key() else { continue };
-                        // start_after is inclusive; the contract is
-                        // exclusive-after.
-                        if let Some(a) = after {
-                            if k <= a.as_str() {
-                                continue;
-                            }
+        let mut req = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .max_keys((limit as i32).clamp(1, 1000));
+        if let Some(a) = after {
+            req = req.start_after(a.as_str());
+        }
+        match req.send().await {
+            Ok(out) => {
+                let mut items = Vec::new();
+                for o in out.contents() {
+                    let Some(k) = o.key() else { continue };
+                    // start_after is inclusive; the contract is
+                    // exclusive-after.
+                    if let Some(a) = after {
+                        if k <= a.as_str() {
+                            continue;
                         }
-                        items.push(Listing {
-                            key: Key::new(k),
-                            meta: Meta {
-                                version: Version(o.e_tag.clone().unwrap_or_default()),
-                                store_time_ns: o
-                                    .last_modified
-                                    .map(|t| quantize(t.as_nanos()))
-                                    .unwrap_or(0),
-                                size: o.size.unwrap_or(0) as u64,
-                            },
-                        });
                     }
-                    let next_after = if out.is_truncated().unwrap_or(false) {
-                        items.last().map(|l| l.key.clone())
-                    } else {
-                        None
-                    };
-                    Ok(Page { items, next_after })
+                    items.push(Listing {
+                        key: Key::new(k),
+                        meta: Meta {
+                            version: Version(o.e_tag.clone().unwrap_or_default()),
+                            store_time_ns: o
+                                .last_modified
+                                .map(|t| quantize(t.as_nanos()))
+                                .unwrap_or(0),
+                            size: o.size.unwrap_or(0) as u64,
+                        },
+                    });
                 }
-                Err(e) => Err(classify_send_err(&e)),
+                let next_after = if out.is_truncated().unwrap_or(false) {
+                    items.last().map(|l| l.key.clone())
+                } else {
+                    None
+                };
+                Ok(Page { items, next_after })
             }
-        })
+            Err(e) => Err(classify_send_err(&e)),
+        }
     }
 
-    fn delete(&self, key: &Key) -> StoreResult<()> {
-        self.runtime.block_on(async {
-            match self
-                .client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(key.as_str())
-                .send()
-                .await
-            {
-                // S3 delete is idempotent: a missing key is success.
-                Ok(_) => Ok(()),
-                Err(e) => match status_of(&e) {
-                    Some(404) => Ok(()),
-                    _ => Err(read_err(e)),
-                },
-            }
-        })
+    async fn delete(&self, key: &Key) -> StoreResult<()> {
+        match self
+            .client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key.as_str())
+            .send()
+            .await
+        {
+            // S3 delete is idempotent: a missing key is success.
+            Ok(_) => Ok(()),
+            Err(e) => match status_of(&e) {
+                Some(404) => Ok(()),
+                _ => Err(read_err(e)),
+            },
+        }
     }
 }

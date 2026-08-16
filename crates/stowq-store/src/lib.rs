@@ -12,6 +12,7 @@ pub mod memory;
 pub use injector::{Fault, FaultPlan, Injector, Op};
 pub use memory::MemoryStore;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use std::fmt;
 use std::ops::Range;
@@ -132,13 +133,24 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 /// The store primitive contract (see spec/store-profiles.md). Object-safe;
 /// backends and wrappers (injector, future caching layers) share one type.
+///
+/// Every real backend is network IO, so the methods are async. On wasm
+/// targets the boxed futures are `?Send` (the Workers runtime requires
+/// it); on every other target they are `Send`.
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub trait ObjectStore: Send + Sync {
     /// Atomic create. `sha256` is verified against `body` (P7); a mismatch
     /// fails with `IntegrityViolation` without writing.
-    fn put_if_absent(&self, key: &Key, body: Bytes, sha256: Digest) -> StoreResult<PutOutcome>;
+    async fn put_if_absent(
+        &self,
+        key: &Key,
+        body: Bytes,
+        sha256: Digest,
+    ) -> StoreResult<PutOutcome>;
 
     /// Atomic overwrite conditional on the current version (P2).
-    fn cas(
+    async fn cas(
         &self,
         key: &Key,
         body: Bytes,
@@ -152,14 +164,14 @@ pub trait ObjectStore: Send + Sync {
     /// backend. A backend that would clamp a past-EOF end (an HTTP
     /// 206 partial) reports `NotFound` rather than returning fewer
     /// bytes than requested.
-    fn get(&self, key: &Key, range: Option<Range<u64>>) -> StoreResult<Object>;
+    async fn get(&self, key: &Key, range: Option<Range<u64>>) -> StoreResult<Object>;
 
-    fn head(&self, key: &Key) -> StoreResult<Meta>;
+    async fn head(&self, key: &Key) -> StoreResult<Meta>;
 
     /// Strongly consistent listing in lexicographic order (P4), starting
     /// strictly after `after` when given.
-    fn list(&self, prefix: &str, after: Option<&Key>, limit: usize) -> StoreResult<Page>;
+    async fn list(&self, prefix: &str, after: Option<&Key>, limit: usize) -> StoreResult<Page>;
 
     /// Idempotent delete (GC only).
-    fn delete(&self, key: &Key) -> StoreResult<()>;
+    async fn delete(&self, key: &Key) -> StoreResult<()>;
 }

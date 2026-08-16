@@ -9,6 +9,7 @@ use crate::{
     Ambiguity, Digest, Key, Meta, Object, ObjectStore, Page, PutOutcome, StoreError, StoreResult,
     TransportClass, Version,
 };
+use async_trait::async_trait;
 use bytes::Bytes;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -155,21 +156,27 @@ impl<S: ObjectStore> Injector<S> {
     }
 }
 
+#[async_trait]
 impl<S: ObjectStore> ObjectStore for Injector<S> {
-    fn put_if_absent(&self, key: &Key, body: Bytes, sha256: Digest) -> StoreResult<PutOutcome> {
+    async fn put_if_absent(
+        &self,
+        key: &Key,
+        body: Bytes,
+        sha256: Digest,
+    ) -> StoreResult<PutOutcome> {
         match self.check(Op::PutIfAbsent) {
             Action::Fail(e) => Err(e),
             Action::FailAfter => {
                 // The write may have committed (Committed) or lost the
                 // race (Rejected); either way the response is lost.
-                let _ = self.store.put_if_absent(key, body, sha256)?;
+                let _ = self.store.put_if_absent(key, body, sha256).await?;
                 Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
             }
-            Action::Pass => self.store.put_if_absent(key, body, sha256),
+            Action::Pass => self.store.put_if_absent(key, body, sha256).await,
         }
     }
 
-    fn cas(
+    async fn cas(
         &self,
         key: &Key,
         body: Bytes,
@@ -179,54 +186,54 @@ impl<S: ObjectStore> ObjectStore for Injector<S> {
         match self.check(Op::Cas) {
             Action::Fail(e) => Err(e),
             Action::FailAfter => {
-                let _ = self.store.cas(key, body, sha256, if_match)?;
+                let _ = self.store.cas(key, body, sha256, if_match).await?;
                 Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
             }
-            Action::Pass => self.store.cas(key, body, sha256, if_match),
+            Action::Pass => self.store.cas(key, body, sha256, if_match).await,
         }
     }
 
-    fn get(&self, key: &Key, range: Option<Range<u64>>) -> StoreResult<Object> {
+    async fn get(&self, key: &Key, range: Option<Range<u64>>) -> StoreResult<Object> {
         match self.check(Op::Get) {
             Action::Fail(e) => Err(e),
             Action::FailAfter => {
-                let _ = self.store.get(key, range)?;
+                let _ = self.store.get(key, range).await?;
                 Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
             }
-            Action::Pass => self.store.get(key, range),
+            Action::Pass => self.store.get(key, range).await,
         }
     }
 
-    fn head(&self, key: &Key) -> StoreResult<Meta> {
+    async fn head(&self, key: &Key) -> StoreResult<Meta> {
         match self.check(Op::Head) {
             Action::Fail(e) => Err(e),
             Action::FailAfter => {
-                let _ = self.store.head(key)?;
+                let _ = self.store.head(key).await?;
                 Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
             }
-            Action::Pass => self.store.head(key),
+            Action::Pass => self.store.head(key).await,
         }
     }
 
-    fn list(&self, prefix: &str, after: Option<&Key>, limit: usize) -> StoreResult<Page> {
+    async fn list(&self, prefix: &str, after: Option<&Key>, limit: usize) -> StoreResult<Page> {
         match self.check(Op::List) {
             Action::Fail(e) => Err(e),
             Action::FailAfter => {
-                let _ = self.store.list(prefix, after, limit)?;
+                let _ = self.store.list(prefix, after, limit).await?;
                 Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
             }
-            Action::Pass => self.store.list(prefix, after, limit),
+            Action::Pass => self.store.list(prefix, after, limit).await,
         }
     }
 
-    fn delete(&self, key: &Key) -> StoreResult<()> {
+    async fn delete(&self, key: &Key) -> StoreResult<()> {
         match self.check(Op::Delete) {
             Action::Fail(e) => Err(e),
             Action::FailAfter => {
-                self.store.delete(key)?;
+                self.store.delete(key).await?;
                 Err(StoreError::OutcomeUnknown(Ambiguity::ConnectionLost))
             }
-            Action::Pass => self.store.delete(key),
+            Action::Pass => self.store.delete(key).await,
         }
     }
 }
@@ -243,8 +250,8 @@ mod tests {
         h.finalize().into()
     }
 
-    #[test]
-    fn pre_transmit_fault_is_retry_safe() {
+    #[tokio::test]
+    async fn pre_transmit_fault_is_retry_safe() {
         let inner = MemoryStore::new();
         let injector = Injector::new(
             inner,
@@ -254,19 +261,22 @@ mod tests {
         let body = Bytes::from_static(b"one");
         let d = digest(b"one");
         assert_eq!(
-            injector.put_if_absent(&k, body.clone(), d).unwrap_err(),
+            injector
+                .put_if_absent(&k, body.clone(), d)
+                .await
+                .unwrap_err(),
             StoreError::Transport(TransportClass::PreTransmit)
         );
         assert!(matches!(
-            injector.put_if_absent(&k, body, d).unwrap(),
+            injector.put_if_absent(&k, body, d).await.unwrap(),
             PutOutcome::Committed { .. }
         ));
         assert_eq!(injector.fired(), vec![1]);
         assert_eq!(injector.total_calls(), 2);
     }
 
-    #[test]
-    fn post_transmit_fault_is_outcome_unknown_and_absent() {
+    #[tokio::test]
+    async fn post_transmit_fault_is_outcome_unknown_and_absent() {
         let inner = MemoryStore::new();
         let injector = Injector::new(
             inner,
@@ -277,21 +287,26 @@ mod tests {
         assert_eq!(
             injector
                 .put_if_absent(&k, Bytes::from_static(b"x"), d)
+                .await
                 .unwrap_err(),
             StoreError::OutcomeUnknown(Ambiguity::ConnectionLost)
         );
         // Resolution: absent, so a blind retry is safe.
-        assert_eq!(injector.inner().head(&k).unwrap_err(), StoreError::NotFound);
+        assert_eq!(
+            injector.inner().head(&k).await.unwrap_err(),
+            StoreError::NotFound
+        );
         assert!(matches!(
             injector
                 .put_if_absent(&k, Bytes::from_static(b"x"), d)
+                .await
                 .unwrap(),
             PutOutcome::Committed { .. }
         ));
     }
 
-    #[test]
-    fn post_transmit_after_is_unknown_but_committed() {
+    #[tokio::test]
+    async fn post_transmit_after_is_unknown_but_committed() {
         let inner = MemoryStore::new();
         let injector = Injector::new(
             inner,
@@ -306,22 +321,24 @@ mod tests {
         assert_eq!(
             injector
                 .put_if_absent(&k, Bytes::from_static(b"x"), d)
+                .await
                 .unwrap_err(),
             StoreError::OutcomeUnknown(Ambiguity::ConnectionLost)
         );
         // Resolution: the key IS present; a blind retry would see Rejected.
-        let meta = injector.inner().head(&k).unwrap();
+        let meta = injector.inner().head(&k).await.unwrap();
         assert_eq!(meta.size, 1);
         assert_eq!(
             injector
                 .put_if_absent(&k, Bytes::from_static(b"x"), d)
+                .await
                 .unwrap(),
             PutOutcome::Rejected
         );
     }
 
-    #[test]
-    fn faults_fire_only_at_planned_indexes() {
+    #[tokio::test]
+    async fn faults_fire_only_at_planned_indexes() {
         let inner = MemoryStore::new();
         let injector = Injector::new(
             inner,
@@ -331,17 +348,18 @@ mod tests {
         let d = digest(b"x");
         injector
             .put_if_absent(&k, Bytes::from_static(b"x"), d)
+            .await
             .unwrap();
-        assert!(injector.get(&k, None).is_ok()); // call 0
-        assert!(injector.get(&k, None).is_err()); // call 1 fires
-        assert!(injector.get(&k, None).is_ok()); // call 2
-        assert!(injector.get(&k, None).is_err()); // call 3 fires
-        assert!(injector.get(&k, None).is_ok()); // call 4
+        assert!(injector.get(&k, None).await.is_ok()); // call 0
+        assert!(injector.get(&k, None).await.is_err()); // call 1 fires
+        assert!(injector.get(&k, None).await.is_ok()); // call 2
+        assert!(injector.get(&k, None).await.is_err()); // call 3 fires
+        assert!(injector.get(&k, None).await.is_ok()); // call 4
         assert_eq!(injector.fired(), vec![2]);
     }
 
-    #[test]
-    fn rejected_put_is_ok_not_error() {
+    #[tokio::test]
+    async fn rejected_put_is_ok_not_error() {
         let inner = MemoryStore::new();
         let injector = Injector::new(inner, vec![]);
         let k = Key::new("jobs/0001/a");
@@ -349,19 +367,21 @@ mod tests {
         assert!(matches!(
             injector
                 .put_if_absent(&k, Bytes::from_static(b"one"), d)
+                .await
                 .unwrap(),
             PutOutcome::Committed { .. }
         ));
         assert_eq!(
             injector
                 .put_if_absent(&k, Bytes::from_static(b"two"), digest(b"two"))
+                .await
                 .unwrap(),
             PutOutcome::Rejected
         );
     }
 
-    #[test]
-    fn plans_are_op_scoped() {
+    #[tokio::test]
+    async fn plans_are_op_scoped() {
         let inner = MemoryStore::new();
         let injector = Injector::new(
             inner,
@@ -371,17 +391,18 @@ mod tests {
         let d = digest(b"x");
         injector
             .put_if_absent(&k, Bytes::from_static(b"x"), d)
+            .await
             .unwrap();
-        assert!(injector.get(&k, None).is_ok());
-        assert!(injector.head(&k).is_ok());
+        assert!(injector.get(&k, None).await.is_ok());
+        assert!(injector.head(&k).await.is_ok());
         assert_eq!(
-            injector.delete(&k).unwrap_err(),
+            injector.delete(&k).await.unwrap_err(),
             StoreError::Transport(TransportClass::PreTransmit)
         );
     }
 
-    #[test]
-    fn one_fault_per_call_and_same_op_plans_count_survivors() {
+    #[tokio::test]
+    async fn one_fault_per_call_and_same_op_plans_count_survivors() {
         // Two plans on Get: plan A faults call 0; plan B counts every
         // call that reaches it and faults its own index 1, which is the
         // second call to survive plan A (the third Get overall).
@@ -397,11 +418,12 @@ mod tests {
         let d = digest(b"x");
         injector
             .put_if_absent(&k, Bytes::from_static(b"x"), d)
+            .await
             .unwrap();
-        assert!(injector.get(&k, None).is_err()); // A fires; B counts 0.
-        assert!(injector.get(&k, None).is_ok()); // B counts 1.
-        assert!(injector.get(&k, None).is_err()); // B's index 1 due; fires.
-        assert!(injector.get(&k, None).is_ok());
+        assert!(injector.get(&k, None).await.is_err()); // A fires; B counts 0.
+        assert!(injector.get(&k, None).await.is_ok()); // B counts 1.
+        assert!(injector.get(&k, None).await.is_err()); // B's index 1 due; fires.
+        assert!(injector.get(&k, None).await.is_ok());
         assert_eq!(injector.fired(), vec![1, 1]);
     }
 }
