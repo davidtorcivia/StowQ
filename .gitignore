@@ -1,6 +1,7 @@
 # Internal working documents
 stowq-spec.md
 stowq-implementation.md
+HANDOFF.md
 
 # Rust
 /target

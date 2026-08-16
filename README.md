@@ -20,6 +20,11 @@ bound sweep work and are never trusted for correctness.
 
 Experimental. Do not use it for workloads where job loss would cause harm.
 
+The protocol and its Rust implementation are complete and continuously
+verified: unit and fault-injection suites, an equivalence-checked state
+machine, TLA+ models of the claim and terminal paths, fuzzing, and a
+live-store conformance suite (MinIO certified; see `spec/store-profiles.md`).
+
 ## Specification
 
 The normative specification lives in `spec/`:
@@ -33,6 +38,21 @@ The normative specification lives in `spec/`:
 - `recovery.md` — sweeping, repair, GC
 - `reasons.md` — reason registries
 
+## Workspace
+
+- `stowq-keys` — key grammar, sharding, key tags
+- `stowq-math` — bucket arithmetic, retry backoff
+- `stowq-format` — canonical CBOR records with digest framing
+- `stowq-store` — `ObjectStore` trait, error taxonomy, memory fake,
+  fault injector
+- `stowq-store-s3` — S3-compatible backend (R2, S3, MinIO) and the
+  conformance suite
+- `stowq-core` — the queue state machine
+- `stowq-testkit` — logical oracle, differential driver, interleaving lab
+- `stowq-cli` — the `stowq` binary
+
+TLA+ models live in `model/`; fuzz targets in `fuzz/`.
+
 ## Quick Start
 
 ```sh
@@ -45,9 +65,22 @@ echo "hello world" | ./target/release/stowq put myqueue - --content-type text/pl
 ./target/release/stowq inspect myqueue <job_id>
 ```
 
-The v1 CLI is memory-backed per invocation with a local snapshot; the
-S3-compatible backend for R2 and MinIO arrives with the conformance
-program.
+The CLI's default store is memory-backed per invocation with a local
+snapshot; the S3-compatible backend (used by the conformance suite)
+attaches through `stowq-store-s3`.
+
+## Conformance
+
+The conformance suite in `stowq-store-s3` runs the primitive
+certification and the full queue lifecycle against any endpoint:
+
+```sh
+STOWQ_CONFORMANCE_ENDPOINT=http://localhost:9000 \
+  AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=... \
+  cargo test -p stowq-store-s3 --features conformance
+```
+
+A store enters `spec/store-profiles.md` after a passing run.
 
 ## License
 
