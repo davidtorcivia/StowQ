@@ -1364,3 +1364,38 @@ fn gc_orphan_pass_propagates_head_errors() {
     // proven with a clean read.
     assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).len(), 1);
 }
+
+#[test]
+fn enqueue_caps_inline_at_the_queues_format_limit() {
+    // The client's setting is an upper bound request; the queue's
+    // FORMAT inline_limit is the contract. A 64 KiB-capable client on
+    // a queue declaring 8 bytes must detach anything larger.
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.max_inline_payload = 65_536;
+    let mut f = format();
+    f.inline_limit = 8;
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &f).unwrap();
+    let mut budget = OpBudget::new(64);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([22; 16]),
+                payload: b"0123456789",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    // The payload went detached despite the client's 64 KiB setting.
+    assert_eq!(
+        list_all(&q, &format!("q/payloads/{jhex}/")).len(),
+        1,
+        "payload must detach above the FORMAT inline_limit"
+    );
+}
