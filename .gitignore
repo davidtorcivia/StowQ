@@ -2,6 +2,9 @@
 stowq-spec.md
 stowq-implementation.md
 HANDOFF.md
+stowq-worker-design.md
+stowq-v11-quarantine-proposal.md
+stowq-decisions.md
 
 # Secrets
 .stowq-r2-env

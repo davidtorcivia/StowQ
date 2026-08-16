@@ -1399,3 +1399,339 @@ fn enqueue_caps_inline_at_the_queues_format_limit() {
         "payload must detach above the FORMAT inline_limit"
     );
 }
+
+// ---------- Deep admissibility audit ----------
+
+#[test]
+fn repair_audits_a_legitimate_deep_chain_clean() {
+    // The false-positive guard: claim -> renew -> expiry takeover ->
+    // renew, all through the real paths, must produce zero findings —
+    // every writer-encoded basis and custody token audited against the
+    // store-time record.
+    let q = make_queue();
+    let mut budget = OpBudget::new(512);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([23; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 5,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(first) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).unwrap() else {
+        panic!("renew")
+    };
+    // Expiry takeover by a fresh floor past second's lease.
+    let later = second.claim_store_time_ns + 2_000;
+    let stowq_core::ClaimOutcome::Claimed(third) =
+        q.claim(&claim_opts(later, 1_000), &mut budget).unwrap()
+    else {
+        panic!("takeover")
+    };
+    let stowq_core::RenewOutcome::Renewed(fourth) = q.renew(&third, &mut budget).unwrap() else {
+        panic!("renew 2")
+    };
+    assert_eq!(fourth.generation, 4);
+    let (report, _) = repair_all(&q);
+    assert!(
+        report.findings.is_empty(),
+        "legitimate chain audited dirty: {:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn repair_flags_forged_continuation_token() {
+    // A continuation whose prev_token does not match the previous
+    // generation: inadmissible custody. The old tail-only check never
+    // saw this (the tail was a continuation, not a takeover).
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([24; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let stowq_core::ClaimOutcome::Claimed(first) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    // A forged renewal: correct worker shape, wrong custody token.
+    use sha2::Digest as _;
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    let rel = format!("q/claims/0000/{jhex}/00000002");
+    let tag = stowq_keys::key_tag(&[1; 16], rel.trim_start_matches("q/"));
+    let forged = stowq_format::Record::Claim(stowq_format::ClaimRecord {
+        job_id,
+        generation: 2,
+        attempt: first.attempt,
+        worker_id: "worker-1".into(),
+        worker_token: [7; 16],
+        lease_duration_ns: 1_000,
+        continuation: true,
+        basis: None,
+        prev_token: Some([8; 16]), // not generation 1's token
+    });
+    let body = bytes::Bytes::from(stowq_format::encode(&forged, &[1; 16], &tag));
+    let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
+    q.store()
+        .put_if_absent(&Key::new(rel), body, digest)
+        .unwrap();
+    let (report, _) = repair_all(&q);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::InadmissibleClaim && f.reason == 0x0010),
+        "findings: {:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn repair_flags_watermark_inequality_in_basis() {
+    // A takeover whose basis names the correct previous store time and
+    // duration, but claims an observed watermark BEFORE that lease
+    // expired: inadmissible takeover evidence.
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([25; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let stowq_core::ClaimOutcome::Claimed(first) =
+        q.claim(&claim_opts(0, 60_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    use sha2::Digest as _;
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    let rel = format!("q/claims/0000/{jhex}/00000002");
+    let tag = stowq_keys::key_tag(&[1; 16], rel.trim_start_matches("q/"));
+    let forged = stowq_format::Record::Claim(stowq_format::ClaimRecord {
+        job_id,
+        generation: 2,
+        attempt: 2,
+        worker_id: "rogue".into(),
+        worker_token: [9; 16],
+        lease_duration_ns: 60_000,
+        continuation: false,
+        basis: Some(stowq_format::ClaimBasis {
+            prev_store_time_ns: first.claim_store_time_ns, // correct
+            prev_duration_ns: 60_000,                      // correct
+            observed_watermark_ns: first.claim_store_time_ns + 1, // before expiry
+        }),
+        prev_token: None,
+    });
+    let body = bytes::Bytes::from(stowq_format::encode(&forged, &[1; 16], &tag));
+    let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
+    q.store()
+        .put_if_absent(&Key::new(rel), body, digest)
+        .unwrap();
+    let (report, _) = repair_all(&q);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::InadmissibleClaim),
+        "findings: {:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn repair_flags_generation_gap() {
+    // A foreign delete of a middle generation leaves a gap: an
+    // impossible state the audit must name.
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([26; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 5,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(first) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).unwrap() else {
+        panic!("renew")
+    };
+    let later = second.claim_store_time_ns + 2_000;
+    let stowq_core::ClaimOutcome::Claimed(third) =
+        q.claim(&claim_opts(later, 1_000), &mut budget).unwrap()
+    else {
+        panic!("takeover")
+    };
+    assert_eq!(third.generation, 3);
+    let jhex: String = third.job_id.iter().map(|b| format!("{b:02x}")).collect();
+    q.store()
+        .delete(&Key::new(format!("q/claims/0000/{jhex}/00000002")))
+        .unwrap();
+    let (report, _) = repair_all(&q);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::ChainGap && f.reason == 0x0010),
+        "findings: {:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn repair_flags_headless_chain() {
+    // Foreign delete of generation 1: the chain's first listed
+    // generation is not 1 — the head branch of the gap check, distinct
+    // from the mid-chain windows branch.
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([27; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 5,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(first) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).unwrap() else {
+        panic!("renew")
+    };
+    let jhex: String = second.job_id.iter().map(|b| format!("{b:02x}")).collect();
+    q.store()
+        .delete(&Key::new(format!("q/claims/0000/{jhex}/00000001")))
+        .unwrap();
+    let (report, _) = repair_all(&q);
+    let head = report
+        .findings
+        .iter()
+        .find(|f| f.kind == RK::ChainGap)
+        .expect("head gap must be flagged");
+    assert!(
+        head.key.ends_with("/00000002"),
+        "keyed at the head: {}",
+        head.key
+    );
+    // The remaining 2..=2 chain is otherwise sound: continuation
+    // evidence still matches, no InadmissibleClaim.
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::InadmissibleClaim),
+        "findings: {:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn repair_audits_around_a_corrupt_middle_generation() {
+    // An undecodable middle record must not produce spurious
+    // inadmissibility on its neighbors: the evidence check skips
+    // pairs with an undecoded side, and the chain audits around the
+    // corruption (the corrupt record itself is a RecordCorrupt
+    // finding).
+    let q = make_queue();
+    let mut budget = OpBudget::new(256);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([28; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 5,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(first) =
+        q.claim(&claim_opts(0, 1_000), &mut budget).unwrap()
+    else {
+        panic!("claim")
+    };
+    let stowq_core::RenewOutcome::Renewed(second) = q.renew(&first, &mut budget).unwrap() else {
+        panic!("renew")
+    };
+    let later = second.claim_store_time_ns + 2_000;
+    let stowq_core::ClaimOutcome::Claimed(third) =
+        q.claim(&claim_opts(later, 1_000), &mut budget).unwrap()
+    else {
+        panic!("takeover")
+    };
+    assert_eq!(third.generation, 3);
+    let jhex: String = third.job_id.iter().map(|b| format!("{b:02x}")).collect();
+    // Corrupt generation 2's body in place: delete, then write garbage
+    // with a self-consistent digest (the store verifies PUT digests).
+    let k = Key::new(format!("q/claims/0000/{jhex}/00000002"));
+    q.store().delete(&k).unwrap();
+    use sha2::Digest as _;
+    let junk = bytes::Bytes::from_static(b"garbage-not-a-record");
+    let digest: [u8; 32] = sha2::Sha256::digest(&junk).into();
+    q.store().put_if_absent(&k, junk, digest).unwrap();
+    let (report, _) = repair_all(&q);
+    // The corruption is named...
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::RecordCorrupt && f.key.ends_with("/00000002")),
+        "findings: {:?}",
+        report.findings
+    );
+    // ...and nothing spurious fires around it: the takeover at
+    // generation 3 has an undecoded predecessor, so its evidence is
+    // skipped, not judged.
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind == RK::InadmissibleClaim),
+        "findings: {:?}",
+        report.findings
+    );
+}
