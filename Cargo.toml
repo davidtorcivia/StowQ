@@ -8,6 +8,7 @@ members = [
     "crates/stowq-core",
     "crates/stowq-testkit",
     "crates/stowq-cli",
+    "crates/stowq-store-s3",
 ]
 
 [workspace.package]
@@ -27,3 +28,4 @@ stowq-keys = { path = "crates/stowq-keys" }
 stowq-math = { path = "crates/stowq-math" }
 stowq-store = { path = "crates/stowq-store" }
 stowq-core = { path = "crates/stowq-core" }
+stowq-testkit = { path = "crates/stowq-testkit" }

@@ -1,0 +1,28 @@
+[package]
+name = "stowq-store-s3"
+description = "S3-compatible ObjectStore backend for R2, S3, and MinIO"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+stowq-store.workspace = true
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "default-https-client"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-credential-types = "1"
+bytes.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[features]
+conformance = []
+
+[dev-dependencies]
+stowq-testkit.workspace = true
+stowq-core.workspace = true
+stowq-format.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
