@@ -23,7 +23,8 @@ Experimental. Do not use it for workloads where job loss would cause harm.
 The protocol and its Rust implementation are complete and continuously
 verified: unit and fault-injection suites, an equivalence-checked state
 machine, TLA+ models of the claim and terminal paths, fuzzing, and a
-live-store conformance suite (MinIO certified; see `spec/store-profiles.md`).
+live-store conformance suite (Cloudflare R2 and MinIO certified; see
+`spec/store-profiles.md`).
 
 ## Specification
 
