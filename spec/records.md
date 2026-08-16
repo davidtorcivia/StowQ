@@ -112,7 +112,8 @@ its job names the job key with the chain tail's store time; an
 inadmissible claim names the offending claim; a duplicate terminal
 pair names the `receipts/` key with the receipt's store time; a chain
 gap names the missing generation's key with the predecessor's store
-time; a missing referenced payload (0x0014) names the payload key with
+time (a head gap — no predecessor — uses the head entry's own store
+time); a missing referenced payload (0x0014) names the payload key with
 the referencing job record's store time.
 
 Quarantine records are never collected by GC. A finding that is
