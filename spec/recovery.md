@@ -56,9 +56,10 @@ automatically.
   claim path's authoritative scan under the two-plane rule. The
   takeover-or-doorbell wording above describes the timely variant, not
   the only conforming one.
-- Orphan-payload collection past the enqueue horizon is required
-  before the retention story is complete; implementations may defer it
-  while payloads remain amortized storage cost only.
+- Orphan-payload collection past the enqueue horizon is implemented
+  by the reference implementation (gc takes the horizon; a payload
+  whose job record is absent and whose store time predates
+  `now - horizon` is deleted). This erratum is resolved.
 - Terminal mutual exclusion has a check-then-act window: ack and bury
   write different keys, both put-if-absent, so no store primitive can
   arbitrate between them. The pre-write terminal checks in each path

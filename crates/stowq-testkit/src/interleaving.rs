@@ -450,14 +450,16 @@ mod tests {
             ClaimOutcome::Empty => panic!("claim"),
         };
         // GC first: the job is not terminal, so nothing is deleted.
-        let report = qg.gc(a.claim_store_time_ns + 100, 1_000, &mut b).unwrap();
+        let report = qg
+            .gc(a.claim_store_time_ns + 100, 1_000, 60_000_000_000, &mut b)
+            .unwrap();
         assert_eq!(report.jobs_deleted, 0, "non-terminal job must not be GC'd");
         // The late ack then succeeds normally.
         let out = qa.ack(&a, &mut b).unwrap();
         assert_eq!(out, AckOutcome::Acked);
         // A subsequent GC past retention deletes the graph; the
         // claimant is gone with it.
-        let report = qg.gc(u64::MAX / 4, 1_000, &mut b).unwrap();
+        let report = qg.gc(u64::MAX / 4, 1_000, 1_000, &mut b).unwrap();
         assert_eq!(report.jobs_deleted, 1);
         check_invariants(&qa, 1, 0);
     }

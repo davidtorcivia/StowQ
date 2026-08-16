@@ -73,6 +73,8 @@ enum Command {
         queue: String,
         #[arg(long, default_value_t = 86_400_000_000_000)]
         retention_ns: u64,
+        #[arg(long, default_value_t = 300_000_000_000)]
+        orphan_horizon_ns: u64,
     },
     /// Print a job's object graph.
     Inspect { queue: String, job_id: String },
@@ -267,13 +269,19 @@ fn run(command: Command) -> Result<(), String> {
         Command::Gc {
             queue,
             retention_ns,
+            orphan_horizon_ns,
         } => {
             let (q, store) = open(&queue)?;
             let floor = q
                 .establish_floor(&mut OpBudget::new(16))
                 .map_err(|e| e.to_string())?;
             let report = q
-                .gc(floor, retention_ns, &mut OpBudget::new(4096))
+                .gc(
+                    floor,
+                    retention_ns,
+                    orphan_horizon_ns,
+                    &mut OpBudget::new(4096),
+                )
                 .map_err(|e| e.to_string())?;
             println!(
                 "{} jobs deleted, {} beacons collected",

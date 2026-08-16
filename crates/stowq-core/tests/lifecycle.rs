@@ -612,7 +612,12 @@ fn gc_deletes_terminal_graphs_and_honors_retention() {
 
     // Within retention: nothing deleted.
     let report = q
-        .gc(claim.claim_store_time_ns + 100, 1_000_000, &mut budget)
+        .gc(
+            claim.claim_store_time_ns + 100,
+            1_000_000,
+            60_000_000_000,
+            &mut budget,
+        )
         .unwrap();
     assert_eq!(report.jobs_deleted, 0);
     let jhex: String = claim.job_id.iter().map(|b| format!("{b:02x}")).collect();
@@ -622,7 +627,7 @@ fn gc_deletes_terminal_graphs_and_honors_retention() {
         .is_ok());
 
     // Past retention: the whole graph goes, terminal last.
-    let report = q.gc(u64::MAX / 4, 1_000, &mut budget).unwrap();
+    let report = q.gc(u64::MAX / 4, 1_000, 1_000, &mut budget).unwrap();
     assert_eq!(report.jobs_deleted, 1);
     assert!(q
         .store()
@@ -720,7 +725,7 @@ fn gc_interruption_leaves_terminal_record_last() {
         q.ack(&claim, &mut budget).unwrap();
 
         let mut small = OpBudget::new(trial);
-        let _ = q.gc(u64::MAX / 4, 1_000, &mut small);
+        let _ = q.gc(u64::MAX / 4, 1_000, 1_000, &mut small);
         let receipt = q.store().head(&Key::new(format!("q/receipts/0000/{jhex}")));
         if receipt.is_err() {
             // Deletion completed on this trial: the terminal record is
@@ -1214,4 +1219,148 @@ fn repair_terminates_across_the_full_shard_space() {
     let (report, resume) = q.repair_scan(65_530, &mut OpBudget::new(512)).unwrap();
     assert_eq!(report.shards_scanned, 6);
     assert!(resume.is_none());
+}
+
+#[test]
+fn gc_collects_orphan_payload_past_horizon() {
+    // The crash window between payload PUT and job-record PUT leaves a
+    // payload with no referencing job record (job record deleted here
+    // to simulate; the payload was written first by enqueue).
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.max_inline_payload = 4;
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format()).unwrap();
+    let mut budget = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([19; 16]),
+                payload: b"detached-orphan",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    q.store()
+        .delete(&Key::new(format!("q/jobs/0000/{jhex}")))
+        .unwrap();
+    // Before the horizon: kept (the enqueue may still be in flight).
+    // now is the payload's own store time, so nothing is past a
+    // 60-second horizon yet.
+    let payload_time = {
+        let items = list_all(&q, &format!("q/payloads/{jhex}/"));
+        assert_eq!(items.len(), 1);
+        q.store()
+            .head(&Key::new(items[0].clone()))
+            .unwrap()
+            .store_time_ns
+    };
+    let report = q
+        .gc(payload_time + 1_000, 1_000, 60_000_000_000, &mut budget)
+        .unwrap();
+    assert_eq!(report.orphans_deleted, 0);
+    assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).len(), 1);
+    // Past the horizon (horizon 0): the orphan goes.
+    let report = q.gc(u64::MAX / 4, 1_000, 0, &mut budget).unwrap();
+    assert_eq!(report.orphans_deleted, 1);
+    assert!(list_all(&q, &format!("q/payloads/{jhex}/")).is_empty());
+}
+
+#[test]
+fn gc_never_collects_referenced_payloads() {
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.max_inline_payload = 4;
+    let q = Queue::init(Box::new(MemoryStore::new()), "q", &opts, &format()).unwrap();
+    let mut budget = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([20; 16]),
+                payload: b"detached-live",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    // Horizon 0 with the job record present: the payload is referenced.
+    let report = q.gc(u64::MAX / 4, 1_000, 0, &mut budget).unwrap();
+    assert_eq!(report.orphans_deleted, 0);
+    assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).len(), 1);
+}
+
+#[test]
+fn gc_skips_non_parseable_payload_keys_without_collecting() {
+    // A stray object under payloads/ that does not parse is a repair
+    // finding, not an orphan: the pass skips it (no delete) and spends
+    // no HEAD on it, whatever its age.
+    let q = make_queue();
+    use sha2::Digest as _;
+    let junk = Key::new("q/payloads/deadbeef/not-hex");
+    let body = bytes::Bytes::from_static(b"junk");
+    let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
+    q.store().put_if_absent(&junk, body, digest).unwrap();
+    let mut budget = OpBudget::new(256);
+    let report = q.gc(u64::MAX / 4, 1_000, 0, &mut budget).unwrap();
+    assert_eq!(report.orphans_deleted, 0);
+    assert!(
+        q.store().head(&junk).is_ok(),
+        "non-parseable keys are left in place"
+    );
+}
+
+#[test]
+fn gc_orphan_pass_propagates_head_errors() {
+    // The orphan HEAD failing with anything but NotFound aborts gc
+    // loudly rather than treating the error as absence.
+    use stowq_store::{Fault, FaultPlan, Injector, Op};
+    let inner = MemoryStore::new();
+    let injector = Injector::new(
+        inner,
+        vec![FaultPlan::new(Op::Head, Fault::PostTransmit, [0])],
+    );
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.max_inline_payload = 4;
+    let q = Queue::init(Box::new(injector), "q", &opts, &format()).unwrap();
+    let mut budget = OpBudget::new(256);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([21; 16]),
+                payload: b"detached-orphan",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let jhex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    q.store()
+        .delete(&Key::new(format!("q/jobs/0000/{jhex}")))
+        .unwrap();
+    // Now 0 with a zero horizon: the payload is due, the first orphan
+    // HEAD is faulted post-transmit, and gc must surface the unknown
+    // outcome instead of deleting anything.
+    let result = q.gc(u64::MAX / 4, 1_000, 0, &mut OpBudget::new(256));
+    match result {
+        Err(stowq_core::Error::Store(stowq_store::StoreError::OutcomeUnknown(_))) => {}
+        other => panic!("expected OutcomeUnknown, got {other:?}"),
+    }
+    // The payload is untouched: absence of the job record was never
+    // proven with a clean read.
+    assert_eq!(list_all(&q, &format!("q/payloads/{jhex}/")).len(), 1);
 }
