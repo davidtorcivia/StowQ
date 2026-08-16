@@ -1479,7 +1479,71 @@ pub struct GcReport {
     pub beacons_deleted: usize,
 }
 
+/// One repair-scan finding: a violation with its quarantine reason
+/// code (spec reasons.md). Findings are reported to the caller; writing
+/// quarantine objects awaits a v1.1 record-schema decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    pub kind: FindingKind,
+    /// The offending object's absolute key.
+    pub key: String,
+    pub reason: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingKind {
+    /// A key under an authoritative prefix that does not parse.
+    KeyGrammar,
+    /// A record that fails digest, envelope, or field decoding.
+    RecordCorrupt,
+    /// A claim chain whose job record is absent.
+    ClaimWithoutJob,
+    /// A takeover whose basis contradicts the store-time record.
+    InadmissibleClaim,
+    /// Both a receipt and a dead record exist for one job.
+    DuplicateTerminal,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepairReport {
+    pub shards_scanned: u32,
+    pub jobs_scanned: usize,
+    pub claim_chains_scanned: usize,
+    pub indexes_regenerated: usize,
+    pub findings: Vec<Finding>,
+}
+
 impl Queue {
+    /// Repair scan (spec recovery.md): shard-by-shard, regenerate
+    /// missing advisory index entries (`delayed/`, `leases/`, `termidx/`)
+    /// and report grammar, corruption, and impossible-state findings.
+    /// Idempotent and safely concurrent: every regeneration is a
+    /// put-if-absent against an absence just proven by HEAD. Resumable:
+    /// the report's caller persists the returned next-unscanned shard
+    /// as its cursor; a shard's scan leaves no partial state a rerun
+    /// would misread. Stops before the budget runs dry mid-shard.
+    pub fn repair_scan(
+        &self,
+        start_shard: u16,
+        budget: &mut OpBudget,
+    ) -> Result<(RepairReport, Option<u16>), Error> {
+        let shard_count = self.format.shard_count;
+        let mut report = RepairReport::default();
+        // u32 counter: shard_count may be 65536, where a u16 counter
+        // overflows on the final increment.
+        let mut next = start_shard as u32;
+        while next < shard_count {
+            self.repair_shard(next as u16, &mut report, budget)?;
+            report.shards_scanned += 1;
+            next += 1;
+            if budget.max_ops <= 4 {
+                break;
+            }
+        }
+        let resume = (next < shard_count).then_some(next as u16);
+        Ok((report, resume))
+    }
+
     /// Expired-lease sweep (spec recovery.md): walk `leases/<b>/` for
     /// buckets at or below the floor bucket, in ascending order; for
     /// each entry, re-evaluate the authoritative tail and delete the
@@ -1906,6 +1970,303 @@ impl Queue {
         budget.spend()?;
         let _ = self.store.delete(&self.absolute(terminal_rel));
         Ok(true)
+    }
+
+    // ---------- Repair scan ----------
+
+    /// Lists a prefix fully, spending the budget per page.
+    fn list_authoritative(
+        &self,
+        prefix: &str,
+        budget: &mut OpBudget,
+    ) -> Result<Vec<stowq_store::Listing>, Error> {
+        let mut out = Vec::new();
+        let mut after: Option<Key> = None;
+        loop {
+            budget.spend()?;
+            let page = self.store.list(prefix, after.as_ref(), 64)?;
+            if page.items.is_empty() {
+                break;
+            }
+            out.extend(page.items);
+            match page.next_after {
+                Some(k) => after = Some(k),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Ensures an advisory index entry exists: present means done;
+    /// absent means put-if-absent (a racing repairer's identical entry
+    /// is benign). Returns true when the entry was missing.
+    fn ensure_index(&self, idx: &Key, budget: &mut OpBudget) -> Result<bool, Error> {
+        match self.store.head(idx) {
+            Ok(_) => Ok(false),
+            Err(StoreError::NotFound) => {
+                budget.spend()?;
+                let _ = self
+                    .store
+                    .put_if_absent(idx, Bytes::new(), Sha256::digest([]).into());
+                Ok(true)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn repair_shard(
+        &self,
+        shard: u16,
+        report: &mut RepairReport,
+        budget: &mut OpBudget,
+    ) -> Result<(), Error> {
+        use std::collections::{HashMap, HashSet};
+
+        // Jobs: delayed-index regeneration plus decode findings. The
+        // parsed job set cross-references the claim scan below.
+        let mut job_ids: HashSet<[u8; 16]> = HashSet::new();
+        for listing in
+            self.list_authoritative(&format!("{}jobs/{shard:04x}/", self.root), budget)?
+        {
+            report.jobs_scanned += 1;
+            let rel = listing
+                .key
+                .as_str()
+                .strip_prefix(&self.root)
+                .and_then(|s| s.parse().ok());
+            let Some(RelKey::Job { job_id, .. }) = rel else {
+                report.findings.push(Finding {
+                    kind: FindingKind::KeyGrammar,
+                    key: listing.key.0.clone(),
+                    reason: 0x0003,
+                });
+                continue;
+            };
+            job_ids.insert(job_id);
+            let job_rel = RelKey::Job { shard, job_id };
+            match self.store.get(&self.absolute(&job_rel), None) {
+                Ok(obj) => {
+                    let tag = self.tag_for(&job_rel);
+                    match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
+                        Ok(Record::Job(j)) => {
+                            if let Some(nb) = j.not_before_ns {
+                                if let Some(bucket) = stowq_math::bucket_number(
+                                    nb,
+                                    self.format.delayed_bucket_width_ns,
+                                ) {
+                                    let idx = self.absolute(&RelKey::DelayIndex {
+                                        bucket,
+                                        shard,
+                                        job_id,
+                                    });
+                                    if self.ensure_index(&idx, budget)? {
+                                        report.indexes_regenerated += 1;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => report.findings.push(Finding {
+                            kind: FindingKind::RecordCorrupt,
+                            key: listing.key.0.clone(),
+                            reason: 0x0005,
+                        }),
+                        Err(e) => report.findings.push(Finding {
+                            kind: FindingKind::RecordCorrupt,
+                            key: listing.key.0.clone(),
+                            reason: record_violation_reason(&e),
+                        }),
+                    }
+                }
+                // Listed but gone: GC raced between LIST and GET; the
+                // graph is terminal and deleted, nothing to regenerate.
+                Err(StoreError::NotFound) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Claim chains: leases-index regeneration from each tail, plus
+        // basis evidence checked against the listing's store times.
+        let mut chains: HashMap<[u8; 16], Vec<(u64, Meta)>> = HashMap::new();
+        for listing in
+            self.list_authoritative(&format!("{}claims/{shard:04x}/", self.root), budget)?
+        {
+            let rel = listing
+                .key
+                .as_str()
+                .strip_prefix(&self.root)
+                .and_then(|s| s.parse().ok());
+            let Some(RelKey::Claim {
+                job_id, generation, ..
+            }) = rel
+            else {
+                report.findings.push(Finding {
+                    kind: FindingKind::KeyGrammar,
+                    key: listing.key.0.clone(),
+                    reason: 0x0003,
+                });
+                continue;
+            };
+            chains
+                .entry(job_id)
+                .or_default()
+                .push((generation as u64, listing.meta));
+        }
+        for (job_id, mut chain) in chains {
+            report.claim_chains_scanned += 1;
+            if !job_ids.contains(&job_id) {
+                report.findings.push(Finding {
+                    kind: FindingKind::ClaimWithoutJob,
+                    key: self.absolute(&RelKey::Job { shard, job_id }).0.clone(),
+                    reason: 0x0005,
+                });
+            }
+            // Generations are fixed-width hex: listing order is
+            // numeric order, so the last entry is the tail.
+            chain.sort_by_key(|(g, _)| *g);
+            let (tail_gen, tail_meta) = chain.last().expect("chain is nonempty").clone();
+            let tail_rel = RelKey::Claim {
+                shard,
+                job_id,
+                generation: tail_gen as u32,
+            };
+            let duration = match self.store.get(&self.absolute(&tail_rel), None) {
+                Ok(obj) => {
+                    let tag = self.tag_for(&tail_rel);
+                    match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
+                        Ok(Record::Claim(c)) => {
+                            // Basis evidence vs the store-time record:
+                            // a takeover's recorded prev_store_time must
+                            // match the previous generation's actual
+                            // store time (free from the listing).
+                            if !c.continuation {
+                                if let Some(prev) = chain.iter().find(|(g, _)| *g + 1 == tail_gen) {
+                                    if c.basis.as_ref().is_none_or(|b| {
+                                        b.prev_store_time_ns != prev.1.store_time_ns
+                                    }) {
+                                        report.findings.push(Finding {
+                                            kind: FindingKind::InadmissibleClaim,
+                                            key: self.absolute(&tail_rel).0.clone(),
+                                            reason: 0x0010,
+                                        });
+                                    }
+                                }
+                            }
+                            c.lease_duration_ns
+                        }
+                        Ok(_) => {
+                            report.findings.push(Finding {
+                                kind: FindingKind::RecordCorrupt,
+                                key: self.absolute(&tail_rel).0.clone(),
+                                reason: 0x0005,
+                            });
+                            0
+                        }
+                        Err(e) => {
+                            report.findings.push(Finding {
+                                kind: FindingKind::RecordCorrupt,
+                                key: self.absolute(&tail_rel).0.clone(),
+                                reason: record_violation_reason(&e),
+                            });
+                            0
+                        }
+                    }
+                }
+                Err(StoreError::NotFound) => 0,
+                Err(e) => return Err(e.into()),
+            };
+            if let Some(bucket) = stowq_math::bucket_number(
+                tail_meta.store_time_ns.saturating_add(duration),
+                self.format.lease_bucket_width_ns,
+            ) {
+                let idx = self.absolute(&RelKey::LeaseIndex {
+                    bucket,
+                    shard,
+                    job_id,
+                    generation: tail_gen as u32,
+                });
+                if self.ensure_index(&idx, budget)? {
+                    report.indexes_regenerated += 1;
+                }
+            }
+        }
+
+        // Terminals: termidx regeneration plus the receipt-and-dead
+        // mutual-exclusion finding (the check-then-act window's residue;
+        // the repair scan owns it per the recovery errata).
+        let mut receipt_jobs: HashSet<[u8; 16]> = HashSet::new();
+        let mut dead_jobs: HashSet<[u8; 16]> = HashSet::new();
+        for (kind_char, prefix, set) in [
+            (
+                'r',
+                format!("{}receipts/{shard:04x}/", self.root),
+                &mut receipt_jobs,
+            ),
+            (
+                'd',
+                format!("{}dead/{shard:04x}/", self.root),
+                &mut dead_jobs,
+            ),
+        ] {
+            for listing in self.list_authoritative(&prefix, budget)? {
+                let rel = listing
+                    .key
+                    .as_str()
+                    .strip_prefix(&self.root)
+                    .and_then(|s| s.parse().ok());
+                let (job_id, term_kind) = match rel {
+                    Some(RelKey::Receipt { job_id, .. }) => (job_id, stowq_keys::TermKind::Receipt),
+                    Some(RelKey::Dead { job_id, .. }) => (job_id, stowq_keys::TermKind::Dead),
+                    _ => {
+                        report.findings.push(Finding {
+                            kind: FindingKind::KeyGrammar,
+                            key: listing.key.0.clone(),
+                            reason: 0x0003,
+                        });
+                        continue;
+                    }
+                };
+                let _ = kind_char;
+                set.insert(job_id);
+                if let Some(bucket) = stowq_math::bucket_number(
+                    listing.meta.store_time_ns,
+                    self.format.terminal_bucket_width_ns,
+                ) {
+                    let idx = self.absolute(&RelKey::TermIndex {
+                        bucket,
+                        kind: term_kind,
+                        shard,
+                        job_id,
+                    });
+                    if self.ensure_index(&idx, budget)? {
+                        report.indexes_regenerated += 1;
+                    }
+                }
+            }
+        }
+        for job_id in receipt_jobs.intersection(&dead_jobs) {
+            report.findings.push(Finding {
+                kind: FindingKind::DuplicateTerminal,
+                key: self
+                    .absolute(&RelKey::Receipt {
+                        shard,
+                        job_id: *job_id,
+                    })
+                    .0
+                    .clone(),
+                reason: 0x0007,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Maps a decode failure to its quarantine reason code (spec
+/// reasons.md): key-tag failure is distinguishable from digest and
+/// envelope corruption.
+fn record_violation_reason(e: &stowq_format::RecordError) -> u64 {
+    match e {
+        stowq_format::RecordError::Field("queue binding") => 0x0004,
+        _ => 0x0001,
     }
 }
 
