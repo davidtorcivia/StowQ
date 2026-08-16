@@ -229,3 +229,185 @@ fn watermark_unknown_outcome_resolves() {
     let w = q.watermark(&mut budget).unwrap().unwrap();
     assert_eq!(w.highest_observed_wall_bucket, floor / 1_000);
 }
+
+#[test]
+fn detached_payload_unknown_outcome_resolves() {
+    // Put calls: FORMAT(0) during init, payload(1) during enqueue. The
+    // payload write is committed-but-response-lost: enqueue must
+    // resolve by presence (the key embeds the digest) and the payload
+    // must be in place for the claim to deliver.
+    let injector = Injector::new(
+        MemoryStore::new(),
+        vec![FaultPlan::new(
+            Op::PutIfAbsent,
+            Fault::PostTransmitAfter,
+            [1],
+        )],
+    );
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.max_inline_payload = 4;
+    let q = Queue::init(Box::new(injector), "q", &opts, &format()).unwrap();
+    let mut budget = OpBudget::new(64);
+    let out = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([3; 16]),
+                payload: b"detached-payload",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap();
+    assert!(matches!(out, EnqueueOutcome::Committed { .. }));
+    let jhex: String = (0..16).map(|_| "03").collect::<String>();
+    let page = q
+        .store()
+        .list(&format!("q/payloads/{jhex}/"), None, 10)
+        .unwrap();
+    assert!(
+        !page.items.is_empty(),
+        "resolved payload write must be present"
+    );
+}
+
+#[test]
+fn head_unknown_during_payload_resolution_retries() {
+    // The payload put (call 1) is committed-but-response-lost; the
+    // resolution head (call 0) itself returns outcome-unknown. Reads
+    // have no side effects, so the probe retries and the enqueue
+    // resolves instead of leaking the unknown.
+    let injector = Injector::new(
+        MemoryStore::new(),
+        vec![
+            FaultPlan::new(Op::PutIfAbsent, Fault::PostTransmitAfter, [1]),
+            FaultPlan::new(Op::Head, Fault::PostTransmit, [0]),
+        ],
+    );
+    let mut opts = OpenOptions::new([1; 16]);
+    opts.max_inline_payload = 4;
+    let q = Queue::init(Box::new(injector), "q", &opts, &format()).unwrap();
+    let mut budget = OpBudget::new(64);
+    let out = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([3; 16]),
+                payload: b"detached-payload",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .unwrap();
+    assert!(matches!(out, EnqueueOutcome::Committed { .. }));
+}
+
+#[test]
+fn read_unknown_during_reack_verification_retries() {
+    // A committed receipt, then a re-ack whose verification GET (Get
+    // call 2, after the FORMAT and job-record reads) returns
+    // outcome-unknown: the retry reads the receipt and verifies as
+    // AlreadyAcked.
+    let injector = Injector::new(
+        MemoryStore::new(),
+        vec![FaultPlan::new(Op::Get, Fault::PostTransmit, [2])],
+    );
+    let q = Queue::init(
+        Box::new(injector),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .unwrap();
+    let mut budget = OpBudget::new(128);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([6; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(claim) = q
+        .claim(
+            &ClaimOptions {
+                shard: 0,
+                floor_ns: 0,
+                lease_duration_ns: 60_000_000_000,
+            },
+            &mut budget,
+        )
+        .unwrap()
+    else {
+        panic!("claim")
+    };
+    assert_eq!(
+        q.ack(&claim, &mut budget).unwrap(),
+        stowq_core::AckOutcome::Acked
+    );
+    assert_eq!(
+        q.ack(&claim, &mut budget).unwrap(),
+        stowq_core::AckOutcome::AlreadyAcked
+    );
+}
+
+#[test]
+fn watermark_resolution_read_unknown_retries() {
+    // The watermark create (Put call 2) is committed-but-response-lost;
+    // the resolution read that follows (Get call 3, after open's FORMAT
+    // read, establish_floor's watermark check, and the CAS loop's own
+    // initial read) itself returns outcome-unknown: the retry reads the
+    // committed watermark, coverage resolves, and no unknown escapes.
+    let injector = Injector::new(
+        MemoryStore::new(),
+        vec![
+            FaultPlan::new(Op::PutIfAbsent, Fault::PostTransmitAfter, [2]),
+            FaultPlan::new(Op::Get, Fault::PostTransmit, [3]),
+        ],
+    );
+    let q = Queue::init(
+        Box::new(injector),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .unwrap();
+    let mut budget = OpBudget::new(64);
+    let floor = q.establish_floor(&mut budget).unwrap();
+    q.advance_watermark(floor, &mut budget).unwrap();
+    let w = q.watermark(&mut budget).unwrap().unwrap();
+    assert_eq!(w.highest_observed_wall_bucket, floor / 1_000);
+}
+
+#[test]
+fn init_rejected_branch_read_unknown_retries() {
+    // An identical FORMAT already owns the prefix (init by another
+    // participant): the put rejects and init reads the existing record
+    // back to compare. That read (Get call 0) returns outcome-unknown;
+    // the retry reads it, the records compare equal, and open proceeds.
+    let inner = MemoryStore::new();
+    let pre = Queue::init(
+        Box::new(inner.clone()),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .unwrap();
+    drop(pre);
+    let injector = Injector::new(
+        inner,
+        vec![FaultPlan::new(Op::Get, Fault::PostTransmit, [0])],
+    );
+    Queue::init(
+        Box::new(injector),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .unwrap();
+}

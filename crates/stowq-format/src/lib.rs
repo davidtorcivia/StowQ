@@ -154,6 +154,30 @@ pub struct FormatRecord {
     pub required_feature_bits: u64,
 }
 
+impl FormatRecord {
+    /// V1 protocol constraints (spec namespace.md, records.md): the
+    /// shard count is a power of two bounded by the 4-hex shard field,
+    /// bucket widths are nonzero (they are divisors), and no unknown
+    /// required features may be demanded. Queue open and init reject a
+    /// record that fails this.
+    pub fn validate(&self) -> Result<(), RecordError> {
+        if self.shard_count == 0 || !self.shard_count.is_power_of_two() || self.shard_count > 65_536
+        {
+            return Err(RecordError::Field("shard_count"));
+        }
+        if self.lease_bucket_width_ns == 0
+            || self.delayed_bucket_width_ns == 0
+            || self.terminal_bucket_width_ns == 0
+        {
+            return Err(RecordError::Field("bucket width"));
+        }
+        if self.required_feature_bits != 0 {
+            return Err(RecordError::Field("required_feature_bits"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRecord {
     pub job_id: [u8; 16],
@@ -361,8 +385,14 @@ impl Record {
                         "required_feature_bits",
                     ],
                 )?;
+                let shard_count = get_u64(m, "shard_count")?;
+                // The shard field is 4 hex digits; reject rather than
+                // silently truncate a wider value.
+                if shard_count > 65_536 {
+                    return Err(RecordError::Field("shard_count"));
+                }
                 Record::Format(FormatRecord {
-                    shard_count: get_u64(m, "shard_count")? as u32,
+                    shard_count: shard_count as u32,
                     lease_bucket_width_ns: get_u64(m, "lease_bucket_width_ns")?,
                     delayed_bucket_width_ns: get_u64(m, "delayed_bucket_width_ns")?,
                     terminal_bucket_width_ns: get_u64(m, "terminal_bucket_width_ns")?,
@@ -1011,5 +1041,117 @@ mod tests {
         out.push(32);
         out.extend_from_slice(&digest);
         assert_eq!(decode(&out, &Q, &TAG), Err(RecordError::Version(2, 0)));
+    }
+
+    fn base_format() -> FormatRecord {
+        FormatRecord {
+            shard_count: 256,
+            lease_bucket_width_ns: 1_000,
+            delayed_bucket_width_ns: 1_000,
+            terminal_bucket_width_ns: 1_000,
+            inline_limit: 4_096,
+            required_feature_bits: 0,
+        }
+    }
+
+    #[test]
+    fn format_validate_rejects_bad_shard_counts() {
+        assert!(base_format().validate().is_ok());
+        assert!(FormatRecord {
+            shard_count: 1,
+            ..base_format()
+        }
+        .validate()
+        .is_ok());
+        assert!(FormatRecord {
+            shard_count: 65_536,
+            ..base_format()
+        }
+        .validate()
+        .is_ok());
+        // Zero, non-powers of two, and anything past the 4-hex shard
+        // field are all invalid.
+        for bad in [0u32, 3, 100, 65_537] {
+            assert_eq!(
+                FormatRecord {
+                    shard_count: bad,
+                    ..base_format()
+                }
+                .validate(),
+                Err(RecordError::Field("shard_count")),
+                "shard_count {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_validate_rejects_zero_widths_and_unknown_features() {
+        for width_field in [
+            "lease_bucket_width_ns",
+            "delayed_bucket_width_ns",
+            "terminal_bucket_width_ns",
+        ] {
+            let mut f = base_format();
+            match width_field {
+                "lease_bucket_width_ns" => f.lease_bucket_width_ns = 0,
+                "delayed_bucket_width_ns" => f.delayed_bucket_width_ns = 0,
+                _ => f.terminal_bucket_width_ns = 0,
+            }
+            assert_eq!(
+                f.validate(),
+                Err(RecordError::Field("bucket width")),
+                "{width_field} = 0 must fail validate"
+            );
+        }
+        assert_eq!(
+            FormatRecord {
+                required_feature_bits: 1,
+                ..base_format()
+            }
+            .validate(),
+            Err(RecordError::Field("required_feature_bits"))
+        );
+    }
+
+    #[test]
+    fn format_decode_rejects_shard_count_past_field_width() {
+        // A digest-valid FORMAT record with shard_count 65_537: decode
+        // must reject rather than truncate the u64 to u32.
+        let fields = vec![
+            (Value::Text("shard_count".into()), Value::Uint(65_537)),
+            (
+                Value::Text("lease_bucket_width_ns".into()),
+                Value::Uint(1_000),
+            ),
+            (
+                Value::Text("delayed_bucket_width_ns".into()),
+                Value::Uint(1_000),
+            ),
+            (
+                Value::Text("terminal_bucket_width_ns".into()),
+                Value::Uint(1_000),
+            ),
+            (Value::Text("inline_limit".into()), Value::Uint(4_096)),
+            (Value::Text("required_feature_bits".into()), Value::Uint(0)),
+        ];
+        let body = Value::Array(vec![
+            Value::Uint(MAGIC),
+            Value::Uint(MAJOR),
+            Value::Uint(MINOR),
+            Value::Bytes(Q.to_vec()),
+            Value::Bytes(TAG.to_vec()),
+            Value::Uint(1),
+            Value::Map(fields),
+        ]);
+        let body_bytes = cbor::encode(&body);
+        let digest = record_digest("format", &body_bytes);
+        let mut out = body_bytes;
+        out.push(0x58);
+        out.push(32);
+        out.extend_from_slice(&digest);
+        assert_eq!(
+            decode(&out, &Q, &TAG),
+            Err(RecordError::Field("shard_count"))
+        );
     }
 }

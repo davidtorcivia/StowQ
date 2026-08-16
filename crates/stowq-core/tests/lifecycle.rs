@@ -813,3 +813,78 @@ fn tail_holder_bury_after_exhaustion_dead_verifies() {
     let bury = q.bury(&claim, 0x0003, &mut budget).unwrap();
     assert_eq!(bury, stowq_core::BuryOutcome::Buried);
 }
+
+#[test]
+fn init_rejects_non_power_of_two_shard_count() {
+    let mut f = format();
+    f.shard_count = 100;
+    let result = Queue::init(
+        Box::new(MemoryStore::new()),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &f,
+    );
+    match result {
+        Err(Error::Record(_)) => {}
+        Err(other) => panic!("expected Record error, got {other:?}"),
+        Ok(_) => panic!("expected a Record error, got success"),
+    }
+    // Bounds are powers of two and accepted.
+    f.shard_count = 65_536;
+    Queue::init(
+        Box::new(MemoryStore::new()),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &f,
+    )
+    .unwrap();
+}
+
+#[test]
+fn open_rejects_format_with_unknown_required_features() {
+    use sha2::{Digest as _, Sha256};
+    use stowq_store::ObjectStore as _;
+
+    let store = MemoryStore::new();
+    let mut f = format();
+    f.required_feature_bits = 1;
+    // Write the record directly, bypassing init's validation: open must
+    // reject a v1 store whose FORMAT demands unknown features.
+    let tag = stowq_keys::key_tag(&[1; 16], "meta/FORMAT");
+    let body = bytes::Bytes::from(stowq_format::encode(
+        &stowq_format::Record::Format(f),
+        &[1; 16],
+        &tag,
+    ));
+    let digest: [u8; 32] = Sha256::digest(&body).into();
+    store
+        .put_if_absent(&Key::new("q/meta/FORMAT"), body, digest)
+        .unwrap();
+    let result = Queue::open(Box::new(store), "q", OpenOptions::new([1; 16]));
+    match result {
+        Err(Error::Record(_)) => {}
+        Err(other) => panic!("expected Record error, got {other:?}"),
+        Ok(_) => panic!("expected a Record error, got success"),
+    }
+}
+
+#[test]
+fn enqueue_rejects_zero_maximum_attempts() {
+    let q = make_queue();
+    let mut budget = OpBudget::new(64);
+    let result = q.enqueue(
+        EnqueueInput {
+            job_id: None,
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 0,
+            not_before_ns: None,
+        },
+        &mut budget,
+    );
+    match result {
+        Err(Error::Record(_)) => {}
+        Err(other) => panic!("expected Record error, got {other:?}"),
+        Ok(_) => panic!("expected a Record error, got success"),
+    }
+}
