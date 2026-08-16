@@ -42,7 +42,7 @@ conformance run against a named endpoint and version.
 
 | Store | P1 | P2 | P3/P4 | P6 | G | Surface | Notes |
 | ------- | ---- | ---- | ------- | ---- | --- | --------- | ------- |
-| Cloudflare R2 | `If-None-Match: *` | `If-Match: <etag>` | strong | yes | 1 ms (LIST) / 1 s (HEAD) | LIST | Primary target. |
+| Cloudflare R2 | `If-None-Match: *` | `If-Match: <etag>` | strong | yes | 1 ms (LIST) / 1 s (HEAD) | LIST | Certified 2026-08-16 by the conformance suite (4/4). See the R2 note. |
 | Amazon S3 | `If-None-Match: *` (2024-08) | `If-Match` on PUT (2024-11) | strong (2020+) | yes | 1 s | LIST or HEAD | |
 | Google GCS | `x-goog-if-generation-match: 0` | generation-match | strong | yes | 1 ms | `updated` | Generations are native fencing. |
 | Azure Blob | `If-None-Match: *` | `If-Match` | strong | yes | 1 s | LIST or HEAD | |
@@ -58,3 +58,23 @@ profile until certified.
 On R2, additional checksums are composite-only (`FULL_OBJECT` is CRC64NVME),
 so P7 is satisfied by verification on read-back; `x-amz-checksum-sha256` is
 a best-effort adjunct, not a correctness dependency.
+
+R2 certification notes (2026-08-16, suite 4/4 green):
+
+- Certification also fixed a backend bug invisible to the MinIO lane:
+  ranged GETs of checksummed objects failed because the SDK's default
+  response-checksum validation hashes the partial 206 body against the
+  full-object checksum the store returns (S3 proper behaves the same;
+  MinIO ignores checksum-mode on ranged reads). The backend disables
+  automatic checksum behavior; the explicit per-PUT checksum remains,
+  and P7 stays digest-on-read-back. The suite's ranged matrix is the
+  pin for this — note it only bites on stores that answer checksum-mode
+  (R2, S3), so the live certification run, not CI, is the regression
+  gate for that configuration.
+- Measured: same-key LIST-vs-HEAD divergence 0 ns, max cross-write
+  store-time regression 0 ns over 16 beacons (single sequential client;
+  guard floor 1 s per the profile granularity).
+- Measured: inline enqueue+deliver beat detached at every size through
+  256 KiB (1.14x-1.39x at WAN latency); the remote crossover is above
+  256 KiB, where localhost MinIO crossed near 16 KiB. Round trips
+  dominate; the inline default's sizing is a remote-store question.
