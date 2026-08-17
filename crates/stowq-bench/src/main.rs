@@ -168,7 +168,15 @@ impl<S: ObjectStore> ObjectStore for CountingStore<S> {
 
 fn format() -> FormatRecord {
     FormatRecord {
-        shard_count: 1,
+        // Spread shards so concurrent bench processes parallelize like
+        // real workers; a single shard serializes every claimant onto
+        // one index page and measures contention, not the queue.
+        // STOWQ_BENCH_SHARDS=1 reproduces the pre-sharding shape for
+        // single-shard A/B comparisons.
+        shard_count: std::env::var("STOWQ_BENCH_SHARDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16),
         lease_bucket_width_ns: 1_000_000_000,
         delayed_bucket_width_ns: 1_000_000_000,
         terminal_bucket_width_ns: 1_000_000_000,
@@ -436,10 +444,16 @@ async fn one_cycle(q: &Queue, floor: u64, i: usize, b: &mut OpBudget) -> Result<
     else {
         return Err("enqueue rejected".into());
     };
-    let ClaimOutcome::Claimed(c) = q
+    // The well-hinted worker shape: a doorbell names the shard, and
+    // the bench knows each job's id, so it claims the computed shard
+    // directly — one probe, no empty-shard scanning (what the probe
+    // loop costs is precisely what doorbell hints exist to avoid).
+    let id = (i as u128).to_be_bytes();
+    let shard = stowq_keys::compute_shard(&[1; 16], &id, q.format().shard_count);
+    let c = match q
         .claim(
             &ClaimOptions {
-                shard: 0,
+                shard,
                 floor_ns: floor,
                 lease_duration_ns: 60_000_000_000,
             },
@@ -447,8 +461,9 @@ async fn one_cycle(q: &Queue, floor: u64, i: usize, b: &mut OpBudget) -> Result<
         )
         .await
         .map_err(|e| e.to_string())?
-    else {
-        return Ok(()); // a prior cycle's lease may still nominally hold
+    {
+        ClaimOutcome::Claimed(c) => c,
+        ClaimOutcome::Empty => return Ok(()), // a prior cycle's lease may still nominally hold
     };
     q.ack(&c, b).await.map_err(|e| e.to_string())?;
     Ok(())

@@ -2629,20 +2629,21 @@ async fn terminal_backlog_scan_is_memoized_per_handle() {
     // Memoization is lazy (proves on first post-terminal encounter):
     // jobs 0-3 were encountered during earlier claim rounds and
     // contribute zero heads now; job 4 (claimed then acked last) meets
-    // its first scan here and pays its single receipt probe. The live
-    // job pays its terminal probes (receipt + dead) plus the
-    // claims-tail head — all winner machinery, not backlog cost.
+    // its first scan here and pays its receipt+dead probes — the
+    // concurrent gather runs both where the sequential code
+    // short-circuited after the receipt hit. The live job pays its
+    // terminal probes plus the claims-tail head — winner machinery.
     for (i, d) in delta_since(&counts, &before).into_iter().enumerate() {
         let expect = if i < 4 {
             0
         } else if i == 4 {
-            1
+            2
         } else {
             3
         };
         assert_eq!(
             d, expect,
-            "job {i}: at most one terminal head per handle, amortized"
+            "job {i}: terminal heads vanish after the memoizing encounter"
         );
     }
 
@@ -2655,10 +2656,10 @@ async fn terminal_backlog_scan_is_memoized_per_handle() {
         Ok(ClaimOutcome::Empty)
     ));
     // NOTE: [AA] went claimed -> acked without a scan encounter, so
-    // this scan lazily memoizes it: exactly one receipt head, then the
-    // rest zero.
+    // this scan lazily memoizes it: its receipt+dead probes (the
+    // concurrent gather runs both), then zero forever after.
     for (i, d) in delta_since(&counts, &before).into_iter().enumerate() {
-        let expect = if i < 5 { 0 } else { 1 };
+        let expect = if i < 5 { 0 } else { 2 };
         assert_eq!(d, expect, "job {i}: lazy memoization pays once, then zero");
     }
 
@@ -2680,16 +2681,20 @@ async fn terminal_backlog_scan_is_memoized_per_handle() {
         fresh.claim(&claim_opts(0, 60_000_000_000), &mut b).await,
         Ok(ClaimOutcome::Empty)
     ));
-    // Fresh handle, cold memo: every terminal job pays its receipt
-    // probe (the hit returns before the dead probe).
+    // Fresh handle, cold memo, concurrent gather: every terminal job
+    // pays its receipt+dead pair (the sequential receipt-only
+    // short-circuit is gone), overlapping in one round-trip window.
     let d = delta_since(&counts, &before);
     let live_seen = d[5];
     let backlog_seen: u64 = (0..5).map(|i| d[i]).sum();
     assert_eq!(
-        backlog_seen, 5,
-        "cold memo: each backlog job pays one receipt head"
+        backlog_seen, 10,
+        "cold memo: each backlog job pays its terminal probe pair"
     );
-    assert_eq!(live_seen, 1, "the acked live job pays one receipt head");
+    assert_eq!(
+        live_seen, 2,
+        "the acked live job pays its terminal probe pair"
+    );
 }
 
 /// The memo is keyed by the jobs-entry VERSION: a deleted-then-

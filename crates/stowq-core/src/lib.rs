@@ -1168,44 +1168,52 @@ impl Queue {
         opts: &ClaimOptions,
         budget: &mut OpBudget,
     ) -> Result<Option<Claim>, Error> {
-        // Readiness: no terminal record. Only NotFound proves absence;
-        // any other error aborts the scan loudly rather than delivering
-        // past an unknown terminal state.
-        for rel in [
-            RelKey::Receipt { shard, job_id },
-            RelKey::Dead { shard, job_id },
-        ] {
-            budget.spend()?;
-            match self.store.head(&self.absolute(&rel)).await {
-                Ok(_) => {
-                    self.memoize_terminal(shard, job_id, jobs_version.clone());
-                    return Ok(None);
-                }
-                Err(StoreError::NotFound) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        // Claim tail.
-        let claims_prefix = format!("{}claims/{shard:04x}/{}/", self.root, hex(&job_id));
+        // Readiness + tail evidence, gathered concurrently: the receipt
+        // and dead probes and the chain listing are independent, so
+        // they share one round-trip window. Only NotFound proves
+        // terminal absence; any other error aborts the scan loudly
+        // rather than delivering past an unknown terminal state. The
+        // spends precede the join; on immediately-ready stores the ops
+        // run in declaration order (the fault injector's positional
+        // indexes are stable).
         budget.spend()?;
-        let mut tail: Option<(u64, Meta)> = None;
-        let mut after: Option<Key> = None;
-        loop {
-            budget.spend()?;
-            let page = self.store.list(&claims_prefix, after.as_ref(), 64).await?;
-            for item in page.items {
-                // Grammar violations in the chain are skipped; the
-                // repair scan owns quarantine.
-                if let Some(g) = parse_generation(&item.key) {
-                    tail = Some((g, item.meta));
+        budget.spend()?;
+        budget.spend()?;
+        let receipt_rel = RelKey::Receipt { shard, job_id };
+        let dead_rel = RelKey::Dead { shard, job_id };
+        let claims_prefix = format!("{}claims/{shard:04x}/{}/", self.root, hex(&job_id));
+        let store = self.store.as_ref();
+        let receipt_abs = self.absolute(&receipt_rel);
+        let dead_abs = self.absolute(&dead_rel);
+        let (receipt, dead, tail) =
+            tokio::join!(store.head(&receipt_abs), store.head(&dead_abs), async {
+                let mut tail: Option<(u64, Meta)> = None;
+                let mut after: Option<Key> = None;
+                loop {
+                    budget.spend()?;
+                    let page = store.list(&claims_prefix, after.as_ref(), 64).await?;
+                    for item in page.items {
+                        // Grammar violations in the chain are skipped;
+                        // the repair scan owns quarantine.
+                        if let Some(g) = parse_generation(&item.key) {
+                            tail = Some((g, item.meta));
+                        }
+                    }
+                    match page.next_after {
+                        Some(k) => after = Some(k),
+                        None => return Ok::<_, Error>(tail),
+                    }
                 }
+            });
+        match (receipt, dead) {
+            (Err(StoreError::NotFound), Err(StoreError::NotFound)) => {}
+            (Ok(_), _) | (_, Ok(_)) => {
+                self.memoize_terminal(shard, job_id, jobs_version.clone());
+                return Ok(None);
             }
-            match page.next_after {
-                Some(k) => after = Some(k),
-                None => break,
-            }
+            (Err(e), _) => return Err(e.into()),
         }
+        let tail = tail?;
 
         let (tail_gen, tail_meta) = tail.unwrap_or((
             0,
@@ -1316,7 +1324,7 @@ impl Queue {
                 .put_resolving(&abs, body, body_digest, &dead, &rel, budget)
                 .await?
             {
-                self.write_termidx(&rel, stowq_keys::TermKind::Dead, shard, job_id, budget)
+                self.write_termidx(stowq_keys::TermKind::Dead, shard, job_id, budget)
                     .await;
             }
             return Ok(None);
@@ -1563,24 +1571,27 @@ impl Queue {
         outputs: &[CommittedOutput],
         budget: &mut OpBudget,
     ) -> Result<AckOutcome, Error> {
-        // A dead record terminalized the job first; refuse so at most
-        // one terminal record per job ever exists.
+        // Dead-record refusal and payload re-verification are
+        // independent reads: they share one round-trip window. A dead
+        // record present means at most one terminal record per job
+        // ever exists; the payload digest is re-verified before the
+        // terminal write either way.
         budget.spend()?;
-        match self
-            .store
-            .head(&self.absolute(&RelKey::Dead {
-                shard: claim.shard,
-                job_id: claim.job_id,
-            }))
-            .await
-        {
+        budget.spend()?;
+        let dead_abs = self.absolute(&RelKey::Dead {
+            shard: claim.shard,
+            job_id: claim.job_id,
+        });
+        let (dead, payload) = tokio::join!(
+            self.store.head(&dead_abs),
+            claim.payload(self.store.as_ref())
+        );
+        match dead {
             Ok(_) => return Ok(AckOutcome::SupersededByDead),
             Err(StoreError::NotFound) => {}
             Err(e) => return Err(e.into()),
         }
-        // Payload evidence: re-verify before the terminal write.
-        budget.spend()?;
-        let payload = claim.payload(self.store.as_ref()).await?;
+        let payload = payload?;
         let digest: Digest = Sha256::digest(&payload).into();
 
         // Commit rule: verify every recorded output exists with its
@@ -1642,7 +1653,6 @@ impl Queue {
         {
             Resolved::Committed => {
                 self.write_termidx(
-                    &rel,
                     stowq_keys::TermKind::Receipt,
                     claim.shard,
                     claim.job_id,
@@ -1786,7 +1796,6 @@ impl Queue {
         {
             Resolved::Committed => {
                 self.write_termidx(
-                    &rel,
                     stowq_keys::TermKind::Dead,
                     claim.shard,
                     claim.job_id,
@@ -1818,7 +1827,6 @@ impl Queue {
     /// Best-effort terminal index entry; drives GC ordering only.
     async fn write_termidx(
         &self,
-        terminal_rel: &RelKey,
         kind: stowq_keys::TermKind,
         shard: u16,
         job_id: [u8; 16],
@@ -1827,11 +1835,19 @@ impl Queue {
         if budget.spend().is_err() {
             return;
         }
-        let Ok(meta) = self.store.head(&self.absolute(terminal_rel)).await else {
+        // The bucket derives from the handle's floor (a proven lower
+        // bound on the terminal record's store time) instead of a
+        // read-back of the just-written record: on the S3 family a PUT
+        // returns no store time, so the read-back cost a round trip
+        // per terminal write. Within the floor staleness window this
+        // is a cache hit (zero ops). The bucket may under-estimate by
+        // up to the window, making a graph GC-eligible marginally
+        // early; retention is policy, and repair regenerates termidx
+        // from authoritative times regardless.
+        let Ok(floor) = self.establish_floor(budget).await else {
             return;
         };
-        if let Some(bucket) =
-            stowq_math::bucket_number(meta.store_time_ns, self.format.terminal_bucket_width_ns)
+        if let Some(bucket) = stowq_math::bucket_number(floor, self.format.terminal_bucket_width_ns)
         {
             let idx = self.absolute(&RelKey::TermIndex {
                 bucket,
