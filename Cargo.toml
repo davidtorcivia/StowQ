@@ -11,6 +11,7 @@ members = [
     "crates/stowq-store-s3",
     "crates/stowq-worker",
     "crates/stowq-demo",
+    "crates/stowq-bench",
 ]
 
 [workspace.package]

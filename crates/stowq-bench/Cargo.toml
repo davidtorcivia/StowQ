@@ -1,0 +1,24 @@
+[package]
+name = "stowq-bench"
+description = "Performance baseline instrumentation: op counts, memory latency, live throughput"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "stowq-bench"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+stowq-core.workspace = true
+stowq-format.workspace = true
+stowq-store.workspace = true
+stowq-store-s3.workspace = true
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "default-https-client"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
