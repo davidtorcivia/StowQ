@@ -59,6 +59,28 @@ impl OpBudget {
         self.max_ops -= 1;
         Ok(())
     }
+
+    /// Divides the remaining budget into `n` independent child
+    /// budgets (`remaining / n` each); the division remainder stays
+    /// here. Children are refunded with [`OpBudget::merge`], so the
+    /// total work bound holds across the split's lifetime.
+    pub fn split(&mut self, n: usize) -> Vec<OpBudget> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let each = self.max_ops / n;
+        self.max_ops -= each * n;
+        (0..n).map(|_| OpBudget { max_ops: each }).collect()
+    }
+
+    /// Refunds unspent child ops to this budget. Children are left
+    /// empty; a merged child must not be spent from again.
+    pub fn merge(&mut self, children: &mut [OpBudget]) {
+        self.max_ops += children
+            .iter_mut()
+            .map(|c| std::mem::take(&mut c.max_ops))
+            .sum::<usize>();
+    }
 }
 
 impl Default for OpBudget {
@@ -1125,13 +1147,21 @@ impl Queue {
     }
 
     /// Claims up to `max` jobs from one shard scan, in scan order.
-    /// Each claim is an independent protocol claim — its own
-    /// generation, lease, and fencing; the batch shares only the scan,
-    /// amortizing the jobs listing and the terminality probes across
-    /// the batch. Stops at `max`, at scan end, or when the budget runs
+    /// Candidates are probed in concurrent waves — each wave's probes
+    /// overlap their round trips, each candidate carrying its own
+    /// slice of the budget (split conserves the total work bound;
+    /// unspent slices refund between waves). Each claim is an
+    /// independent protocol claim — its own generation, lease, and
+    /// fencing. Stops at `max`, at scan end, or when the budget runs
     /// dry: a partial batch is returned, an empty one propagates the
     /// error (for `max == 1` the observable behavior is exactly
-    /// [`Queue::claim`]'s). A claimant holding several leases keeps
+    /// [`Queue::claim`]'s). An error in a wave does not prevent
+    /// wave-mates' claims from being taken and returned; the erroring
+    /// candidate is not memoized and re-surfaces on the next scan.
+    /// The budget must serve the WHOLE wave —
+    /// equal-split children that are individually too small exhaust
+    /// together (size budgets to the batch, not to one claim chain).
+    /// A claimant holding several leases keeps
     /// renewing only the one it is executing; the rest age out and are
     /// taken over per the ordinary rules — batch size should fit
     /// within lease / per-job execution time.
@@ -1141,10 +1171,79 @@ impl Queue {
         max: usize,
         budget: &mut OpBudget,
     ) -> Result<Vec<Claim>, Error> {
+        struct Candidate {
+            job_id: [u8; 16],
+            shard: u16,
+            version: Version,
+        }
         let shard_prefix = format!("{}jobs/{:04x}/", self.root, opts.shard);
         let mut after: Option<Key> = None;
+        let mut pending: std::collections::VecDeque<Candidate> = Default::default();
         let mut claims: Vec<Claim> = Vec::with_capacity(max.min(64));
+        let mut scan_done = false;
         loop {
+            // Probe waves until the batch fills or candidates run out.
+            while !pending.is_empty() && claims.len() < max {
+                let take = pending.len().min(max - claims.len());
+                let wave: Vec<Candidate> = pending.drain(..take).collect();
+                // Concurrent candidate probing: each candidate carries
+                // its own child budget (the split conserves the total
+                // work bound; unspent ops refund after the wave). On
+                // immediately-ready stores join_all runs the futures
+                // to completion in declaration order, so the fault
+                // injector's positional op indexes stay stable.
+                let mut children = budget.split(wave.len());
+                let futs = wave
+                    .iter()
+                    .zip(children.iter_mut())
+                    .map(|(c, b)| self.try_claim(c.job_id, c.shard, &c.version, opts, b));
+                let results = futures::future::join_all(futs).await;
+                let mut first_err: Option<Error> = None;
+                let mut any_exhausted = false;
+                for r in results {
+                    match r {
+                        Ok(Some(c)) => claims.push(c),
+                        Ok(None) => {}
+                        Err(Error::BudgetExhausted) => any_exhausted = true,
+                        Err(e) => {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                }
+                budget.merge(&mut children);
+                if claims.len() >= max {
+                    return Ok(claims);
+                }
+                // Child errors surface before the budget boundary:
+                // with the merge landing the parent at exactly zero,
+                // an exhausted child's error must still propagate (the
+                // zero check alone would swallow it as an empty
+                // partial batch).
+                if let Some(e) = first_err {
+                    return if claims.is_empty() {
+                        Err(e)
+                    } else {
+                        Ok(claims)
+                    };
+                }
+                if any_exhausted {
+                    return if claims.is_empty() {
+                        Err(Error::BudgetExhausted)
+                    } else {
+                        Ok(claims)
+                    };
+                }
+                // The scan's budget boundary is a partial batch, not
+                // an error — the caller resumes with a fresh budget.
+                if budget.max_ops == 0 {
+                    return Ok(claims);
+                }
+            }
+            if scan_done || claims.len() >= max {
+                return Ok(claims);
+            }
             if let Err(e) = budget.spend() {
                 return if claims.is_empty() {
                     Err(e)
@@ -1183,32 +1282,15 @@ impl Queue {
                 if self.is_memoized_terminal(shard, job_id, &listing.meta.version) {
                     continue;
                 }
-                match self
-                    .try_claim(job_id, shard, &listing.meta.version, opts, budget)
-                    .await
-                {
-                    Ok(Some(c)) => {
-                        claims.push(c);
-                        if claims.len() >= max {
-                            return Ok(claims);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        return if claims.is_empty() {
-                            Err(e)
-                        } else {
-                            Ok(claims)
-                        };
-                    }
-                }
-                if budget.max_ops == 0 {
-                    return Ok(claims);
-                }
+                pending.push_back(Candidate {
+                    job_id,
+                    shard,
+                    version: listing.meta.version.clone(),
+                });
             }
             match page.next_after {
                 Some(k) => after = Some(k),
-                None => return Ok(claims),
+                None => scan_done = true,
             }
         }
     }
