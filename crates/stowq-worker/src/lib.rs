@@ -14,6 +14,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -216,6 +217,7 @@ pub async fn run_delivery(
     // payload() verifies the digest, so the executor never sees
     // unverified bytes.
     let payload = claim.payload(q.store()).await?;
+    let payload_digest: [u8; 32] = Sha256::digest(&payload).into();
 
     // Renewal cadence: lease/3 wall-clock, floored at 1ms so a
     // sub-millisecond lease cannot busy-loop renewals. The store clock
@@ -225,7 +227,7 @@ pub async fn run_delivery(
     loop {
         tokio::select! {
             out = &mut exec_fut => {
-                return finish_delivery(q, &claim, out, &mut budget).await;
+                return finish_delivery(q, &claim, out, payload_digest, &mut budget).await;
             }
             _ = tokio::time::sleep(interval) => {
                 match q.renew(&claim, &mut budget).await? {
@@ -243,6 +245,7 @@ async fn finish_delivery(
     q: &Queue,
     claim: &stowq_core::Claim,
     executed: Result<Vec<ExecutorOutput>, ExecutionFailure>,
+    payload_digest: [u8; 32],
     budget: &mut OpBudget,
 ) -> Result<DeliveryReport, Error> {
     match executed {
@@ -257,13 +260,34 @@ async fn finish_delivery(
                 };
                 committed.push(out);
             }
-            match q.ack_with_outputs(claim, &committed, budget).await? {
-                AckOutcome::Acked | AckOutcome::AlreadyAcked => {
+            match q.ack_with_outputs(claim, &committed, budget).await {
+                Ok(AckOutcome::Acked | AckOutcome::AlreadyAcked) => {
                     Ok(DeliveryReport::Delivered { outputs: committed })
                 }
                 // A dead record terminalized the job while we held a
                 // stale claim: not ours to decide anymore.
-                AckOutcome::SupersededByDead => Ok(DeliveryReport::LostLease),
+                Ok(AckOutcome::SupersededByDead) => Ok(DeliveryReport::LostLease),
+                // A foreign receipt under a different claim's
+                // generation can hold the SAME completed state (a
+                // duplicate-doorbell zombie converging on the same
+                // deterministic outputs): success-equivalent. The
+                // receipt's payload and output digests decide.
+                Err(Error::ReceiptEvidenceMismatch) => {
+                    let equivalent = match q.receipt_for(claim, budget).await? {
+                        Some(r) => {
+                            r.payload_digest == payload_digest
+                                && r.output_digests
+                                    == committed.iter().map(|o| o.digest).collect::<Vec<_>>()
+                        }
+                        None => false,
+                    };
+                    if equivalent {
+                        Ok(DeliveryReport::Delivered { outputs: committed })
+                    } else {
+                        Err(Error::ReceiptEvidenceMismatch)
+                    }
+                }
+                Err(e) => Err(e),
             }
         }
         Err(failure) => {
@@ -652,6 +676,95 @@ mod tests {
                 .unwrap_err()
                 == StoreError::NotFound
         );
+    }
+
+    /// A second worker delivers the same deterministic output while
+    /// the first stalls; the first's late ack must verify the foreign
+    /// receipt's completed state and report Delivered (equivalence).
+    struct DeliverThenStall {
+        store: MemoryStore,
+    }
+
+    #[async_trait]
+    impl Executor for DeliverThenStall {
+        async fn run(
+            &self,
+            _job_id: [u8; 16],
+            _payload: Bytes,
+        ) -> Result<Vec<ExecutorOutput>, ExecutionFailure> {
+            self.store.advance_clock_to(u64::MAX / 4);
+            let q2 = queue(&self.store).await;
+            let mut b = OpBudget::new(256);
+            let floor = q2.establish_floor(&mut b).await.unwrap();
+            let ClaimOutcome::Claimed(c2) = q2
+                .claim(
+                    &ClaimOptions {
+                        shard: 0,
+                        floor_ns: floor,
+                        lease_duration_ns: 60_000_000_000,
+                    },
+                    &mut b,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("takeover claim")
+            };
+            let out = q2
+                .commit_output(&c2, "r", Bytes::from_static(b"same"), &mut b)
+                .await
+                .unwrap();
+            let committed = match out {
+                stowq_core::CommitOutcome::Committed(c)
+                | stowq_core::CommitOutcome::Converged(c) => c,
+            };
+            assert_eq!(
+                q2.ack_with_outputs(&c2, &[committed], &mut b)
+                    .await
+                    .unwrap(),
+                AckOutcome::Acked
+            );
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok(vec![ExecutorOutput {
+                name: "r".into(),
+                body: Bytes::from_static(b"same"),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn zombie_convergence_reports_delivered() {
+        let (q, store, job_id) = queue_with_job().await;
+        let report = run_delivery(
+            &q,
+            &DoorbellMsg::sweep(),
+            &DeliverThenStall {
+                store: store.clone(),
+            },
+            60_000_000_000,
+        )
+        .await
+        .unwrap();
+        let DeliveryReport::Delivered { outputs } = report else {
+            panic!("expected Delivered, got {report:?}")
+        };
+        assert_eq!(outputs.len(), 1);
+        // Exactly one receipt (the second worker's), first-wins output.
+        assert!(store
+            .head(&stowq_store::Key::new(format!(
+                "q/receipts/0000/{}",
+                jhex(&job_id)
+            )))
+            .await
+            .is_ok());
+        let obj = store
+            .get(
+                &stowq_store::Key::new(format!("q/outputs/{}/r", jhex(&job_id))),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(&obj.body[..], b"same");
     }
 
     #[tokio::test]
