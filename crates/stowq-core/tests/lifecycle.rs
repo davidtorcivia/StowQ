@@ -2876,7 +2876,7 @@ async fn claim_many_of_one_matches_claim() {
 }
 
 #[tokio::test]
-async fn claim_many_returns_partial_on_budget_exhaustion() {
+async fn claim_many_fills_the_batch_when_the_budget_serves_the_wave() {
     let q = make_queue().await;
     let mut b = OpBudget::new(256);
     for i in 1..=4u8 {
@@ -2897,17 +2897,17 @@ async fn claim_many_returns_partial_on_budget_exhaustion() {
             panic!()
         };
     }
-    // A budget that cannot possibly finish 4 claims: partial batch.
-    let mut small = OpBudget::new(24);
+    // A budget serving the whole wave (list + 4 full chains + slack)
+    // fills the batch in one concurrent probe wave. (Uniform
+    // candidate costs make mid-wave partial batches unreachable:
+    // equal-split children either complete or exhaust together —
+    // partial batches arise at wave and listing boundaries.)
+    let mut wave_budget = OpBudget::new(96);
     let claims = q
-        .claim_many(&claim_opts(0, 60_000_000_000), 4, &mut small)
+        .claim_many(&claim_opts(0, 60_000_000_000), 4, &mut wave_budget)
         .await
         .unwrap();
-    assert!(
-        !claims.is_empty() && claims.len() < 4,
-        "partial batch, got {}",
-        claims.len()
-    );
+    assert_eq!(claims.len(), 4, "full batch");
     // Each returned claim is real (its claim record exists).
     for c in &claims {
         let hex: String = c.job_id.iter().map(|x| format!("{x:02x}")).collect();
@@ -2919,5 +2919,93 @@ async fn claim_many_returns_partial_on_budget_exhaustion() {
             )))
             .await
             .is_ok());
+    }
+}
+
+// ---------- concurrent candidate probing: budget split/refund ----------
+
+#[tokio::test]
+async fn claim_many_refunds_unspent_child_budget_between_waves() {
+    let q = make_queue().await;
+    let mut b = OpBudget::new(256);
+    for i in [1u8, 2] {
+        let EnqueueOutcome::Committed { .. } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([i; 16]),
+                    payload: b"x",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut b,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+    }
+    // Terminalize job 1: the scan's first candidate. Its wave child
+    // spends only the terminal probes; without the merge-back refund
+    // the parent would be empty and the scan would die before the
+    // live candidate — this test kills a split-without-merge mutant.
+    let ClaimOutcome::Claimed(c) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    q.ack(&c, &mut b).await.unwrap();
+
+    // Tight budget: enough for probe(list) + refund + one full claim
+    // chain, not enough to waste.
+    let mut tight = OpBudget::new(16);
+    let out = q
+        .claim_many(&claim_opts(0, 60_000_000_000), 1, &mut tight)
+        .await
+        .unwrap();
+    assert_eq!(
+        out.len(),
+        1,
+        "the refund lets the scan continue past the terminal candidate"
+    );
+    assert_eq!(out[0].job_id, [2; 16]);
+}
+
+#[tokio::test]
+async fn claim_many_spreads_thin_budgets_across_the_wave() {
+    let q = make_queue().await;
+    let mut b = OpBudget::new(256);
+    for i in 1..=4u8 {
+        let EnqueueOutcome::Committed { .. } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([i; 16]),
+                    payload: b"x",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut b,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+    }
+    // A budget that would serve ONE candidate sequentially is spread
+    // across the wave (24/4 = 6 per child — below a full claim chain),
+    // so every child exhausts and an empty batch surfaces the error.
+    // Documented spread semantics: callers size budgets to the wave.
+    let mut thin = OpBudget::new(24);
+    match q
+        .claim_many(&claim_opts(0, 60_000_000_000), 4, &mut thin)
+        .await
+    {
+        Err(Error::BudgetExhausted) => {}
+        other => panic!("expected BudgetExhausted from the spread, got {other:?}"),
     }
 }
