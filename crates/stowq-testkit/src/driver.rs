@@ -46,6 +46,7 @@ pub enum DriveOp {
     Nack { job: usize },
     Bury { job: usize },
     CommitOutput { job: usize },
+    ClaimMany { n: usize },
     AdvanceClock { to: u64 },
 }
 
@@ -136,7 +137,7 @@ fn gen_ops(rng: &mut Rng, cfg: &DriverConfig) -> Vec<DriveOp> {
     let mut ops: Vec<DriveOp> = Vec::with_capacity(cfg.ops);
     for _ in 0..cfg.ops {
         let job = rng.below(cfg.jobs as u64) as usize;
-        ops.push(match rng.below(8) {
+        ops.push(match rng.below(9) {
             0 => DriveOp::Enqueue { job },
             1 => DriveOp::Claim,
             2 => DriveOp::Renew { job },
@@ -144,6 +145,7 @@ fn gen_ops(rng: &mut Rng, cfg: &DriverConfig) -> Vec<DriveOp> {
             4 => DriveOp::Nack { job },
             5 => DriveOp::Bury { job },
             6 => DriveOp::CommitOutput { job },
+            7 => DriveOp::ClaimMany { n: 2 + (job % 2) },
             // Exponential clock: the median draw is ~93us and the
             // maximum ~8.6s, so microsecond leases and the retry
             // backoffs both elapse.
@@ -344,6 +346,40 @@ pub async fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64
                         !oracle.commit_output(&id, [0; 32]),
                         "seed {seed} op {i}: driver holds nothing but oracle allowed the output"
                     );
+                }
+            }
+            DriveOp::ClaimMany { n } => {
+                let opts = ClaimOptions {
+                    shard: 0,
+                    floor_ns: oracle.clock,
+                    lease_duration_ns: cfg.lease_ns,
+                };
+                let claims = queue
+                    .claim_many(&opts, n, &mut budget)
+                    .await
+                    .expect("claim_many op");
+                let mut prev_j = None;
+                for c in claims {
+                    let j = job_index(&c.job_id);
+                    // Scan order within the batch.
+                    if let Some(p) = prev_j {
+                        assert!(
+                            j > p,
+                            "seed {seed} op {i}: batch not in scan order ({p} then {j})"
+                        );
+                    }
+                    prev_j = Some(j);
+                    let expected = oracle
+                        .claim(&c.job_id, cfg.lease_ns, c.claim_store_time_ns)
+                        .unwrap_or_else(|| {
+                            panic!("seed {seed} op {i}: core claimed job {j}, oracle refused")
+                        });
+                    assert_eq!(
+                        (c.generation, c.attempt),
+                        expected,
+                        "seed {seed} op {i} job {j}"
+                    );
+                    held[j] = Some(c);
                 }
             }
             DriveOp::Ack { job } => {

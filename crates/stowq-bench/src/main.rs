@@ -537,6 +537,93 @@ async fn live_store() -> Result<stowq_store_s3::S3Store, String> {
     Ok(stowq_store_s3::S3Store::new(&sdk, &config, bucket))
 }
 
+/// A batched cycle: enqueue `n` jobs, claim them in one scan
+/// (claim_many), ack each. Reports total ops and per-job ops — the
+/// batch amortization measurement.
+async fn batch_cycle(q: &Queue, n: usize, i: usize, b: &mut OpBudget) -> Result<usize, String> {
+    // All jobs land on shard 0 (the well-hinted batch shape: one
+    // scan serves the whole batch), so scan candidate ids upward and
+    // keep those whose shard hash is 0.
+    let shard_count = q.format().shard_count.max(1);
+    let mut ids = Vec::with_capacity(n);
+    let mut cand = i as u128 * 1024;
+    while ids.len() < n {
+        let id = cand.to_be_bytes();
+        cand += 1;
+        if stowq_keys::compute_shard(&[1; 16], &id, shard_count) == 0 {
+            ids.push(id);
+        }
+    }
+    for id in ids {
+        let EnqueueOutcome::Committed { .. } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some(id),
+                    payload: b"bench-payload",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 5,
+                    not_before_ns: None,
+                },
+                b,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Err("enqueue rejected".into());
+        };
+    }
+    let floor = q.establish_floor(b).await.map_err(|e| e.to_string())?;
+    let opts = ClaimOptions {
+        shard: 0,
+        floor_ns: floor,
+        lease_duration_ns: 60_000_000_000,
+    };
+    let claims = q.claim_many(&opts, n, b).await.map_err(|e| e.to_string())?;
+    // Terminal writes overlap like the harness's concurrent
+    // deliveries; each carries its own budget (the worker shape).
+    let mut budgets: Vec<_> = claims.iter().map(|_| OpBudget::new(1024)).collect();
+    let acks: Vec<_> = claims
+        .iter()
+        .zip(&mut budgets)
+        .map(|(c, b)| q.ack(c, b))
+        .collect();
+    let results = futures::future::join_all(acks).await;
+    for r in results {
+        r.map_err(|e| e.to_string())?;
+    }
+    Ok(claims.len())
+}
+
+async fn live_batch_mode(cycles: usize, batch: usize) -> Result<(), String> {
+    let root = format!("benchb-{}", std::process::id());
+    let (store, counts) = CountingStore::new(live_store().await?);
+    let q = Queue::init(Box::new(store), &root, &opts("liveb"), &format())
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("root: {root}  ({cycles} cycles x batch {batch})");
+    let mut b = OpBudget::new(64_000);
+    let t_all = Instant::now();
+    for i in 0..cycles {
+        let c0 = counts.snapshot();
+        let t0 = Instant::now();
+        let claimed = batch_cycle(&q, batch, i, &mut b).await?;
+        let dt = t0.elapsed().as_secs_f64() * 1000.0;
+        let d = OpDiff::delta(c0, counts.snapshot());
+        println!(
+            "cycle {i:>3}: {dt:7.1}ms  {} claims  {}  ({:.1} ops/job)",
+            claimed,
+            d.line(),
+            d.total() as f64 / batch as f64
+        );
+    }
+    let wall = t_all.elapsed().as_secs_f64();
+    println!(
+        "live batch: {:.2} jobs/s (batch {batch}, {cycles} cycles)",
+        (cycles * batch) as f64 / wall
+    );
+    Ok(())
+}
+
 async fn live_mode(cycles: usize) -> Result<(), String> {
     let root = format!("bench-{}", std::process::id());
     let (store, counts) = CountingStore::new(live_store().await?);
@@ -571,22 +658,27 @@ async fn live_mode(cycles: usize) -> Result<(), String> {
 
 // ---------- main ----------
 
-fn parse() -> Result<(String, usize), String> {
+fn parse() -> Result<(String, usize, usize), String> {
     let mut it = std::env::args().skip(1);
     let mode = it
         .next()
-        .ok_or("usage: stowq-bench ops|mem|live [cycles]")?;
+        .ok_or("usage: stowq-bench ops|mem|live|live-batch [cycles] [batch]")?;
     let cycles: usize = it
         .next()
         .map(|s| s.parse().map_err(|_| "cycles".to_string()))
         .transpose()?
         .unwrap_or(1000);
-    Ok((mode, cycles))
+    let batch: usize = it
+        .next()
+        .map(|s| s.parse().map_err(|_| "batch".to_string()))
+        .transpose()?
+        .unwrap_or(5);
+    Ok((mode, cycles, batch))
 }
 
 #[tokio::main]
 async fn main() {
-    let (mode, cycles) = parse().unwrap_or_else(|e| {
+    let (mode, cycles, batch) = parse().unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(2);
     });
@@ -594,6 +686,7 @@ async fn main() {
         "ops" => ops_mode().await,
         "mem" => mem_mode(cycles).await,
         "live" => live_mode(cycles.min(500)).await,
+        "live-batch" => live_batch_mode(cycles.min(200), batch.clamp(1, 64)).await,
         m => Err(format!("unknown mode {m}")),
     };
     if let Err(e) = r {
