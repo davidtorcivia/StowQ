@@ -132,18 +132,22 @@ fn expect_keys(map: &[(Value, Value)], allowed: &[&str]) -> Result<(), RecordErr
     Ok(())
 }
 
+#[cfg(test)]
 fn kv_u64(out: &mut Vec<(Value, Value)>, key: &str, v: u64) {
     out.push((Value::Text(key.into()), Value::Uint(v)));
 }
 
+#[cfg(test)]
 fn kv_bytes<const N: usize>(out: &mut Vec<(Value, Value)>, key: &str, v: &[u8; N]) {
     out.push((Value::Text(key.into()), Value::Bytes(v.to_vec())));
 }
 
+#[cfg(test)]
 fn kv_text(out: &mut Vec<(Value, Value)>, key: &str, v: &str) {
     out.push((Value::Text(key.into()), Value::Text(v.into())));
 }
 
+#[cfg(test)]
 fn kv_bool(out: &mut Vec<(Value, Value)>, key: &str, v: bool) {
     out.push((Value::Text(key.into()), Value::Bool(v)));
 }
@@ -304,6 +308,7 @@ impl Record {
         }
     }
 
+    #[cfg(test)]
     fn fields(&self) -> Vec<(Value, Value)> {
         let mut m = Vec::new();
         match self {
@@ -678,24 +683,175 @@ impl Record {
 /// Encodes a record against a queue identity and its canonical key. The
 /// `key_tag` binds the record to the key (see stowq-keys).
 pub fn encode(record: &Record, queue_id: &[u8; 16], key_tag: &[u8; 8]) -> Vec<u8> {
-    let body = Value::Array(vec![
-        Value::Uint(MAGIC),
-        Value::Uint(MAJOR),
-        Value::Uint(MINOR),
-        Value::Bytes(queue_id.to_vec()),
-        Value::Bytes(key_tag.to_vec()),
-        Value::Uint(record.type_number()),
-        Value::Map(record.fields()),
-    ]);
-    let body_bytes = cbor::encode(&body);
-    let digest = record_digest(type_name(record.type_number()).unwrap(), &body_bytes);
-    let mut out = body_bytes;
-    // The digest is appended as a trailing byte string, outside the digested
-    // body: appending keeps the digest input a valid standalone CBOR value.
-    out.push(0x58);
-    out.push(32);
-    out.extend_from_slice(&digest);
-    out
+    // Direct canonical write: no intermediate Value tree, no per-key
+    // encoding for the map sort (fields are written in bytewise-sorted
+    // key order by construction; the differential test against the
+    // value path pins every record shape). The wire bytes are
+    // identical to encoding the equivalent Value tree.
+    let mut body = Vec::with_capacity(192);
+    cbor::push_head(&mut body, 4, 7);
+    cbor::push_head(&mut body, 0, MAGIC);
+    cbor::push_head(&mut body, 0, MAJOR);
+    cbor::push_head(&mut body, 0, MINOR);
+    put_bytes(&mut body, queue_id);
+    put_bytes(&mut body, key_tag);
+    cbor::push_head(&mut body, 0, record.type_number());
+    write_fields(record, &mut body);
+    // Digest domain separator, hashed without the format! copy.
+    let mut hasher = Sha256::new();
+    hasher.update(b"StowQ-1-");
+    hasher.update(type_name(record.type_number()).unwrap().as_bytes());
+    hasher.update([0]);
+    hasher.update(&body);
+    let digest: [u8; 32] = hasher.finalize().into();
+    // The digest is appended as a trailing byte string, outside the
+    // digested body: appending keeps the digest input a valid
+    // standalone CBOR value.
+    body.push(0x58);
+    body.push(32);
+    body.extend_from_slice(&digest);
+    body
+}
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    cbor::push_head(out, 2, b.len() as u64);
+    out.extend_from_slice(b);
+}
+
+fn put_text(out: &mut Vec<u8>, t: &str) {
+    cbor::push_head(out, 3, t.len() as u64);
+    out.extend_from_slice(t.as_bytes());
+}
+
+fn put_key(out: &mut Vec<u8>, k: &str, v: u64) {
+    put_text(out, k);
+    cbor::push_head(out, 0, v);
+}
+
+fn put_key_bytes(out: &mut Vec<u8>, k: &str, v: &[u8]) {
+    put_text(out, k);
+    put_bytes(out, v);
+}
+
+fn put_key_text(out: &mut Vec<u8>, k: &str, v: &str) {
+    put_text(out, k);
+    put_text(out, v);
+}
+
+fn put_key_bool(out: &mut Vec<u8>, k: &str, v: bool) {
+    put_text(out, k);
+    out.push(if v { 0xf5 } else { 0xf4 });
+}
+
+/// Writes the record's fields map with keys in canonical order
+/// (canonical CBOR map order), one write per field, no intermediates.
+fn write_fields(record: &Record, out: &mut Vec<u8>) {
+    match record {
+        Record::Format(r) => {
+            cbor::push_head(out, 5, 6);
+            put_key(out, "shard_count", r.shard_count as u64);
+            put_key(out, "inline_limit", r.inline_limit);
+            put_key(out, "lease_bucket_width_ns", r.lease_bucket_width_ns);
+            put_key(out, "required_feature_bits", r.required_feature_bits);
+            put_key(out, "delayed_bucket_width_ns", r.delayed_bucket_width_ns);
+            put_key(out, "terminal_bucket_width_ns", r.terminal_bucket_width_ns);
+        }
+        Record::Job(r) => {
+            let n = 6
+                + r.not_before_ns.is_some() as u64
+                + r.payload_inline.is_some() as u64
+                + r.payload_key.is_some() as u64;
+            cbor::push_head(out, 5, n);
+            put_key_bytes(out, "job_id", &r.job_id);
+            if let Some(key) = &r.payload_key {
+                put_key_text(out, "payload_key", key);
+            }
+            put_key_text(out, "content_type", &r.content_type);
+            if let Some(nb) = r.not_before_ns {
+                put_key(out, "not_before_ns", nb);
+            }
+            put_key_bytes(out, "payload_digest", &r.payload_digest);
+            if let Some(inline) = &r.payload_inline {
+                put_key_bytes(out, "payload_inline", inline);
+            }
+            put_key(out, "payload_length", r.payload_length);
+            put_key(out, "maximum_attempts", r.maximum_attempts);
+            put_key(out, "created_store_time_ns", r.created_store_time_ns);
+        }
+        Record::Claim(r) => {
+            let n = 7 + r.basis.is_some() as u64 + r.prev_token.is_some() as u64;
+            cbor::push_head(out, 5, n);
+            if let Some(b) = &r.basis {
+                put_text(out, "basis");
+                cbor::push_head(out, 5, 3);
+                put_key(out, "prev_duration_ns", b.prev_duration_ns);
+                put_key(out, "prev_store_time_ns", b.prev_store_time_ns);
+                put_key(out, "observed_watermark_ns", b.observed_watermark_ns);
+            }
+            put_key_bytes(out, "job_id", &r.job_id);
+            put_key(out, "attempt", r.attempt);
+            put_key_text(out, "worker_id", &r.worker_id);
+            put_key(out, "generation", r.generation);
+            if let Some(pt) = &r.prev_token {
+                put_key_bytes(out, "prev_token", pt);
+            }
+            put_key_bool(out, "continuation", r.continuation);
+            put_key_bytes(out, "worker_token", &r.worker_token);
+            put_key(out, "lease_duration_ns", r.lease_duration_ns);
+        }
+        Record::Fail(r) => {
+            cbor::push_head(out, 5, 5);
+            put_key_bytes(out, "job_id", &r.job_id);
+            put_key(out, "reason", r.reason);
+            put_key(out, "attempt", r.attempt);
+            put_key(out, "generation", r.generation);
+            put_key(out, "retry_not_before_ns", r.retry_not_before_ns);
+        }
+        Record::Receipt(r) => {
+            let n = 6 + !r.output_digests.is_empty() as u64;
+            cbor::push_head(out, 5, n);
+            put_key_bytes(out, "job_id", &r.job_id);
+            put_key(out, "attempt", r.attempt);
+            put_key_text(out, "worker_id", &r.worker_id);
+            put_key(out, "generation", r.generation);
+            put_key_bytes(out, "worker_token", &r.worker_token);
+            if !r.output_digests.is_empty() {
+                put_text(out, "output_digests");
+                cbor::push_head(out, 4, r.output_digests.len() as u64);
+                for d in &r.output_digests {
+                    put_bytes(out, d);
+                }
+            }
+            put_key_bytes(out, "payload_digest", &r.payload_digest);
+        }
+        Record::Dead(r) => {
+            cbor::push_head(out, 5, 4);
+            put_key_bytes(out, "job_id", &r.job_id);
+            put_key(out, "reason", r.reason);
+            put_key(out, "attempt", r.attempt);
+            put_key(out, "generation", r.generation);
+        }
+        Record::Watermark(r) => {
+            cbor::push_head(out, 5, 2);
+            put_key(out, "sequence", r.sequence);
+            put_key(
+                out,
+                "highest_observed_wall_bucket",
+                r.highest_observed_wall_bucket,
+            );
+        }
+        Record::Quarantine(r) => {
+            let n = 4 + r.detail.is_some() as u64;
+            cbor::push_head(out, 5, n);
+            put_key_bytes(out, "qid", &r.qid);
+            if let Some(d) = r.detail {
+                put_key(out, "detail", d);
+            }
+            put_key(out, "reason", r.reason);
+            put_key_text(out, "source_key", &r.source_key);
+            put_key(out, "observed_store_ns", r.observed_store_ns);
+        }
+    }
 }
 
 /// Decodes and fully verifies a record: envelope shape, version, digest,
@@ -753,6 +909,166 @@ pub fn decode(data: &[u8], queue_id: &[u8; 16], key_tag: &[u8; 8]) -> Result<Rec
         return Err(RecordError::Field("queue binding"));
     }
     Record::from_fields(*rtype, fields)
+}
+
+#[cfg(test)]
+mod direct_encode_tests {
+    use super::*;
+
+    /// The old path: the Value tree with its encode-time map sort.
+    /// The direct encoder must be byte-identical for every shape.
+    fn value_encode(record: &Record, queue_id: &[u8; 16], key_tag: &[u8; 8]) -> Vec<u8> {
+        let body = Value::Array(vec![
+            Value::Uint(MAGIC),
+            Value::Uint(MAJOR),
+            Value::Uint(MINOR),
+            Value::Bytes(queue_id.to_vec()),
+            Value::Bytes(key_tag.to_vec()),
+            Value::Uint(record.type_number()),
+            Value::Map(record.fields()),
+        ]);
+        let body_bytes = cbor::encode(&body);
+        let digest = record_digest(type_name(record.type_number()).unwrap(), &body_bytes);
+        let mut out = body_bytes;
+        out.push(0x58);
+        out.push(32);
+        out.extend_from_slice(&digest);
+        out
+    }
+
+    fn check(record: &Record) {
+        let qid = [7u8; 16];
+        let tag = [9u8; 8];
+        let a = encode(record, &qid, &tag);
+        let b = value_encode(record, &qid, &tag);
+        assert_eq!(a, b, "direct encode diverged for {record:?}");
+        // And it round-trips through the unchanged decoder.
+        assert_eq!(&decode(&a, &qid, &tag).unwrap(), record);
+    }
+
+    #[test]
+    fn direct_encode_matches_the_value_path_for_every_shape() {
+        check(&Record::Format(FormatRecord {
+            shard_count: 4,
+            lease_bucket_width_ns: 1_000,
+            delayed_bucket_width_ns: 1_000,
+            terminal_bucket_width_ns: 1_000,
+            inline_limit: 4_096,
+            required_feature_bits: 1,
+        }));
+        let payload_digest = [3u8; 32];
+        // Inline, not delayed.
+        check(&Record::Job(JobRecord {
+            job_id: [1; 16],
+            maximum_attempts: 5,
+            content_type: "application/octet-stream".into(),
+            created_store_time_ns: 0,
+            not_before_ns: None,
+            payload_digest,
+            payload_length: 64,
+            payload_inline: Some(vec![0xA5; 64]),
+            payload_key: None,
+        }));
+        // Detached + delayed (both optionals the other way).
+        check(&Record::Job(JobRecord {
+            job_id: [2; 16],
+            maximum_attempts: 1,
+            content_type: "text/plain".into(),
+            created_store_time_ns: 123,
+            not_before_ns: Some(456),
+            payload_digest,
+            payload_length: 1 << 20,
+            payload_inline: None,
+            payload_key: Some("payloads/aa/digest".into()),
+        }));
+        // (A job with neither payload_inline nor payload_key is an
+        // invalid shape the decoder rejects; the encoder never sees
+        // one from the protocol paths.)
+        // A claim carries exactly one of basis (takeover evidence) or
+        // prev_token (continuation evidence).
+        check(&Record::Claim(ClaimRecord {
+            job_id: [4; 16],
+            generation: 2,
+            attempt: 2,
+            worker_id: "worker-1".into(),
+            worker_token: [5; 16],
+            lease_duration_ns: 60_000_000_000,
+            continuation: false,
+            basis: Some(ClaimBasis {
+                prev_store_time_ns: 100,
+                prev_duration_ns: 200,
+                observed_watermark_ns: 300,
+            }),
+            prev_token: None,
+        }));
+        check(&Record::Claim(ClaimRecord {
+            job_id: [5; 16],
+            generation: 3,
+            attempt: 1,
+            worker_id: "w".into(),
+            worker_token: [7; 16],
+            lease_duration_ns: 1,
+            continuation: true,
+            basis: None,
+            prev_token: Some([6; 16]),
+        }));
+        check(&Record::Fail(FailRecord {
+            job_id: [6; 16],
+            generation: 1,
+            reason: 0x0001,
+            attempt: 1,
+            retry_not_before_ns: 999,
+        }));
+        check(&Record::Receipt(ReceiptRecord {
+            job_id: [7; 16],
+            generation: 3,
+            attempt: 3,
+            worker_id: "worker-2".into(),
+            worker_token: [8; 16],
+            payload_digest,
+            output_digests: vec![[9u8; 32], [10u8; 32]],
+        }));
+        check(&Record::Receipt(ReceiptRecord {
+            job_id: [8; 16],
+            generation: 1,
+            attempt: 1,
+            worker_id: "w".into(),
+            worker_token: [1; 16],
+            payload_digest,
+            output_digests: vec![],
+        }));
+        check(&Record::Dead(DeadRecord {
+            job_id: [9; 16],
+            generation: 2,
+            attempt: 2,
+            reason: 0x0004,
+        }));
+        check(&Record::Watermark(WatermarkRecord {
+            highest_observed_wall_bucket: 1 << 40,
+            sequence: 77,
+        }));
+        check(&Record::Quarantine(QuarantineRecord {
+            qid: [2; 16],
+            source_key: "jobs/0000/aa".into(),
+            reason: 0x0014,
+            observed_store_ns: 424,
+            detail: Some(2),
+        }));
+        check(&Record::Quarantine(QuarantineRecord {
+            qid: [3; 16],
+            source_key: "q".into(),
+            reason: 0x0010,
+            observed_store_ns: 1,
+            detail: None,
+        }));
+        // Integer-length boundaries through the direct head writer.
+        for v in [0u64, 23, 24, 255, 256, 65_535, 65_536, 1 << 32, u64::MAX] {
+            check(&Record::Watermark(WatermarkRecord {
+                highest_observed_wall_bucket: v,
+                sequence: v,
+            }));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -55,7 +55,7 @@ impl std::error::Error for Error {}
 
 // ---------- Encoding ----------
 
-fn push_head(out: &mut Vec<u8>, major: u8, value: u64) {
+pub(crate) fn push_head(out: &mut Vec<u8>, major: u8, value: u64) {
     let m = major << 5;
     match value {
         0..=23 => out.push(m | value as u8),
