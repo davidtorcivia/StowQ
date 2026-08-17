@@ -1,6 +1,7 @@
 //! Lifecycle tests against the memory fake: init, enqueue, claim, renew,
 //! ack, nack, bury, takeover, exhaustion, and budgets.
 
+use sha2::Digest as _;
 use stowq_core::{ClaimOptions, EnqueueInput, EnqueueOutcome, Error, OpBudget, OpenOptions, Queue};
 use stowq_format::FormatRecord;
 use stowq_store::{Key, MemoryStore, StoreError};
@@ -2165,4 +2166,309 @@ async fn repair_reports_and_quarantines_missing_referenced_payload() {
     assert_eq!(rec.observed_store_ns, job_time);
     let payload_rel = payload_key.trim_start_matches("q/").to_string();
     assert_eq!(rec.source_key, payload_rel);
+}
+
+// ---------- commit rule: commit_output + ack_with_outputs ----------
+
+/// Enqueues one job and claims it; the standard preamble for the
+/// commit-rule tests.
+async fn claimed_job(q: &Queue) -> ([u8; 16], stowq_core::Claim) {
+    let mut budget = OpBudget::new(128);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: None,
+                payload: b"work",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut budget,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("commit")
+    };
+    let stowq_core::ClaimOutcome::Claimed(claim) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut budget)
+        .await
+        .unwrap()
+    else {
+        panic!("claim")
+    };
+    (job_id, claim)
+}
+
+fn jhex16(id: &[u8; 16]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[tokio::test]
+async fn commit_output_then_ack_with_outputs_records_digests() {
+    let q = make_queue().await;
+    let (job_id, claim) = claimed_job(&q).await;
+    let mut budget = OpBudget::new(128);
+    let out = q
+        .commit_output(
+            &claim,
+            "result.bin",
+            bytes::Bytes::from_static(b"OUT"),
+            &mut budget,
+        )
+        .await
+        .unwrap();
+    let committed = match &out {
+        stowq_core::CommitOutcome::Committed(c) => c.clone(),
+        other => panic!("first commit must win, got {other:?}"),
+    };
+    assert_eq!(
+        committed.key,
+        format!("q/outputs/{}/result.bin", jhex16(&job_id))
+    );
+    let ack = q
+        .ack_with_outputs(&claim, &[committed], &mut budget)
+        .await
+        .unwrap();
+    assert_eq!(ack, stowq_core::AckOutcome::Acked);
+    // The receipt records the output digest; the output object exists.
+    let rel = format!("receipts/0000/{}", jhex16(&job_id));
+    let obj = q
+        .store()
+        .get(&Key::new(format!("q/{rel}")), None)
+        .await
+        .unwrap();
+    let tag = stowq_keys::key_tag(&[1; 16], &rel);
+    let stowq_format::Record::Receipt(r) = stowq_format::decode(&obj.body, &[1; 16], &tag).unwrap()
+    else {
+        panic!("receipt")
+    };
+    assert_eq!(r.output_digests.len(), 1);
+    let got: [u8; 32] = sha2::Sha256::digest(b"OUT").into();
+    assert_eq!(r.output_digests[0], got);
+}
+
+#[tokio::test]
+async fn duplicate_commit_converges_on_first_wins_bytes() {
+    let q = make_queue().await;
+    let (_job_id, claim) = claimed_job(&q).await;
+    let mut budget = OpBudget::new(128);
+    let first = q
+        .commit_output(
+            &claim,
+            "r",
+            bytes::Bytes::from_static(b"first"),
+            &mut budget,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(first, stowq_core::CommitOutcome::Committed(_)));
+    let before = q
+        .store()
+        .head(&Key::new(format!("q/outputs/{}/r", jhex16(&_job_id))))
+        .await
+        .unwrap();
+    // A duplicate attempt with identical deterministic bytes converges.
+    let second = q
+        .commit_output(
+            &claim,
+            "r",
+            bytes::Bytes::from_static(b"first"),
+            &mut budget,
+        )
+        .await
+        .unwrap();
+    let conv = match second {
+        stowq_core::CommitOutcome::Converged(c) => c,
+        other => panic!("duplicate must converge, got {other:?}"),
+    };
+    assert_eq!(conv.key, format!("q/outputs/{}/r", jhex16(&_job_id)));
+    // First-wins: no rewrite, so version and store time are unchanged.
+    let after = q.store().head(&Key::new(conv.key)).await.unwrap();
+    assert_eq!(before.version, after.version);
+    assert_eq!(before.store_time_ns, after.store_time_ns);
+}
+
+#[tokio::test]
+async fn conflicting_commit_bytes_is_output_conflict() {
+    let q = make_queue().await;
+    let (job_id, claim) = claimed_job(&q).await;
+    let mut budget = OpBudget::new(128);
+    q.commit_output(&claim, "r", bytes::Bytes::from_static(b"mine"), &mut budget)
+        .await
+        .unwrap();
+    let err = q
+        .commit_output(
+            &claim,
+            "r",
+            bytes::Bytes::from_static(b"theirs"),
+            &mut budget,
+        )
+        .await
+        .unwrap_err();
+    // 0x0011 semantics: the error carries the first-wins digest.
+    let expected: [u8; 32] = sha2::Sha256::digest(b"mine").into();
+    match err {
+        Error::OutputConflict(d) => assert_eq!(d, expected),
+        other => panic!("expected OutputConflict, got {other:?}"),
+    }
+    // The store keeps the first-wins bytes.
+    let obj = q
+        .store()
+        .get(&Key::new(format!("q/outputs/{}/r", jhex16(&job_id))), None)
+        .await
+        .unwrap();
+    assert_eq!(&obj.body[..], b"mine");
+}
+
+#[tokio::test]
+async fn ack_with_outputs_refuses_when_output_is_absent_or_corrupt() {
+    let q = make_queue().await;
+    let (job_id, claim) = claimed_job(&q).await;
+    let mut budget = OpBudget::new(256);
+    let committed = match q
+        .commit_output(
+            &claim,
+            "r",
+            bytes::Bytes::from_static(b"final"),
+            &mut budget,
+        )
+        .await
+        .unwrap()
+    {
+        stowq_core::CommitOutcome::Committed(c) => c,
+        other => panic!("{other:?}"),
+    };
+    let key = Key::new(committed.key.clone());
+    // Absent: fail closed, no receipt.
+    q.store().delete(&key).await.unwrap();
+    let err = q
+        .ack_with_outputs(&claim, std::slice::from_ref(&committed), &mut budget)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::OutputEvidenceMismatch(_)), "{err:?}");
+    // Corrupt: different bytes at the key, same failure class.
+    let d: [u8; 32] = sha2::Sha256::digest(b"tampered").into();
+    q.store()
+        .put_if_absent(&key, bytes::Bytes::from_static(b"tampered"), d)
+        .await
+        .unwrap();
+    let err = q
+        .ack_with_outputs(&claim, &[committed], &mut budget)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::OutputEvidenceMismatch(_)), "{err:?}");
+    // No receipt exists: the terminal write never happened.
+    assert_eq!(
+        q.store()
+            .head(&Key::new(format!("q/receipts/0000/{}", jhex16(&job_id))))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound
+    );
+}
+
+#[tokio::test]
+async fn reack_with_outputs_verifies_recorded_digests() {
+    let q = make_queue().await;
+    let (_job_id, claim) = claimed_job(&q).await;
+    let mut budget = OpBudget::new(256);
+    let committed = match q
+        .commit_output(&claim, "r", bytes::Bytes::from_static(b"done"), &mut budget)
+        .await
+        .unwrap()
+    {
+        stowq_core::CommitOutcome::Committed(c) => c,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        q.ack_with_outputs(&claim, std::slice::from_ref(&committed), &mut budget)
+            .await
+            .unwrap(),
+        stowq_core::AckOutcome::Acked
+    );
+    // Idempotent re-ack with the same evidence.
+    assert_eq!(
+        q.ack_with_outputs(&claim, std::slice::from_ref(&committed), &mut budget)
+            .await
+            .unwrap(),
+        stowq_core::AckOutcome::AlreadyAcked
+    );
+    // A plain ack cannot verify the recorded outputs' evidence.
+    match q.ack(&claim, &mut budget).await {
+        Err(Error::ReceiptEvidenceMismatch) => {}
+        other => panic!("expected ReceiptEvidenceMismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn invalid_output_names_are_rejected() {
+    let q = make_queue().await;
+    let (_job_id, claim) = claimed_job(&q).await;
+    let mut budget = OpBudget::new(64);
+    for bad in ["", "/abs", "../escape", "a//b", "a/../b", "."] {
+        let err = q
+            .commit_output(&claim, bad, bytes::Bytes::new(), &mut budget)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Key(_)), "{bad}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn ack_rejects_another_jobs_output() {
+    let q = make_queue().await;
+    let (_id_a, claim_a) = claimed_job(&q).await;
+    let (id_b, claim_b) = claimed_job(&q).await;
+    let mut budget = OpBudget::new(256);
+    // B commits an output; A attempts to record it on A's receipt.
+    let b_out = match q
+        .commit_output(&claim_b, "r", bytes::Bytes::from_static(b"b"), &mut budget)
+        .await
+        .unwrap()
+    {
+        stowq_core::CommitOutcome::Committed(c) => c,
+        other => panic!("{other:?}"),
+    };
+    match q.ack_with_outputs(&claim_a, &[b_out], &mut budget).await {
+        Err(Error::Key(_)) => {}
+        other => panic!("expected Error::Key, got {other:?}"),
+    }
+    // No receipt for A: the terminal write never happened.
+    assert_eq!(
+        q.store()
+            .head(&Key::new(format!("q/receipts/0000/{}", jhex16(&_id_a))))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound
+    );
+    let _ = id_b;
+}
+
+#[tokio::test]
+async fn committed_output_persists_without_a_receipt() {
+    let q = make_queue().await;
+    let (job_id, claim) = claimed_job(&q).await;
+    let mut budget = OpBudget::new(256);
+    let committed = match q
+        .commit_output(&claim, "r", bytes::Bytes::from_static(b"won"), &mut budget)
+        .await
+        .unwrap()
+    {
+        stowq_core::CommitOutcome::Committed(c) => c,
+        other => panic!("{other:?}"),
+    };
+    // Nack instead of ack: the job returns to backoff, no receipt.
+    let floor = q.establish_floor(&mut budget).await.unwrap();
+    q.nack(&claim, 1, floor, &mut budget).await.unwrap();
+    assert_eq!(
+        q.store()
+            .head(&Key::new(format!("q/receipts/0000/{}", jhex16(&job_id))))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound
+    );
+    // The output is durable first-wins state: still present, unchanged.
+    let obj = q.store().get(&Key::new(committed.key), None).await.unwrap();
+    assert_eq!(&obj.body[..], b"won");
 }

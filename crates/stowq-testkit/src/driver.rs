@@ -5,9 +5,11 @@
 //! transport-level, and every core write path resolves them internally.
 
 use crate::oracle::{Oracle, Phase, Terminal};
+use bytes::Bytes;
+use sha2::{Digest as _, Sha256};
 use stowq_core::{
-    AckOutcome, Claim, ClaimOptions, ClaimOutcome, EnqueueInput, EnqueueOutcome, OpBudget,
-    OpenOptions, Queue, RenewOutcome,
+    AckOutcome, Claim, ClaimOptions, ClaimOutcome, CommitOutcome, CommittedOutput, EnqueueInput,
+    EnqueueOutcome, OpBudget, OpenOptions, Queue, RenewOutcome,
 };
 use stowq_format::FormatRecord;
 use stowq_store::{Fault, FaultPlan, Injector, MemoryStore, ObjectStore as _, Op};
@@ -43,6 +45,7 @@ pub enum DriveOp {
     Ack { job: usize },
     Nack { job: usize },
     Bury { job: usize },
+    CommitOutput { job: usize },
     AdvanceClock { to: u64 },
 }
 
@@ -85,6 +88,44 @@ fn job_id(index: usize) -> [u8; 16] {
     id
 }
 
+/// Deterministic per-job output content: every attempt of a job
+/// produces byte-identical output, which is what makes the commit
+/// rule's first-wins convergence observable.
+fn output_content(job: usize) -> Vec<u8> {
+    format!("stowq differential output for job {job}").into_bytes()
+}
+
+/// An output committed through the commit rule is durable first-wins
+/// state: whatever the job's terminal fate, once the oracle records an
+/// output the store must hold the deterministic bytes at the output
+/// key — with or without a receipt.
+#[allow(clippy::too_many_arguments)]
+async fn assert_output_persistence(
+    j: usize,
+    id: &[u8; 16],
+    hex_id: &str,
+    oracle: &Oracle,
+    store: &MemoryStore,
+    seed: u64,
+) {
+    let Some(d) = oracle.output_digest(id) else {
+        return;
+    };
+    let okey = format!("q/outputs/{hex_id}/result");
+    let oobj = store
+        .get(&stowq_store::Key::new(okey), None)
+        .await
+        .unwrap_or_else(|_| panic!("seed {seed} job {j}: committed output absent"));
+    let content = output_content(j);
+    assert_eq!(
+        &oobj.body[..],
+        &content[..],
+        "seed {seed} job {j}: output bytes are not the deterministic first-wins"
+    );
+    let got_d: [u8; 32] = Sha256::digest(&oobj.body).into();
+    assert_eq!(got_d, d, "seed {seed} job {j}: output digest drift");
+}
+
 fn job_index(id: &[u8; 16]) -> usize {
     let mut b = [0u8; 8];
     b.copy_from_slice(&id[..8]);
@@ -95,13 +136,14 @@ fn gen_ops(rng: &mut Rng, cfg: &DriverConfig) -> Vec<DriveOp> {
     let mut ops: Vec<DriveOp> = Vec::with_capacity(cfg.ops);
     for _ in 0..cfg.ops {
         let job = rng.below(cfg.jobs as u64) as usize;
-        ops.push(match rng.below(7) {
+        ops.push(match rng.below(8) {
             0 => DriveOp::Enqueue { job },
             1 => DriveOp::Claim,
             2 => DriveOp::Renew { job },
             3 => DriveOp::Ack { job },
             4 => DriveOp::Nack { job },
             5 => DriveOp::Bury { job },
+            6 => DriveOp::CommitOutput { job },
             // Exponential clock: the median draw is ~93us and the
             // maximum ~8.6s, so microsecond leases and the retry
             // backoffs both elapse.
@@ -149,6 +191,9 @@ pub async fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64
     let mut oracle = Oracle::new();
     // The real handles a worker would hold, from core returns.
     let mut held: Vec<Option<Claim>> = vec![None; cfg.jobs];
+    // Absolute store key of each job's committed output, set the first
+    // time commit_output runs for the job.
+    let mut out_keys: Vec<Option<String>> = vec![None; cfg.jobs];
     let mut budget = OpBudget::new(4_096);
     let mut exhausted = 0usize;
 
@@ -258,12 +303,57 @@ pub async fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64
                     ),
                 }
             }
+            DriveOp::CommitOutput { job } => {
+                let id = job_id(job);
+                if let Some(claim) = held[job].as_ref() {
+                    let first = oracle.output_digest(&id).is_none();
+                    let content = output_content(job);
+                    let out = queue
+                        .commit_output(claim, "result", Bytes::from(content.clone()), &mut budget)
+                        .await
+                        .expect("commit_output op");
+                    assert!(
+                        oracle.commit_output(&id, Sha256::digest(&content).into()),
+                        "seed {seed} op {i}: driver holds the claim but oracle refused the output"
+                    );
+                    let d: [u8; 32] = Sha256::digest(&content).into();
+                    match (&out, first) {
+                        (CommitOutcome::Committed(c), true) => {
+                            assert_eq!(c.digest, d, "seed {seed} op {i}");
+                            out_keys[job] = Some(c.key.clone());
+                        }
+                        (CommitOutcome::Converged(c), false) => {
+                            assert_eq!(c.digest, d, "seed {seed} op {i}");
+                        }
+                        (o, f) => panic!("seed {seed} op {i}: outcome {o:?} but first-write={f}"),
+                    }
+                } else {
+                    assert!(
+                        !oracle.commit_output(&id, [0; 32]),
+                        "seed {seed} op {i}: driver holds nothing but oracle allowed the output"
+                    );
+                }
+            }
             DriveOp::Ack { job } => {
                 let id = job_id(job);
                 match held[job].take() {
                     Some(claim) => {
                         let expected = oracle.ack(&id);
-                        let out = queue.ack(&claim, &mut budget).await.expect("ack op");
+                        // The receipt carries the committed outputs'
+                        // digests (the commit rule), so the ack
+                        // presents exactly what the oracle recorded.
+                        let outputs: Vec<CommittedOutput> =
+                            match (oracle.output_digest(&id), out_keys[job].clone()) {
+                                (Some(d), Some(k)) => vec![CommittedOutput { key: k, digest: d }],
+                                (None, None) => vec![],
+                                (od, ok) => {
+                                    panic!("seed {seed} op {i}: oracle digest {od:?} vs key {ok:?}")
+                                }
+                            };
+                        let out = queue
+                            .ack_with_outputs(&claim, &outputs, &mut budget)
+                            .await
+                            .expect("ack op");
                         // First ack commits; an already-acked receipt with
                         // matching evidence is success either way.
                         let acked = matches!(out, AckOutcome::Acked | AckOutcome::AlreadyAcked);
@@ -332,21 +422,43 @@ pub async fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64
         let id = job_id(j);
         let hex_id: String = id.iter().map(|b| format!("{b:02x}")).collect();
         let receipt = store
-            .head(&stowq_store::Key::new(format!("q/receipts/0000/{hex_id}")))
+            .get(
+                &stowq_store::Key::new(format!("q/receipts/0000/{hex_id}")),
+                None,
+            )
             .await;
         let dead = store
             .head(&stowq_store::Key::new(format!("q/dead/0000/{hex_id}")))
             .await;
         match oracle.jobs.get(&id).map(|s| &s.phase) {
             Some(Phase::Terminal(Terminal::Receipt)) => {
-                assert!(
-                    receipt.is_ok(),
-                    "seed {seed} job {j}: oracle receipt, store none"
-                );
+                let obj = receipt
+                    .as_ref()
+                    .expect("seed {seed} job {j}: oracle receipt, store none");
                 assert!(
                     dead.is_err(),
                     "seed {seed} job {j}: oracle receipt but dead exists"
                 );
+                // The receipt's output digests are the commit rule's
+                // record: they must equal exactly what the oracle
+                // expects, and the output object itself must hold the
+                // deterministic first-wins bytes.
+                let rel = format!("receipts/0000/{hex_id}");
+                let tag = stowq_keys::key_tag(&[1; 16], &rel);
+                match stowq_format::decode(&obj.body, &[1; 16], &tag) {
+                    Ok(stowq_format::Record::Receipt(r)) => {
+                        let expected_outputs = match oracle.output_digest(&id) {
+                            Some(d) => vec![d],
+                            None => vec![],
+                        };
+                        assert_eq!(
+                            r.output_digests, expected_outputs,
+                            "seed {seed} job {j}: receipt output digests diverge from the oracle"
+                        );
+                    }
+                    other => panic!("seed {seed} job {j}: receipt undecodable: {other:?}"),
+                }
+                assert_output_persistence(j, &id, &hex_id, &oracle, &store, seed).await;
             }
             Some(Phase::Terminal(Terminal::Dead { .. })) => {
                 assert!(dead.is_ok(), "seed {seed} job {j}: oracle dead, store none");
@@ -354,12 +466,14 @@ pub async fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64
                     receipt.is_err(),
                     "seed {seed} job {j}: oracle dead but receipt exists"
                 );
+                assert_output_persistence(j, &id, &hex_id, &oracle, &store, seed).await;
             }
             _ => {
                 assert!(
                     receipt.is_err() && dead.is_err(),
                     "seed {seed} job {j}: oracle non-terminal but store has a terminal record"
                 );
+                assert_output_persistence(j, &id, &hex_id, &oracle, &store, seed).await;
             }
         }
     }

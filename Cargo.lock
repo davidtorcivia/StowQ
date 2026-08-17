@@ -1770,6 +1770,7 @@ dependencies = [
 name = "stowq-testkit"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "sha2 0.10.9",
  "stowq-core",
  "stowq-format",
