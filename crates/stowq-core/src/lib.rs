@@ -1155,7 +1155,10 @@ impl Queue {
     /// fencing. Stops at `max`, at scan end, or when the budget runs
     /// dry: a partial batch is returned, an empty one propagates the
     /// error (for `max == 1` the observable behavior is exactly
-    /// [`Queue::claim`]'s). The budget must serve the WHOLE wave —
+    /// [`Queue::claim`]'s). An error in a wave does not prevent
+    /// wave-mates' claims from being taken and returned; the erroring
+    /// candidate is not memoized and re-surfaces on the next scan.
+    /// The budget must serve the WHOLE wave —
     /// equal-split children that are individually too small exhaust
     /// together (size budgets to the batch, not to one claim chain).
     /// A claimant holding several leases keeps
@@ -1213,11 +1216,11 @@ impl Queue {
                 if claims.len() >= max {
                     return Ok(claims);
                 }
-                // The scan's budget boundary is a partial batch, not
-                // an error — the caller resumes with a fresh budget.
-                if budget.max_ops == 0 {
-                    return Ok(claims);
-                }
+                // Child errors surface before the budget boundary:
+                // with the merge landing the parent at exactly zero,
+                // an exhausted child's error must still propagate (the
+                // zero check alone would swallow it as an empty
+                // partial batch).
                 if let Some(e) = first_err {
                     return if claims.is_empty() {
                         Err(e)
@@ -1231,6 +1234,11 @@ impl Queue {
                     } else {
                         Ok(claims)
                     };
+                }
+                // The scan's budget boundary is a partial batch, not
+                // an error — the caller resumes with a fresh budget.
+                if budget.max_ops == 0 {
+                    return Ok(claims);
                 }
             }
             if scan_done || claims.len() >= max {

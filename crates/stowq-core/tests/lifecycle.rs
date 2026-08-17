@@ -2996,11 +2996,14 @@ async fn claim_many_spreads_thin_budgets_across_the_wave() {
             panic!()
         };
     }
-    // A budget that would serve ONE candidate sequentially is spread
-    // across the wave (24/4 = 6 per child — below a full claim chain),
-    // so every child exhausts and an empty batch surfaces the error.
-    // Documented spread semantics: callers size budgets to the wave.
-    let mut thin = OpBudget::new(24);
+    // A budget that would serve candidates sequentially is spread
+    // across the wave: the outer listing spends 1, then 23/4 = 5 per
+    // child — below the 9 a fresh claim chain costs — so every child
+    // exhausts and an empty batch surfaces the error. Budget 25 (not
+    // 24) pins the exact-zero edge: the merge lands the parent at 0
+    // and the error must STILL surface (a zero-first check would
+    // swallow it as an empty partial batch).
+    let mut thin = OpBudget::new(25);
     match q
         .claim_many(&claim_opts(0, 60_000_000_000), 4, &mut thin)
         .await
