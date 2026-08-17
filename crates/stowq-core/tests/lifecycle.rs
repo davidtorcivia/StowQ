@@ -2,7 +2,11 @@
 //! ack, nack, bury, takeover, exhaustion, and budgets.
 
 use sha2::Digest as _;
-use stowq_core::{ClaimOptions, EnqueueInput, EnqueueOutcome, Error, OpBudget, OpenOptions, Queue};
+use std::sync::Arc;
+
+use stowq_core::{
+    ClaimOptions, ClaimOutcome, EnqueueInput, EnqueueOutcome, Error, OpBudget, OpenOptions, Queue,
+};
 use stowq_format::FormatRecord;
 use stowq_store::{Key, MemoryStore, StoreError};
 
@@ -2471,4 +2475,294 @@ async fn committed_output_persists_without_a_receipt() {
     // The output is durable first-wins state: still present, unchanged.
     let obj = q.store().get(&Key::new(committed.key), None).await.unwrap();
     assert_eq!(&obj.body[..], b"won");
+}
+
+// ---------- claim-scan terminality memo ----------
+
+/// Counts head calls per job hex: terminal-probe attribution for the
+/// memo tests (scan heads for the backlog ids must vanish; the live
+/// id pays its receipt+dead probes).
+struct CountHeads {
+    inner: MemoryStore,
+    watched: Vec<String>,
+    counts: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+#[async_trait::async_trait]
+impl stowq_store::ObjectStore for CountHeads {
+    async fn put_if_absent(
+        &self,
+        key: &Key,
+        body: bytes::Bytes,
+        sha256: [u8; 32],
+    ) -> stowq_store::StoreResult<stowq_store::PutOutcome> {
+        self.inner.put_if_absent(key, body, sha256).await
+    }
+    async fn cas(
+        &self,
+        key: &Key,
+        body: bytes::Bytes,
+        sha256: [u8; 32],
+        if_match: &stowq_store::Version,
+    ) -> stowq_store::StoreResult<stowq_store::PutOutcome> {
+        self.inner.cas(key, body, sha256, if_match).await
+    }
+    async fn get(
+        &self,
+        key: &Key,
+        range: Option<std::ops::Range<u64>>,
+    ) -> stowq_store::StoreResult<stowq_store::Object> {
+        self.inner.get(key, range).await
+    }
+    async fn head(&self, key: &Key) -> stowq_store::StoreResult<stowq_store::Meta> {
+        {
+            let k = key.as_str();
+            let mut counts = self.counts.lock().unwrap();
+            for (i, w) in self.watched.iter().enumerate() {
+                if k.contains(w) {
+                    counts[i] += 1;
+                }
+            }
+        }
+        self.inner.head(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+        after: Option<&Key>,
+        limit: usize,
+    ) -> stowq_store::StoreResult<stowq_store::Page> {
+        self.inner.list(prefix, after, limit).await
+    }
+    async fn delete(&self, key: &Key) -> stowq_store::StoreResult<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// The memo: after this handle proves jobs terminal, later scans skip
+/// their receipt/dead heads; a fresh handle pays the full scan; a live
+/// job behind the backlog is still found.
+#[tokio::test]
+async fn terminal_backlog_scan_is_memoized_per_handle() {
+    struct Fixture;
+
+    impl Fixture {
+        async fn enqueue(q: &Queue, id: [u8; 16]) {
+            let mut b = OpBudget::new(64);
+            let out = q
+                .enqueue(
+                    EnqueueInput {
+                        job_id: Some(id),
+                        payload: b"x",
+                        content_type: "text/plain".into(),
+                        maximum_attempts: 3,
+                        not_before_ns: None,
+                    },
+                    &mut b,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(out, EnqueueOutcome::Committed { .. }));
+        }
+    }
+
+    let backlog: Vec<String> = (0..5u8)
+        .map(|i| ([i; 16]).iter().map(|b| format!("{b:02x}")).collect())
+        .collect();
+    let live: String = [0xAAu8; 16].iter().map(|b| format!("{b:02x}")).collect();
+    let watched = backlog
+        .iter()
+        .cloned()
+        .chain([live.clone()])
+        .collect::<Vec<_>>();
+
+    fn delta_since(
+        counts: &std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+        before: &[u64],
+    ) -> Vec<u64> {
+        // Scoped: the guard drops before any later store call can
+        // re-lock it (head tallies inside CountHeads share the mutex).
+        let now = counts.lock().unwrap();
+        now.iter().zip(before).map(|(a, b)| a - b).collect()
+    }
+    let mem = MemoryStore::new();
+    let counts = Arc::new(std::sync::Mutex::new(vec![0u64; watched.len()]));
+    let q = Queue::init(
+        Box::new(CountHeads {
+            inner: mem.clone(),
+            watched: watched.clone(),
+            counts: counts.clone(),
+        }),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .await
+    .unwrap();
+
+    // A backlog of 5 acked jobs.
+    for i in 0..5u8 {
+        Fixture::enqueue(&q, [i; 16]).await;
+        let mut b = OpBudget::new(512);
+        let ClaimOutcome::Claimed(c) = q
+            .claim(&claim_opts(0, 60_000_000_000), &mut b)
+            .await
+            .unwrap()
+        else {
+            panic!("claim {i}")
+        };
+        q.ack(&c, &mut b).await.unwrap();
+    }
+
+    // One live job behind the backlog.
+    Fixture::enqueue(&q, [0xAA; 16]).await;
+    let mut b = OpBudget::new(512);
+    let before: Vec<u64> = counts.lock().unwrap().clone();
+    let ClaimOutcome::Claimed(c) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!("live job behind backlog must be found")
+    };
+    assert_eq!(c.job_id, [0xAA; 16]);
+    // Memoization is lazy (proves on first post-terminal encounter):
+    // jobs 0-3 were encountered during earlier claim rounds and
+    // contribute zero heads now; job 4 (claimed then acked last) meets
+    // its first scan here and pays its single receipt probe. The live
+    // job pays its terminal probes (receipt + dead) plus the
+    // claims-tail head — all winner machinery, not backlog cost.
+    for (i, d) in delta_since(&counts, &before).into_iter().enumerate() {
+        let expect = if i < 4 {
+            0
+        } else if i == 4 {
+            1
+        } else {
+            3
+        };
+        assert_eq!(
+            d, expect,
+            "job {i}: at most one terminal head per handle, amortized"
+        );
+    }
+
+    // Second round: same shape, memo persists on the handle.
+    q.ack(&c, &mut b).await.unwrap();
+    let before: Vec<u64> = counts.lock().unwrap().clone();
+    let mut b = OpBudget::new(512);
+    assert!(matches!(
+        q.claim(&claim_opts(0, 60_000_000_000), &mut b).await,
+        Ok(ClaimOutcome::Empty)
+    ));
+    // NOTE: [AA] went claimed -> acked without a scan encounter, so
+    // this scan lazily memoizes it: exactly one receipt head, then the
+    // rest zero.
+    for (i, d) in delta_since(&counts, &before).into_iter().enumerate() {
+        let expect = if i < 5 { 0 } else { 1 };
+        assert_eq!(d, expect, "job {i}: lazy memoization pays once, then zero");
+    }
+
+    // A fresh handle pays the full scan: six terminal jobs now.
+    let fresh = Queue::open(
+        Box::new(CountHeads {
+            inner: mem.clone(),
+            watched: watched.clone(),
+            counts: counts.clone(),
+        }),
+        "q",
+        OpenOptions::new([1; 16]),
+    )
+    .await
+    .unwrap();
+    let before: Vec<u64> = counts.lock().unwrap().clone();
+    let mut b = OpBudget::new(512);
+    assert!(matches!(
+        fresh.claim(&claim_opts(0, 60_000_000_000), &mut b).await,
+        Ok(ClaimOutcome::Empty)
+    ));
+    // Fresh handle, cold memo: every terminal job pays its receipt
+    // probe (the hit returns before the dead probe).
+    let d = delta_since(&counts, &before);
+    let live_seen = d[5];
+    let backlog_seen: u64 = (0..5).map(|i| d[i]).sum();
+    assert_eq!(
+        backlog_seen, 5,
+        "cold memo: each backlog job pays one receipt head"
+    );
+    assert_eq!(live_seen, 1, "the acked live job pays one receipt head");
+}
+
+/// The memo is keyed by the jobs-entry VERSION: a deleted-then-
+/// re-enqueued incarnation (the GC-then-reuse shape) never matches and
+/// is re-examined. Kills an id-only-keyed memo mutant.
+#[tokio::test]
+async fn reenqueued_incarnation_after_graph_delete_is_rescanned() {
+    let q = make_queue().await;
+    let mut b = OpBudget::new(512);
+    let id = [0x5A; 16];
+    let out = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some(id),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(out, EnqueueOutcome::Committed { .. }));
+    let ClaimOutcome::Claimed(c) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!("claim")
+    };
+    q.ack(&c, &mut b).await.unwrap();
+    // Populate the memo for this job.
+    assert!(matches!(
+        q.claim(&claim_opts(0, 60_000_000_000), &mut b).await,
+        Ok(ClaimOutcome::Empty)
+    ));
+
+    // Simulate GC deleting the terminal graph (jobs entry + receipt +
+    // index entries), then re-enqueue the SAME id: a fresh incarnation
+    // with a new jobs-entry version.
+    let hex: String = id.iter().map(|x| format!("{x:02x}")).collect();
+    for key in [
+        format!("q/jobs/0000/{hex}"),
+        format!("q/receipts/0000/{hex}"),
+        format!("q/claims/0000/{hex}/00000001"),
+    ] {
+        q.store().delete(&Key::new(key)).await.unwrap();
+    }
+    let out = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some(id),
+                payload: b"y",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(out, EnqueueOutcome::Committed { .. }),
+        "re-enqueue after graph delete must commit"
+    );
+    let ClaimOutcome::Claimed(c2) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!("re-enqueued incarnation must not be falsely skipped by the memo")
+    };
+    assert_eq!(c2.job_id, id);
+    assert_eq!(c2.generation, 1, "fresh incarnation starts a fresh chain");
 }

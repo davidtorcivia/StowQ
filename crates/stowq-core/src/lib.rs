@@ -369,8 +369,29 @@ pub struct Queue {
     /// Cached wall floor (store time) and when it was established; see
     /// establish_floor.
     floor: std::sync::Mutex<FloorCache>,
+    /// Scan-proven terminal jobs, keyed by the jobs index entry's
+    /// version with a staleness deadline; see memoize_terminal.
+    terminal_memo: std::sync::Mutex<TerminalMemo>,
     clock: std::sync::Arc<dyn ElapsedClock>,
 }
+
+/// The terminality memo's entry cap: on overflow it is cleared
+/// wholesale and the scan re-proves lazily. Bounded memory; the worst
+/// case is one full re-scan per cap-overflow, never a wrong skip.
+/// Jobs this handle has proven terminal: (shard, job_id) to the
+/// jobs-entry version at proof time and the proof's clock reading.
+type TerminalMemo = std::collections::HashMap<(u16, [u8; 16]), (Version, u64)>;
+
+const TERMINAL_MEMO_CAP: usize = 65_536;
+
+/// A memo entry is honored for at most this long (the floor-staleness
+/// philosophy: staleness only delays work). Versions are not
+/// incarnation proofs on every backend — content-addressed stores
+/// (S3-family ETags) repeat versions across byte-identical
+/// re-enqueues after GC — so a stale entry is re-proven after the
+/// window; the version key still catches every input-changing
+/// re-enqueue immediately.
+const TERMINAL_MEMO_TTL_NS: u64 = 30 * 1_000_000_000;
 
 /// Elapsed time since an arbitrary fixed anchor, monotone. The floor
 /// cache trusts local time only for its staleness deadline, never for
@@ -395,6 +416,31 @@ impl NativeElapsedClock {
 impl Default for NativeElapsedClock {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Test clock: settable reading.
+#[cfg(test)]
+pub(crate) struct FakeClock {
+    now: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl FakeClock {
+    pub(crate) fn new() -> Self {
+        FakeClock {
+            now: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    pub(crate) fn advance_ns(&self, ns: u64) {
+        self.now.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+impl ElapsedClock for FakeClock {
+    fn elapsed_ns(&self) -> u64 {
+        self.now.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -428,6 +474,23 @@ impl Queue {
         root: &str,
         opts: OpenOptions,
     ) -> Result<Self, Error> {
+        Self::open_with_clock(
+            store,
+            root,
+            opts,
+            std::sync::Arc::new(NativeElapsedClock::new()),
+        )
+        .await
+    }
+
+    /// [`Queue::open`] with an injected elapsed clock — for tests that
+    /// advance time past staleness windows.
+    pub async fn open_with_clock(
+        store: Box<dyn ObjectStore>,
+        root: &str,
+        opts: OpenOptions,
+        clock: std::sync::Arc<dyn ElapsedClock>,
+    ) -> Result<Self, Error> {
         let root = format!("{}/", root.trim_end_matches('/'));
         let mut q = Queue {
             store,
@@ -445,7 +508,8 @@ impl Queue {
                 floor_ns: 0,
                 established_at_ns: 0,
             }),
-            clock: std::sync::Arc::new(NativeElapsedClock::new()),
+            terminal_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
+            clock,
         };
         let key = q.absolute(&RelKey::Format);
         let tag = key_tag(&q.opts.queue_id, "meta/FORMAT");
@@ -517,6 +581,32 @@ impl Queue {
     /// The underlying store, for inspection and audit tooling.
     pub fn store(&self) -> &dyn ObjectStore {
         self.store.as_ref()
+    }
+
+    fn is_memoized_terminal(&self, shard: u16, job_id: [u8; 16], version: &Version) -> bool {
+        self.terminal_memo
+            .lock()
+            .unwrap()
+            .get(&(shard, job_id))
+            .is_some_and(|(v, at)| {
+                v == version && self.clock.elapsed_ns().saturating_sub(*at) < TERMINAL_MEMO_TTL_NS
+            })
+    }
+
+    /// Records that this handle proved the job terminal while its jobs
+    /// index entry had this version. Terminality is monotone (receipts
+    /// and dead records are never un-written; GC removes the whole
+    /// graph including the jobs entry), and a version mismatch always
+    /// re-examines — but a version match is not an incarnation proof
+    /// on content-addressed backends (identical-input re-enqueues
+    /// repeat etags), so entries carry a staleness deadline and are
+    /// re-proven once per window.
+    fn memoize_terminal(&self, shard: u16, job_id: [u8; 16], version: Version) {
+        let mut memo = self.terminal_memo.lock().unwrap();
+        if memo.len() >= TERMINAL_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert((shard, job_id), (version, self.clock.elapsed_ns()));
     }
 
     /// Establishes a wall floor (spec time.md): PUT a beacon, read it
@@ -1023,7 +1113,7 @@ impl Queue {
         let mut after: Option<Key> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(&shard_prefix, after.as_ref(), 32).await?;
+            let page = self.store.list(&shard_prefix, after.as_ref(), 1024).await?;
             if page.items.is_empty() {
                 return Ok(ClaimOutcome::Empty);
             }
@@ -1038,7 +1128,16 @@ impl Queue {
                 else {
                     continue;
                 };
-                if let Some(claim) = self.try_claim(job_id, shard, opts, budget).await? {
+                // Skip jobs this handle already proved terminal (same
+                // jobs-entry version): the receipt/dead heads would
+                // only re-confirm. A fresh handle pays the full scan.
+                if self.is_memoized_terminal(shard, job_id, &listing.meta.version) {
+                    continue;
+                }
+                if let Some(claim) = self
+                    .try_claim(job_id, shard, &listing.meta.version, opts, budget)
+                    .await?
+                {
                     return Ok(ClaimOutcome::Claimed(claim));
                 }
                 if budget.max_ops == 0 {
@@ -1057,6 +1156,7 @@ impl Queue {
         &self,
         job_id: [u8; 16],
         shard: u16,
+        jobs_version: &Version,
         opts: &ClaimOptions,
         budget: &mut OpBudget,
     ) -> Result<Option<Claim>, Error> {
@@ -1069,7 +1169,10 @@ impl Queue {
         ] {
             budget.spend()?;
             match self.store.head(&self.absolute(&rel)).await {
-                Ok(_) => return Ok(None),
+                Ok(_) => {
+                    self.memoize_terminal(shard, job_id, jobs_version.clone());
+                    return Ok(None);
+                }
                 Err(StoreError::NotFound) => {}
                 Err(e) => return Err(e.into()),
             }
@@ -3247,6 +3350,46 @@ mod handle_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Record(_)));
+    }
+
+    #[tokio::test]
+    async fn terminal_memo_entries_expire_past_the_ttl() {
+        use stowq_store::MemoryStore;
+        let clock = std::sync::Arc::new(FakeClock::new());
+        let mem = MemoryStore::new();
+        Queue::init(
+            Box::new(mem.clone()),
+            "q",
+            &OpenOptions::new([1; 16]),
+            &stowq_format::FormatRecord {
+                shard_count: 1,
+                lease_bucket_width_ns: 1_000,
+                delayed_bucket_width_ns: 1_000,
+                terminal_bucket_width_ns: 1_000,
+                inline_limit: 4_096,
+                required_feature_bits: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let q =
+            Queue::open_with_clock(Box::new(mem), "q", OpenOptions::new([1; 16]), clock.clone())
+                .await
+                .unwrap();
+        let v = Version("v1".into());
+        q.memoize_terminal(0, [9; 16], v.clone());
+        assert!(
+            q.is_memoized_terminal(0, [9; 16], &v),
+            "fresh entry is honored"
+        );
+        clock.advance_ns(super::TERMINAL_MEMO_TTL_NS);
+        assert!(
+            !q.is_memoized_terminal(0, [9; 16], &v),
+            "an entry past the TTL is re-proven (content-addressed backends repeat versions across byte-identical re-enqueues)"
+        );
+        // A different version never matches at any age.
+        q.memoize_terminal(0, [9; 16], Version("v2".into()));
+        assert!(!q.is_memoized_terminal(0, [9; 16], &v));
     }
 
     #[tokio::test]
