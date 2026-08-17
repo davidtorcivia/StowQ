@@ -27,6 +27,8 @@ commit rule).
   dead/<shard>/<job-id>             Terminal failure, by reason (immutable)
   termidx/<t-bucket>/<kind>/<shard>/<job-id>
                                     Advisory terminal index for GC order
+  tails/<shard>/<job-id>             Advisory claim-chain tail hint (feature bit 2;
+                                    body = 8-byte big-endian generation)
   quarantine/<t-bucket>/<qid>       Isolated corrupt/ambiguous objects
   outputs/...                       Application output space (see records.md, optional)
 ```
@@ -36,7 +38,14 @@ commit rule).
 Objects under `jobs/`, `claims/`, `fails/`, `receipts/`, `dead/` are
 **authoritative**. Objects under `leases/`, `delayed/`, and `termidx/` are
 **advisory indexes** — hints that make sweeping a bounded LIST rather than a
-full scan. An index entry proves nothing; a missing index entry hides
+full scan. `tails/` entries are the same class for claim discovery: a queue
+whose FORMAT requires feature bit 2 maintains, per live job, the generation
+of the claim-chain tail, so a takeover claim reads one object instead of
+listing the whole chain (O(1) in chain depth — the long-execution
+workload). A missing, stale, or corrupt hint falls back to the authoritative
+`claims/` listing; the claim's put-if-absent remains the fence. The hint is
+deleted with the terminal graph and is never repaired — absence is the
+fallback. An index entry proves nothing; a missing index entry hides
 nothing forever (see recovery.md, Repair scan). Correctness never reads an
 index; only efficiency does.
 

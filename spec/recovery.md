@@ -20,6 +20,20 @@ Identically over `delayed/<b>/` for due buckets: verify the job's
 authoritative `not_before` / `retry_not_before`, doorbell or claim, delete
 the index entry.
 
+## Tail hints (feature bit 2)
+
+Queues whose FORMAT requires feature bit 2 maintain
+`tails/<shard>/<job-id>` (body: 8-byte big-endian generation) as an
+advisory fast path for claim discovery. Writers update it best-effort
+at claim and renewal; readers treat it strictly as a hint: a missing
+hint, a hint pointing at a nonexistent generation, or a rejected claim
+put (stale hint) falls back to the authoritative `claims/` chain
+listing, retrying once on its evidence. The claim's put-if-absent
+remains the linearization point in every path. Hints are deleted with
+the terminal graph during GC and are never repaired — absence is the
+fallback. Old clients reject bit-2 queues at open, so they never
+observe the keys.
+
 ## Repair scan (rare, resumable)
 
 On v1.1 queues (feature bit 1) the repair scan additionally WRITES each

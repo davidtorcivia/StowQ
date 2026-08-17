@@ -57,7 +57,7 @@ fn type_name(t: u64) -> Option<&'static str> {
 /// v1.1: the feature bits this decoder understands. Bit 1 gates the
 /// quarantine record (type 8). A FORMAT demanding any other bit is
 /// rejected as an unknown required feature.
-pub const KNOWN_FEATURE_BITS: u64 = 1;
+pub const KNOWN_FEATURE_BITS: u64 = 1 | 2;
 
 fn record_digest(type_str: &str, body: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1721,10 +1721,11 @@ mod tests {
                 "{width_field} = 0 must fail validate"
             );
         }
-        // Bit 1 is known (v1.1 quarantine); bit 2 is not.
+        // Bits 1 (v1.1 quarantine) and 2 (tail hints) are known;
+        // bit 4 is not.
         assert_eq!(
             FormatRecord {
-                required_feature_bits: 2,
+                required_feature_bits: 4,
                 ..base_format()
             }
             .validate(),
@@ -1791,12 +1792,12 @@ mod tests {
         let mut f = base_format();
         f.required_feature_bits = KNOWN_FEATURE_BITS;
         assert!(f.validate().is_ok());
-        f.required_feature_bits = 2;
+        f.required_feature_bits = 4;
         assert_eq!(
             f.validate(),
             Err(RecordError::Field("required_feature_bits"))
         );
-        f.required_feature_bits = 3; // known bit plus unknown
+        f.required_feature_bits = 6; // bit 2 plus unknown bit 4
         assert_eq!(
             f.validate(),
             Err(RecordError::Field("required_feature_bits"))

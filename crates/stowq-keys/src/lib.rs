@@ -179,6 +179,12 @@ pub enum Key {
         bucket: u64,
         qid: [u8; 16],
     },
+    /// Advisory tail hint: `tails/<shard>/<job>`, body = 8-byte
+    /// big-endian generation of the claim-chain tail (feature bit 2).
+    Tail {
+        shard: u16,
+        job_id: [u8; 16],
+    },
     Beacon {
         nonce: [u8; 16],
     },
@@ -290,6 +296,12 @@ impl fmt::Display for Key {
                 s.push_str("meta/clock/");
                 push_hex(&mut s, nonce);
             }
+            Key::Tail { shard, job_id } => {
+                s.push_str("tails/");
+                push_hex(&mut s, &shard.to_be_bytes());
+                s.push('/');
+                push_hex(&mut s, job_id);
+            }
             Key::Format => s.push_str("meta/FORMAT"),
             Key::Watermark => s.push_str("meta/watermark"),
         }
@@ -399,6 +411,13 @@ pub fn parse(s: &str) -> Result<Key, ParseError> {
             Ok(Key::Quarantine {
                 bucket: field("bucket", hex_decode_u64(parts[1]))?,
                 qid: field("qid", hex_decode_fixed(parts[2]))?,
+            })
+        }
+        Some("tails") => {
+            seg(3)?;
+            Ok(Key::Tail {
+                shard: field("shard", hex_decode_u16(parts[1]))?,
+                job_id: field("job-id", hex_decode_fixed(parts[2]))?,
             })
         }
         Some("meta") => match parts.get(1).copied() {
