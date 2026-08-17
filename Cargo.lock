@@ -1782,6 +1782,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "stowq-worker"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "stowq-core",
+ "stowq-format",
+ "stowq-keys",
+ "stowq-store",
+ "tokio",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
