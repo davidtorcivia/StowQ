@@ -325,12 +325,10 @@ async fn ops_mode() -> Result<(), String> {
 
     // Backoff: advance the fake clock far past retry_not_before, then
     // continue on a fresh handle (its floor re-beacons past the
-    // advance; the old handle's cache would sit below it). The fresh
-    // counting pair shadows `counts`/`before` so the macro is unchanged.
+    // advance; the old handle's cache would sit below it).
     mem.advance_clock_to(u64::MAX / 4);
     // Rebind the SAME bindings (macro hygiene resolves `counts` and
-    // `before` at the macro definition site; shadowing would not reach
-    // the expansions).
+    // `before` at the macro definition site).
     let (s2, counts2) = CountingStore::new(mem.clone());
     counts = counts2;
     let q = Queue::open(Box::new(s2), "q", opts("ops2"))
@@ -425,7 +423,7 @@ async fn one_cycle(q: &Queue, floor: u64, i: usize, b: &mut OpBudget) -> Result<
     let EnqueueOutcome::Committed { .. } = q
         .enqueue(
             EnqueueInput {
-                job_id: Some([i as u8; 16]),
+                job_id: Some((i as u128).to_be_bytes()),
                 payload: b"bench-payload",
                 content_type: "text/plain".into(),
                 maximum_attempts: 5,
@@ -492,7 +490,7 @@ async fn mem_mode(cycles: usize) -> Result<(), String> {
     let _ = cyc_us;
     let mut a2 = allocs.clone();
     println!(
-        "allocations per cycle: median {:.0} bytes / p95 {:.0} bytes",
+        "bytes allocated per cycle (gross, incl. runtime overhead): median {:.0} / p95 {:.0}",
         median_u64(&mut a2),
         p95_u64(&mut allocs),
     );
