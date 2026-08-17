@@ -9,6 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes.workspace = true
 stowq-core.workspace = true
 stowq-format.workspace = true
 stowq-keys.workspace = true

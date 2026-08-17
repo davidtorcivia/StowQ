@@ -41,6 +41,10 @@ pub enum Phase {
 pub struct JobState {
     pub maximum_attempts: u64,
     pub phase: Phase,
+    /// Digest of the job's committed output, once written through the
+    /// commit rule. Immutable from then on: the store's first-wins
+    /// bytes are the only possible value.
+    pub output: Option<[u8; 32]>,
 }
 
 /// What the oracle expects a driver operation to return.
@@ -80,6 +84,7 @@ impl Oracle {
                     JobState {
                         maximum_attempts,
                         phase: Phase::Ready { not_before },
+                        output: None,
                     },
                 );
                 true
@@ -247,6 +252,29 @@ impl Oracle {
             Phase::Terminal(Terminal::Receipt) => false, // already acked
             _ => false,
         }
+    }
+
+    /// Records a commit-rule output write. Allowed only while a
+    /// claim is held (the harness discipline); returns false without
+    /// recording otherwise.
+    pub fn commit_output(&mut self, job_id: &[u8; 16], digest: [u8; 32]) -> bool {
+        let Some(state) = self.jobs.get_mut(job_id) else {
+            return false;
+        };
+        match state.phase {
+            Phase::Claimed { .. } => {
+                if state.output.is_none() {
+                    state.output = Some(digest);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The committed output digest for a job, if any.
+    pub fn output_digest(&self, job_id: &[u8; 16]) -> Option<[u8; 32]> {
+        self.jobs.get(job_id).and_then(|s| s.output)
     }
 
     pub fn nack(&mut self, job_id: &[u8; 16], not_before: u64) -> bool {

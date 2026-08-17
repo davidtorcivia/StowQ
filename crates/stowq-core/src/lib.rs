@@ -249,6 +249,27 @@ pub enum AckOutcome {
     SupersededByDead,
 }
 
+/// A store-resident effect committed through the commit rule
+/// (spec records.md): put-if-absent at a deterministic job-derived key
+/// under `outputs/`, written before the receipt. Produced by
+/// `Queue::commit_output` and passed back verbatim to
+/// `ack_with_outputs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedOutput {
+    /// Absolute store key of the output object.
+    pub key: String,
+    pub digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// This call's put-if-absent won; the stored bytes are ours.
+    Committed(CommittedOutput),
+    /// The key already held byte-identical content (a duplicate
+    /// attempt converging on the first-wins result); nothing written.
+    Converged(CommittedOutput),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuryOutcome {
     /// The dead record committed.
@@ -283,6 +304,10 @@ pub enum Error {
     PayloadCorrupt,
     #[error("receipt evidence mismatch")]
     ReceiptEvidenceMismatch,
+    #[error("output key holds different bytes (output_digest_conflict, 0x0011); first-wins digest: {}", hex(.0))]
+    OutputConflict(Digest),
+    #[error("output evidence mismatch: {0}")]
+    OutputEvidenceMismatch(String),
     #[error("operation budget hit an internal invariant; report this")]
     Internal(String),
 }
@@ -290,6 +315,35 @@ pub enum Error {
 impl From<stowq_format::RecordError> for Error {
     fn from(e: stowq_format::RecordError) -> Self {
         Error::Record(e.to_string())
+    }
+}
+
+/// Output names select a key under `outputs/<job-id>/`. `outputs/` is
+/// application space (spec namespace.md); the only protocol constraint
+/// is that a name cannot escape the job's prefix.
+fn valid_output_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && name
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// Classifies the bytes found at an output key against the digest we
+/// intended to write: identical bytes are convergence on the
+/// first-wins result; different bytes are an output conflict.
+fn classify_output(
+    obj: &stowq_store::Object,
+    digest: Digest,
+    out: CommittedOutput,
+) -> Result<CommitOutcome, Error> {
+    let got: Digest = Sha256::digest(&obj.body).into();
+    if got == digest {
+        Ok(CommitOutcome::Converged(out))
+    } else {
+        Err(Error::OutputConflict(got))
     }
 }
 
@@ -1279,7 +1333,99 @@ impl Queue {
 
     // ---------- ack ----------
 
+    /// Commits a store-resident effect through the commit rule (spec
+    /// records.md): put-if-absent at `<root>outputs/<job-id>/<name>` —
+    /// a deterministic key derived from `job_id`, never from attempt
+    /// or generation — with the digest verified by the store (P7).
+    /// Duplicate attempts converge on the first-wins bytes
+    /// (`Converged`); different bytes already at the key are
+    /// `OutputConflict` (the 0x0011 semantics, surfaced to the
+    /// caller). Write outputs through this BEFORE the receipt:
+    /// `ack_with_outputs` verifies and records them, so a receipt
+    /// implies its outputs exist and are final.
+    pub async fn commit_output(
+        &self,
+        claim: &Claim,
+        name: &str,
+        body: Bytes,
+        budget: &mut OpBudget,
+    ) -> Result<CommitOutcome, Error> {
+        if !valid_output_name(name) {
+            return Err(Error::Key(format!("invalid output name {name:?}")));
+        }
+        let digest: Digest = Sha256::digest(&body).into();
+        let abs = Key::new(format!(
+            "{}outputs/{}/{}",
+            self.root,
+            hex(&claim.job_id),
+            name
+        ));
+        let out = CommittedOutput {
+            key: abs.0.clone(),
+            digest,
+        };
+        let mut transport_retries = 0;
+        loop {
+            budget.spend()?;
+            match self.store.put_if_absent(&abs, body.clone(), digest).await {
+                Ok(PutOutcome::Committed { .. }) => return Ok(CommitOutcome::Committed(out)),
+                Ok(PutOutcome::Rejected) => {
+                    // First-wins: the bytes already at the key decide.
+                    let obj = self.read_retrying(&abs, budget).await?;
+                    return classify_output(&obj, digest, out);
+                }
+                Err(StoreError::Transport(_)) => {
+                    transport_retries += 1;
+                    if transport_retries > RETRY_TRANSPORT_MAX {
+                        return Err(Error::TransportExhausted);
+                    }
+                    continue;
+                }
+                Err(StoreError::OutcomeUnknown(_)) => {
+                    // Present means committed (possibly by us before the
+                    // response was lost); absent means retry the put.
+                    match self.read_retrying(&abs, budget).await {
+                        Ok(obj) => return classify_output(&obj, digest, out),
+                        Err(Error::Store(StoreError::NotFound)) => {
+                            transport_retries += 1;
+                            if transport_retries > RETRY_TRANSPORT_MAX {
+                                return Err(Error::TransportExhausted);
+                            }
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Acknowledges, recording no outputs (the v1 shape; identical to
+    /// `ack_with_outputs(&[])`).
     pub async fn ack(&self, claim: &Claim, budget: &mut OpBudget) -> Result<AckOutcome, Error> {
+        self.ack_inner(claim, &[], budget).await
+    }
+
+    /// Acknowledges with committed outputs: each output is re-read and
+    /// digest-verified before the receipt write, and the receipt
+    /// records their digests. The commit rule ordering (outputs before
+    /// receipt) is the caller's; this verifies the result.
+    pub async fn ack_with_outputs(
+        &self,
+        claim: &Claim,
+        outputs: &[CommittedOutput],
+        budget: &mut OpBudget,
+    ) -> Result<AckOutcome, Error> {
+        self.ack_inner(claim, outputs, budget).await
+    }
+
+    async fn ack_inner(
+        &self,
+        claim: &Claim,
+        outputs: &[CommittedOutput],
+        budget: &mut OpBudget,
+    ) -> Result<AckOutcome, Error> {
         // A dead record terminalized the job first; refuse so at most
         // one terminal record per job ever exists.
         budget.spend()?;
@@ -1300,6 +1446,31 @@ impl Queue {
         let payload = claim.payload(self.store.as_ref()).await?;
         let digest: Digest = Sha256::digest(&payload).into();
 
+        // Commit rule: verify every recorded output exists with its
+        // committed digest before the terminal write; a receipt
+        // implies its outputs exist and are final.
+        for out in outputs {
+            match self.read_retrying(&Key::new(out.key.clone()), budget).await {
+                Ok(obj) => {
+                    let got: Digest = Sha256::digest(&obj.body).into();
+                    if got != out.digest {
+                        return Err(Error::OutputEvidenceMismatch(format!(
+                            "output {} body does not match its committed digest",
+                            out.key
+                        )));
+                    }
+                }
+                Err(Error::Store(StoreError::NotFound)) => {
+                    return Err(Error::OutputEvidenceMismatch(format!(
+                        "output {} absent at ack",
+                        out.key
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let output_digests: Vec<Digest> = outputs.iter().map(|o| o.digest).collect();
         let record = Record::Receipt(ReceiptRecord {
             job_id: claim.job_id,
             generation: claim.generation,
@@ -1307,7 +1478,7 @@ impl Queue {
             worker_id: self.opts.worker_id.clone(),
             worker_token: claim.worker_token,
             payload_digest: digest,
-            output_digests: vec![],
+            output_digests: output_digests.clone(),
         });
         let rel = RelKey::Receipt {
             shard: claim.shard,
@@ -1344,7 +1515,8 @@ impl Queue {
                         if r.job_id == claim.job_id
                             && r.generation == claim.generation
                             && r.attempt == claim.attempt
-                            && r.payload_digest == digest =>
+                            && r.payload_digest == digest
+                            && r.output_digests == output_digests =>
                     {
                         Ok(AckOutcome::AlreadyAcked)
                     }

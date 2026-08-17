@@ -437,3 +437,62 @@ async fn init_rejected_branch_read_unknown_retries() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn unknown_committed_on_commit_output_resolves_to_converged() {
+    // PutIfAbsent indexes from process start: FORMAT(0) in init,
+    // job(1) in enqueue, claim record(2) + lease-index entry(3) in
+    // claim, and the output put(4).
+    // Committed-but-response-lost: the resolver re-reads the key, the
+    // bytes match, and the outcome is Converged (first-wins held).
+    let injector = Injector::new(
+        MemoryStore::new(),
+        vec![FaultPlan::new(
+            Op::PutIfAbsent,
+            Fault::PostTransmitAfter,
+            [4],
+        )],
+    );
+    let q = Queue::init(
+        Box::new(injector),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .await
+    .unwrap();
+    let mut budget = OpBudget::new(128);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([9; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .await
+    .unwrap();
+    let stowq_core::ClaimOutcome::Claimed(claim) =
+        q.claim(&claim_opts(0), &mut budget).await.unwrap()
+    else {
+        panic!("claim")
+    };
+    let out = q
+        .commit_output(&claim, "r", bytes::Bytes::from_static(b"out"), &mut budget)
+        .await
+        .unwrap();
+    let committed = match out {
+        stowq_core::CommitOutcome::Converged(c) => c,
+        other => panic!("resolved outcome must be Converged, got {other:?}"),
+    };
+    // The committed output is ackable: the resolution read proved the
+    // bytes, so the ack's verification re-read succeeds.
+    assert_eq!(
+        q.ack_with_outputs(&claim, &[committed], &mut budget)
+            .await
+            .unwrap(),
+        stowq_core::AckOutcome::Acked
+    );
+}
