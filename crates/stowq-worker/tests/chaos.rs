@@ -307,15 +307,24 @@ async fn duplicate_doorbell_corpus() {
     const ITERS: usize = 25;
     const WORKERS: usize = 4;
     const PAYLOAD: &[u8] = b"chaos-duplicate-payload";
+    let mut lost_total = 0;
 
     for s in 0..ITERS {
         let store = init_store().await;
         let job_id = enqueue(&store, PAYLOAD).await;
-        // Leases are tiny in STORE time (MemoryStore ticks 1ns per
-        // op), so a rival's beacon+scan+claim can genuinely lapse a
-        // live lease: takeovers and zombie convergence interleave with
-        // straight deliveries across iterations.
-        let lease_ns = 50 + (s % 5) as u64 * 10;
+        // A takeover needs a rival whose BEACON write lands at or past
+        // the holder's claim time plus the lease — and MemoryStore's
+        // clock only advances on writes (~1ns each), while a claim
+        // puts two objects (claim, lease index). Empirically (probed):
+        // same-instant spawns all beacon before anyone claims, so the
+        // rivals must arrive comfortably after the holder has claimed:
+        // per-worker staggered wall delays (500us + w*300us) against a
+        // 1-2ns store lease put the rivals' beacons past the claim,
+        // and the race genuinely produces BOTH interleavings — some
+        // runs the holder delivers (rivals NoWork on the receipt),
+        // some runs a rival takes over (holder LostLease at its
+        // renewal tick, rival delivers).
+        let lease_ns = 1 + (s % 2) as u64;
 
         struct SlowThenDeliver(Duration);
 
@@ -339,7 +348,16 @@ async fn duplicate_doorbell_corpus() {
         let mut handles = Vec::new();
         for w in 0..WORKERS {
             let ws = store.clone();
+            let d = if w == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_micros(500 + w as u64 * 300)
+            };
             handles.push(tokio::spawn(async move {
+                // Rivals arrive after the holder's claim (see the
+                // lease comment above): their beacons land past it,
+                // so takeovers genuinely occur.
+                tokio::time::sleep(d).await;
                 let q = Queue::open(Box::new(ws), "q", opts()).await.unwrap();
                 let exec: Box<dyn Executor> = if w == 0 {
                     Box::new(SlowThenDeliver(Duration::from_millis(30)))
@@ -350,6 +368,7 @@ async fn duplicate_doorbell_corpus() {
             }));
         }
         let mut delivered = 0;
+        let mut lost = 0;
         for h in handles {
             let report = h
                 .await
@@ -357,13 +376,22 @@ async fn duplicate_doorbell_corpus() {
                 .unwrap_or_else(|e| panic!("iter {s}: worker errored: {e:?}"));
             match report {
                 DeliveryReport::Delivered { .. } => delivered += 1,
-                DeliveryReport::NoWork | DeliveryReport::LostLease => {}
+                DeliveryReport::LostLease => lost += 1,
+                DeliveryReport::NoWork => {}
                 other => panic!("iter {s}: unexpected report {other:?}"),
             }
         }
         assert!(delivered >= 1, "iter {s}: nobody delivered");
+        lost_total += lost;
         assert_converged(&store, &job_id, PAYLOAD).await;
     }
+    // The corpus must actually exercise takeovers somewhere: a lease
+    // lost to a rival proves the takeover interleaving was reached
+    // (and with it the zombie paths: convergence or equivalence).
+    assert!(
+        lost_total > 0,
+        "no takeover occurred in {ITERS} iterations — the race is not racing"
+    );
 }
 
 // ---------- Floor regression fails closed ----------
@@ -445,10 +473,15 @@ async fn renewal_starvation_corpus() {
     let store = init_store().await;
     let job_id = enqueue(&store, b"chaos-starve-payload").await;
 
-    // Lease 300ms (tick 100ms). The executor survives two renewals,
-    // defeats one takeover attempt (the rival claims BEFORE a
-    // renewal extends the lease — renewal wins the CAS), then loses
-    // to a second takeover after the lease truly lapses.
+    // The scenario: heartbeats hold custody (two renewal continuations,
+    // generations 2 and 3), an early rival is refused while the
+    // continued lease covers it, a late rival forces store time past
+    // the tail and delivers, and the displaced worker's next renewal
+    // tick — which observes the terminal record first — reports
+    // LeaseLost and stops all action. The write-level renew-vs-takeover
+    // race is owned by the interleaving lab (adversarial_renewal_vs_
+    // takeover); here the continuation generations are ASSERTED, so a
+    // silent no-op renew cannot pass.
     struct Starved {
         store: MemoryStore,
     }
@@ -457,14 +490,30 @@ async fn renewal_starvation_corpus() {
     impl Executor for Starved {
         async fn run(
             &self,
-            _job_id: [u8; 16],
+            job_id: [u8; 16],
             _payload: Bytes,
         ) -> Result<Vec<ExecutorOutput>, ExecutionFailure> {
             // Two renewal ticks pass: generations 2 and 3 commit.
             tokio::time::sleep(Duration::from_millis(250)).await;
-            // Rival 1: too early — the last renewal (tick 200ms)
-            // extended the lease; the takeover claim finds the lease
-            // live and returns Empty.
+            // The renewals' continuations must be on the chain: the
+            // heartbeat path (not just the initial claim) got us here.
+            // This is the assertion that kills a no-op renew.
+            let hex = jhex(&job_id);
+            let page = self
+                .store
+                .list(&format!("q/claims/0000/{hex}/"), None, 64)
+                .await
+                .unwrap();
+            assert!(
+                page.items.len() >= 3,
+                "two renewal continuations must exist before the takeover, chain: {:?}",
+                page.items
+                    .iter()
+                    .map(|l| l.key.as_str())
+                    .collect::<Vec<_>>()
+            );
+            // Rival 1: too early — the lease (in store time) still
+            // covers the job; the takeover claim returns Empty.
             let r1 = queue(&self.store).await;
             let mut b = OpBudget::new(256);
             let floor = r1.establish_floor(&mut b).await.unwrap();
