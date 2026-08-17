@@ -16,8 +16,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use stowq_core::{
     AckOutcome, BuryOutcome, ClaimOptions, ClaimOutcome, CommitOutcome, CommittedOutput, Error,
     OpBudget, Queue, RenewOutcome,
@@ -145,6 +147,116 @@ pub trait Executor: Send + Sync {
 
 // ---------- Harness ----------
 
+/// Delivery metrics: plain atomic counters, no dependencies, Send +
+/// Sync. Share one via `Arc<Metrics>` and pass it to the `_with`
+/// harness variants; the plain variants cost nothing. Snapshot for
+/// reporting.
+#[derive(Default)]
+pub struct Metrics {
+    /// Doorbell hints consumed by harness runs.
+    pub hints: AtomicU64,
+    /// Hints that found no claimable work.
+    pub no_work: AtomicU64,
+    /// Jobs delivered to terminal receipt (or verified-equivalent).
+    pub delivered: AtomicU64,
+    /// Executor failures that nacked (retryable).
+    pub failed_retryable: AtomicU64,
+    /// Executor failures that buried (permanent).
+    pub failed_permanent: AtomicU64,
+    /// Deliveries that observed a lost lease (takeover).
+    pub lost_lease: AtomicU64,
+    /// Successful renewal heartbeats.
+    pub renewals: AtomicU64,
+    /// Renewals that observed a takeover (LeaseLost).
+    pub renewals_lost: AtomicU64,
+    /// Store errors surfaced from harness operations.
+    pub store_errors: AtomicU64,
+    /// Delivery wall-time distribution, milliseconds, half-open
+    /// buckets: [0,10) [10,50) [50,100) [100,250) [250,500)
+    /// [500,1k) [1k,2.5k) [2.5k,5k) [5k,+inf).
+    pub delivery_ms: [AtomicU64; 9],
+}
+
+impl Metrics {
+    fn bucket_idx(ms: u128) -> usize {
+        match ms {
+            0..=9 => 0,
+            10..=49 => 1,
+            50..=99 => 2,
+            100..=249 => 3,
+            250..=499 => 4,
+            500..=999 => 5,
+            1_000..=2_499 => 6,
+            2_500..=4_999 => 7,
+            _ => 8,
+        }
+    }
+
+    fn record_delivery(&self, elapsed: std::time::Duration) {
+        let ms = elapsed.as_millis();
+        self.delivery_ms[Self::bucket_idx(ms)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A plain-value copy for reporting.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            hints: self.hints.load(Ordering::Relaxed),
+            no_work: self.no_work.load(Ordering::Relaxed),
+            delivered: self.delivered.load(Ordering::Relaxed),
+            failed_retryable: self.failed_retryable.load(Ordering::Relaxed),
+            failed_permanent: self.failed_permanent.load(Ordering::Relaxed),
+            lost_lease: self.lost_lease.load(Ordering::Relaxed),
+            renewals: self.renewals.load(Ordering::Relaxed),
+            renewals_lost: self.renewals_lost.load(Ordering::Relaxed),
+            store_errors: self.store_errors.load(Ordering::Relaxed),
+            delivery_ms: self
+                .delivery_ms
+                .each_ref()
+                .map(|c| c.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// A printable copy of [`Metrics`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub hints: u64,
+    pub no_work: u64,
+    pub delivered: u64,
+    pub failed_retryable: u64,
+    pub failed_permanent: u64,
+    pub lost_lease: u64,
+    pub renewals: u64,
+    pub renewals_lost: u64,
+    pub store_errors: u64,
+    pub delivery_ms: [u64; 9],
+}
+
+impl fmt::Display for MetricsSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "hints {} (no-work {}) | delivered {} | failed {} retryable / {} permanent | lost-lease {} | renewals {} (lost {}) | store-errors {}",
+            self.hints,
+            self.no_work,
+            self.delivered,
+            self.failed_retryable,
+            self.failed_permanent,
+            self.lost_lease,
+            self.renewals,
+            self.renewals_lost,
+            self.store_errors,
+        )?;
+        write!(
+            f,
+            "delivery ms [ <10 {} | 10-50 {} | 50-100 {} | 100-250 {} | 250-500 {} | 0.5-1k {} | 1-2.5k {} | 2.5-5k {} | >5k {} ]",
+            self.delivery_ms[0], self.delivery_ms[1], self.delivery_ms[2],
+            self.delivery_ms[3], self.delivery_ms[4], self.delivery_ms[5],
+            self.delivery_ms[6], self.delivery_ms[7], self.delivery_ms[8],
+        )
+    }
+}
+
 /// Store ops allowed for one delivery: claim across hinted shards,
 /// floor establishment, execution renewals, output commits, ack.
 /// A sweep hint claims shard by shard, so a queue with more shards
@@ -186,6 +298,55 @@ pub async fn run_delivery(
     exec: &dyn Executor,
     lease_duration_ns: u64,
 ) -> Result<DeliveryReport, Error> {
+    run_delivery_with(q, msg, exec, lease_duration_ns, None).await
+}
+
+/// [`run_delivery`] with optional metrics collection.
+pub async fn run_delivery_with(
+    q: &Queue,
+    msg: &DoorbellMsg,
+    exec: &dyn Executor,
+    lease_duration_ns: u64,
+    metrics: Option<&Metrics>,
+) -> Result<DeliveryReport, Error> {
+    if let Some(m) = metrics {
+        m.hints.fetch_add(1, Ordering::Relaxed);
+    }
+    let start = Instant::now();
+    let report = match run_delivery_inner(q, msg, exec, lease_duration_ns, metrics).await {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(m) = metrics {
+                m.store_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(e);
+        }
+    };
+    if let Some(m) = metrics {
+        m.record_delivery(start.elapsed());
+        match &report {
+            DeliveryReport::NoWork => m.no_work.fetch_add(1, Ordering::Relaxed),
+            DeliveryReport::Delivered { .. } => m.delivered.fetch_add(1, Ordering::Relaxed),
+            DeliveryReport::Failed { buried, .. } => {
+                if *buried {
+                    m.failed_permanent.fetch_add(1, Ordering::Relaxed)
+                } else {
+                    m.failed_retryable.fetch_add(1, Ordering::Relaxed)
+                }
+            }
+            DeliveryReport::LostLease => m.lost_lease.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+    Ok(report)
+}
+
+async fn run_delivery_inner(
+    q: &Queue,
+    msg: &DoorbellMsg,
+    exec: &dyn Executor,
+    lease_duration_ns: u64,
+    metrics: Option<&Metrics>,
+) -> Result<DeliveryReport, Error> {
     let mut budget = OpBudget::new(DELIVERY_BUDGET_OPS);
     let floor = q.establish_floor(&mut budget).await?;
 
@@ -212,7 +373,7 @@ pub async fn run_delivery(
     let Some(claim) = claim else {
         return Ok(DeliveryReport::NoWork);
     };
-    deliver_one(q, claim, exec, lease_duration_ns, &mut budget).await
+    deliver_one(q, claim, exec, lease_duration_ns, &mut budget, metrics).await
 }
 
 /// One claimed job through execution (with renewal heartbeats) to its
@@ -224,6 +385,7 @@ async fn deliver_one(
     exec: &dyn Executor,
     lease_duration_ns: u64,
     budget: &mut OpBudget,
+    metrics: Option<&Metrics>,
 ) -> Result<DeliveryReport, Error> {
     // Delivery = committed claim + verified payload (spec records.md):
     // payload() verifies the digest, so the executor never sees
@@ -243,10 +405,20 @@ async fn deliver_one(
             }
             _ = tokio::time::sleep(interval) => {
                 match q.renew(&claim, budget).await? {
-                    RenewOutcome::Renewed(c) => claim = c,
+                    RenewOutcome::Renewed(c) => {
+                        if let Some(m) = metrics {
+                            m.renewals.fetch_add(1, Ordering::Relaxed);
+                        }
+                        claim = c;
+                    }
                     // No action after LeaseLost: no nack, no ack, no
                     // commits — the new owner decides the job's fate.
-                    RenewOutcome::LeaseLost => return Ok(DeliveryReport::LostLease),
+                    RenewOutcome::LeaseLost => {
+                        if let Some(m) = metrics {
+                            m.renewals_lost.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Ok(DeliveryReport::LostLease);
+                    }
                 }
             }
         }
@@ -266,6 +438,32 @@ pub async fn run_batch(
     exec: &dyn Executor,
     lease_duration_ns: u64,
     batch: usize,
+) -> Result<Vec<DeliveryReport>, Error> {
+    run_batch_with(q, msg, exec, lease_duration_ns, batch, None).await
+}
+
+/// [`run_batch`] with optional metrics collection (per-delivery).
+pub async fn run_batch_with(
+    q: &Queue,
+    msg: &DoorbellMsg,
+    exec: &dyn Executor,
+    lease_duration_ns: u64,
+    batch: usize,
+    metrics: Option<&Metrics>,
+) -> Result<Vec<DeliveryReport>, Error> {
+    if let Some(m) = metrics {
+        m.hints.fetch_add(1, Ordering::Relaxed);
+    }
+    run_batch_inner(q, msg, exec, lease_duration_ns, batch, metrics).await
+}
+
+async fn run_batch_inner(
+    q: &Queue,
+    msg: &DoorbellMsg,
+    exec: &dyn Executor,
+    lease_duration_ns: u64,
+    batch: usize,
+    metrics: Option<&Metrics>,
 ) -> Result<Vec<DeliveryReport>, Error> {
     let mut budget = OpBudget::new(DELIVERY_BUDGET_OPS);
     let floor = q.establish_floor(&mut budget).await?;
@@ -300,8 +498,28 @@ pub async fn run_batch(
         .into_iter()
         .map(|claim| {
             let mut budget = OpBudget::new(DELIVERY_BUDGET_OPS);
+            let start = Instant::now();
             let fut: DeliveryFut = Box::pin(async move {
-                deliver_one(q, claim, exec, lease_duration_ns, &mut budget).await
+                let report =
+                    deliver_one(q, claim, exec, lease_duration_ns, &mut budget, metrics).await?;
+                if let Some(m) = metrics {
+                    m.record_delivery(start.elapsed());
+                    match &report {
+                        DeliveryReport::NoWork => m.no_work.fetch_add(1, Ordering::Relaxed),
+                        DeliveryReport::Delivered { .. } => {
+                            m.delivered.fetch_add(1, Ordering::Relaxed)
+                        }
+                        DeliveryReport::Failed { buried, .. } => {
+                            if *buried {
+                                m.failed_permanent.fetch_add(1, Ordering::Relaxed)
+                            } else {
+                                m.failed_retryable.fetch_add(1, Ordering::Relaxed)
+                            }
+                        }
+                        DeliveryReport::LostLease => m.lost_lease.fetch_add(1, Ordering::Relaxed),
+                    };
+                }
+                Ok(report)
             });
             fut
         })
@@ -463,7 +681,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn queue_with_job() -> (Queue, MemoryStore, [u8; 16]) {
+    pub(crate) async fn queue_with_job() -> (Queue, MemoryStore, [u8; 16]) {
         let store = MemoryStore::new();
         let q = Queue::init(
             Box::new(store.clone()),
@@ -498,7 +716,7 @@ mod tests {
     }
 
     /// An executor producing fixed output.
-    struct Fixed(Vec<ExecutorOutput>);
+    pub(crate) struct Fixed(pub Vec<ExecutorOutput>);
 
     #[async_trait]
     impl Executor for Fixed {
@@ -1241,5 +1459,82 @@ mod tests {
             .expect("sweeper exits")
             .unwrap()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use crate::tests::{queue_with_job as setup, Fixed};
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn metrics_count_the_happy_path() {
+        let (q, _store, _id) = setup().await;
+        let m = Metrics::default();
+        let report = run_delivery_with(
+            &q,
+            &DoorbellMsg::sweep(),
+            &Fixed(vec![ExecutorOutput {
+                name: "r".into(),
+                body: Bytes::from_static(b"done"),
+            }]),
+            60_000_000_000,
+            Some(&m),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(report, DeliveryReport::Delivered { .. }));
+        let s = m.snapshot();
+        assert_eq!(s.hints, 1);
+        assert_eq!(s.delivered, 1);
+        assert_eq!(s.no_work, 0);
+        // The delivery histogram recorded one sample under 10ms
+        // (memory store, instant executor).
+        let total: u64 = s.delivery_ms.iter().sum();
+        assert_eq!(total, 1, "one delivery recorded");
+        assert_eq!(s.delivery_ms[0], 1, "fast bucket");
+    }
+
+    #[tokio::test]
+    async fn metrics_count_no_work_and_failures() {
+        let (q, _store, _id) = setup().await;
+        let m = Metrics::default();
+        // First delivery consumes the job.
+        run_delivery_with(
+            &q,
+            &DoorbellMsg::sweep(),
+            &Fixed(vec![]),
+            60_000_000_000,
+            Some(&m),
+        )
+        .await
+        .unwrap();
+        // Second hint finds nothing.
+        run_delivery_with(
+            &q,
+            &DoorbellMsg::sweep(),
+            &Fixed(vec![]),
+            60_000_000_000,
+            Some(&m),
+        )
+        .await
+        .unwrap();
+        let s = m.snapshot();
+        assert_eq!(s.hints, 2);
+        assert_eq!(s.delivered, 1);
+        assert_eq!(s.no_work, 1);
+        assert_eq!(m.delivery_ms[0].load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_display_is_machine_parseable() {
+        let m = Metrics::default();
+        m.renewals.fetch_add(3, Ordering::Relaxed);
+        m.lost_lease.fetch_add(1, Ordering::Relaxed);
+        let text = m.snapshot().to_string();
+        assert!(text.contains("renewals 3"), "{text}");
+        assert!(text.contains("lost-lease 1"), "{text}");
+        assert!(text.contains("delivery ms [ <10 0"), "{text}");
     }
 }

@@ -3573,3 +3573,57 @@ async fn corrupt_hint_bodies_fall_back_and_repair() {
         assert_eq!(hint_body(&store, &c.job_id).await, Some(1));
     }
 }
+
+// ---------- depth + metrics ----------
+
+#[tokio::test]
+async fn depth_counts_each_plane() {
+    let q = make_queue().await;
+    let mut b = OpBudget::new(1024);
+    for i in 1..=3u8 {
+        let EnqueueOutcome::Committed { .. } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([i; 16]),
+                    payload: b"x",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut b,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+    }
+    // Two acked, one claimed-and-held, one... we have three: ack one,
+    // hold one, nack one.
+    let ClaimOutcome::Claimed(c1) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let ClaimOutcome::Claimed(c2) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    q.ack(&c1, &mut b).await.unwrap();
+    let floor = q.establish_floor(&mut b).await.unwrap();
+    q.nack(&c2, 1, floor, &mut b).await.unwrap();
+
+    let mut b2 = OpBudget::new(256);
+    let d = q.depth(0, &mut b2).await.unwrap();
+    assert_eq!(d.jobs, 3);
+    assert_eq!(d.receipts, 1);
+    assert_eq!(d.dead, 0);
+    // Claims: gen-1 records for c1 and c2 exist (c1's survives ack —
+    // GC owns deletion); nack's gen-1 also. Total: 2 claim records.
+    assert_eq!(d.claims, 2, "gen-1 records for both claimed jobs");
+}

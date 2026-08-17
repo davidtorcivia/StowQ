@@ -721,6 +721,37 @@ impl Queue {
         Ok(floor_ns)
     }
 
+    /// Shard depth: object counts per plane prefix. A monitoring
+    /// probe, not a protocol operation — four bounded listings.
+    pub async fn depth(&self, shard: u16, budget: &mut OpBudget) -> Result<DepthReport, Error> {
+        let mut report = DepthReport::default();
+        for (prefix, slot) in [
+            ("jobs", 0usize),
+            ("claims", 1),
+            ("receipts", 2),
+            ("dead", 3),
+        ] {
+            let p = format!("{}{}/{shard:04x}/", self.root, prefix);
+            let mut after: Option<Key> = None;
+            loop {
+                budget.spend()?;
+                let page = self.store.list(&p, after.as_ref(), 1024).await?;
+                let n = page.items.len() as u64;
+                match slot {
+                    0 => report.jobs += n,
+                    1 => report.claims += n,
+                    2 => report.receipts += n,
+                    _ => report.dead += n,
+                }
+                match page.next_after {
+                    Some(k) => after = Some(k),
+                    None => break,
+                }
+            }
+        }
+        Ok(report)
+    }
+
     /// Reads and verifies the watermark record, if present.
     pub async fn watermark(
         &self,
@@ -2309,6 +2340,15 @@ pub struct GcReport {
     pub beacons_deleted: usize,
     /// Orphan payloads deleted past the enqueue horizon.
     pub orphans_deleted: usize,
+}
+
+/// Shard depth: object counts per plane (monitoring probe).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DepthReport {
+    pub jobs: u64,
+    pub claims: u64,
+    pub receipts: u64,
+    pub dead: u64,
 }
 
 /// One repair-scan finding: a violation with its quarantine reason
