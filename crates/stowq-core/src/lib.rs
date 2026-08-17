@@ -1117,13 +1117,54 @@ impl Queue {
         opts: &ClaimOptions,
         budget: &mut OpBudget,
     ) -> Result<ClaimOutcome, Error> {
+        let mut claims = self.claim_many(opts, 1, budget).await?;
+        match claims.pop() {
+            Some(c) => Ok(ClaimOutcome::Claimed(c)),
+            None => Ok(ClaimOutcome::Empty),
+        }
+    }
+
+    /// Claims up to `max` jobs from one shard scan, in scan order.
+    /// Each claim is an independent protocol claim — its own
+    /// generation, lease, and fencing; the batch shares only the scan,
+    /// amortizing the jobs listing and the terminality probes across
+    /// the batch. Stops at `max`, at scan end, or when the budget runs
+    /// dry: a partial batch is returned, an empty one propagates the
+    /// error (for `max == 1` the observable behavior is exactly
+    /// [`Queue::claim`]'s). A claimant holding several leases keeps
+    /// renewing only the one it is executing; the rest age out and are
+    /// taken over per the ordinary rules — batch size should fit
+    /// within lease / per-job execution time.
+    pub async fn claim_many(
+        &self,
+        opts: &ClaimOptions,
+        max: usize,
+        budget: &mut OpBudget,
+    ) -> Result<Vec<Claim>, Error> {
         let shard_prefix = format!("{}jobs/{:04x}/", self.root, opts.shard);
         let mut after: Option<Key> = None;
+        let mut claims: Vec<Claim> = Vec::with_capacity(max.min(64));
         loop {
-            budget.spend()?;
-            let page = self.store.list(&shard_prefix, after.as_ref(), 1024).await?;
+            if let Err(e) = budget.spend() {
+                return if claims.is_empty() {
+                    Err(e)
+                } else {
+                    Ok(claims)
+                };
+            }
+            let page = match self.store.list(&shard_prefix, after.as_ref(), 1024).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let e: Error = e.into();
+                    return if claims.is_empty() {
+                        Err(e)
+                    } else {
+                        Ok(claims)
+                    };
+                }
+            };
             if page.items.is_empty() {
-                return Ok(ClaimOutcome::Empty);
+                return Ok(claims);
             }
             for listing in &page.items {
                 // A key that does not parse is skipped; the repair scan
@@ -1142,19 +1183,32 @@ impl Queue {
                 if self.is_memoized_terminal(shard, job_id, &listing.meta.version) {
                     continue;
                 }
-                if let Some(claim) = self
+                match self
                     .try_claim(job_id, shard, &listing.meta.version, opts, budget)
-                    .await?
+                    .await
                 {
-                    return Ok(ClaimOutcome::Claimed(claim));
+                    Ok(Some(c)) => {
+                        claims.push(c);
+                        if claims.len() >= max {
+                            return Ok(claims);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return if claims.is_empty() {
+                            Err(e)
+                        } else {
+                            Ok(claims)
+                        };
+                    }
                 }
                 if budget.max_ops == 0 {
-                    return Ok(ClaimOutcome::Empty);
+                    return Ok(claims);
                 }
             }
             match page.next_after {
                 Some(k) => after = Some(k),
-                None => return Ok(ClaimOutcome::Empty),
+                None => return Ok(claims),
             }
         }
     }

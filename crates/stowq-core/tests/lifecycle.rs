@@ -2771,3 +2771,153 @@ async fn reenqueued_incarnation_after_graph_delete_is_rescanned() {
     assert_eq!(c2.job_id, id);
     assert_eq!(c2.generation, 1, "fresh incarnation starts a fresh chain");
 }
+
+// ---------- claim_many: one scan, independent claims ----------
+
+#[tokio::test]
+async fn claim_many_collects_live_jobs_in_scan_order() {
+    let q = make_queue().await;
+    let mut b = OpBudget::new(1024);
+    // Seven jobs; the first three become terminal (claim takes the
+    // first live job in scan order), leaving four live behind.
+    for i in 1..=7u8 {
+        let EnqueueOutcome::Committed { .. } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([i; 16]),
+                    payload: b"x",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut b,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+    }
+    for expected in 1..=3u8 {
+        let ClaimOutcome::Claimed(c) = q
+            .claim(&claim_opts(0, 60_000_000_000), &mut b)
+            .await
+            .unwrap()
+        else {
+            panic!("claim")
+        };
+        assert_eq!(c.job_id, [expected; 16]);
+        q.ack(&c, &mut b).await.unwrap();
+    }
+    let mut b = OpBudget::new(1024);
+    let claims = q
+        .claim_many(&claim_opts(0, 60_000_000_000), 3, &mut b)
+        .await
+        .unwrap();
+    assert_eq!(
+        claims.iter().map(|c| c.job_id).collect::<Vec<_>>(),
+        vec![[0x04; 16], [0x05; 16], [0x06; 16]],
+        "scan order, terminal jobs skipped"
+    );
+    // Independent claims: each is a fresh generation-1 chain.
+    assert!(claims.iter().all(|c| c.generation == 1));
+
+    // The remaining live job 7 comes back alone; then nothing.
+    let mut b = OpBudget::new(1024);
+    let rest = q
+        .claim_many(&claim_opts(0, 60_000_000_000), 2, &mut b)
+        .await
+        .unwrap();
+    assert_eq!(
+        rest.iter().map(|c| c.job_id).collect::<Vec<_>>(),
+        vec![[0x07; 16]]
+    );
+    let mut b = OpBudget::new(1024);
+    assert!(q
+        .claim_many(&claim_opts(0, 60_000_000_000), 2, &mut b)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn claim_many_of_one_matches_claim() {
+    let q = make_queue().await;
+    let mut b = OpBudget::new(256);
+    let EnqueueOutcome::Committed { .. } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([9; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let mut b1 = OpBudget::new(256);
+    let mut b2 = OpBudget::new(256);
+    let single = q.claim(&claim_opts(0, 60_000_000_000), &mut b1).await;
+    let batched = q
+        .claim_many(&claim_opts(0, 60_000_000_000), 1, &mut b2)
+        .await;
+    // Whichever ran first holds the claim; the other sees Empty/[] —
+    // the shapes correspond.
+    match (single, batched) {
+        (Ok(ClaimOutcome::Claimed(_)), Ok(v)) => assert_eq!(v.len(), 0),
+        (Ok(ClaimOutcome::Empty), Ok(v)) => assert_eq!(v.len(), 1),
+        (a, b) => panic!("mismatch: {a:?} vs {b:?}"),
+    }
+}
+
+#[tokio::test]
+async fn claim_many_returns_partial_on_budget_exhaustion() {
+    let q = make_queue().await;
+    let mut b = OpBudget::new(256);
+    for i in 1..=4u8 {
+        let EnqueueOutcome::Committed { .. } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([i; 16]),
+                    payload: b"x",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut b,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+    }
+    // A budget that cannot possibly finish 4 claims: partial batch.
+    let mut small = OpBudget::new(24);
+    let claims = q
+        .claim_many(&claim_opts(0, 60_000_000_000), 4, &mut small)
+        .await
+        .unwrap();
+    assert!(
+        !claims.is_empty() && claims.len() < 4,
+        "partial batch, got {}",
+        claims.len()
+    );
+    // Each returned claim is real (its claim record exists).
+    for c in &claims {
+        let hex: String = c.job_id.iter().map(|x| format!("{x:02x}")).collect();
+        assert!(q
+            .store()
+            .head(&Key::new(format!(
+                "q/claims/0000/{hex}/{:08x}",
+                c.generation
+            )))
+            .await
+            .is_ok());
+    }
+}

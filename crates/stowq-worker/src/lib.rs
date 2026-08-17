@@ -209,10 +209,22 @@ pub async fn run_delivery(
             ClaimOutcome::Empty => continue,
         }
     }
-    let Some(mut claim) = claim else {
+    let Some(claim) = claim else {
         return Ok(DeliveryReport::NoWork);
     };
+    deliver_one(q, claim, exec, lease_duration_ns, &mut budget).await
+}
 
+/// One claimed job through execution (with renewal heartbeats) to its
+/// terminal or lost-lease report. The executor future is dropped on
+/// lease loss; no store action follows.
+async fn deliver_one(
+    q: &Queue,
+    mut claim: stowq_core::Claim,
+    exec: &dyn Executor,
+    lease_duration_ns: u64,
+    budget: &mut OpBudget,
+) -> Result<DeliveryReport, Error> {
     // Delivery = committed claim + verified payload (spec records.md):
     // payload() verifies the digest, so the executor never sees
     // unverified bytes.
@@ -227,10 +239,10 @@ pub async fn run_delivery(
     loop {
         tokio::select! {
             out = &mut exec_fut => {
-                return finish_delivery(q, &claim, out, payload_digest, &mut budget).await;
+                return finish_delivery(q, &claim, out, payload_digest, budget).await;
             }
             _ = tokio::time::sleep(interval) => {
-                match q.renew(&claim, &mut budget).await? {
+                match q.renew(&claim, budget).await? {
                     RenewOutcome::Renewed(c) => claim = c,
                     // No action after LeaseLost: no nack, no ack, no
                     // commits — the new owner decides the job's fate.
@@ -239,6 +251,67 @@ pub async fn run_delivery(
             }
         }
     }
+}
+
+/// The batch shape: one floor session, one scan per hinted shard
+/// claiming up to `batch` jobs ([`Queue::claim_many`]), then each job
+/// delivered in claim order. Only the job under execution is renewed;
+/// queued claims age, and one whose lease was taken over by the time
+/// its turn comes reports [`DeliveryReport::LostLease`] — the ordinary
+/// takeover rules decide the job, never the batch. Batch size should
+/// fit within lease / per-job execution time.
+pub async fn run_batch(
+    q: &Queue,
+    msg: &DoorbellMsg,
+    exec: &dyn Executor,
+    lease_duration_ns: u64,
+    batch: usize,
+) -> Result<Vec<DeliveryReport>, Error> {
+    let mut budget = OpBudget::new(DELIVERY_BUDGET_OPS);
+    let floor = q.establish_floor(&mut budget).await?;
+    let shards: Vec<u16> = if msg.shards.is_empty() {
+        (0..q.format().shard_count).map(|s| s as u16).collect()
+    } else {
+        msg.shards.clone()
+    };
+    let mut claims: Vec<stowq_core::Claim> = Vec::new();
+    for shard in shards {
+        if claims.len() >= batch {
+            break;
+        }
+        let opts = ClaimOptions {
+            shard,
+            floor_ns: floor,
+            lease_duration_ns,
+        };
+        claims.extend(
+            q.claim_many(&opts, batch - claims.len(), &mut budget)
+                .await?,
+        );
+    }
+    // Deliveries run CONCURRENTLY: independent claims, independent
+    // renewal heartbeats, overlapping round trips — the batch's wall
+    // time is the slowest delivery, not the sum. Reports preserve
+    // claim (scan) order.
+    type DeliveryFut<'a> = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<DeliveryReport, Error>> + Send + 'a>,
+    >;
+    let futs: Vec<DeliveryFut> = claims
+        .into_iter()
+        .map(|claim| {
+            let mut budget = OpBudget::new(DELIVERY_BUDGET_OPS);
+            let fut: DeliveryFut = Box::pin(async move {
+                deliver_one(q, claim, exec, lease_duration_ns, &mut budget).await
+            });
+            fut
+        })
+        .collect();
+    let results = futures::future::join_all(futs).await;
+    let mut reports = Vec::with_capacity(results.len());
+    for r in results {
+        reports.push(r?);
+    }
+    Ok(reports)
 }
 
 async fn finish_delivery(
@@ -470,6 +543,173 @@ mod tests {
             };
             tokio::time::sleep(self.stall).await;
             Ok(vec![])
+        }
+    }
+
+    async fn enqueue_job(q: &Queue, id: [u8; 16]) {
+        let mut b = OpBudget::new(128);
+        let stowq_core::EnqueueOutcome::Committed { .. } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some(id),
+                    payload: b"work",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 5,
+                    not_before_ns: None,
+                },
+                &mut b,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+    }
+
+    #[tokio::test]
+    async fn batch_delivers_all_in_claim_order() {
+        let store = MemoryStore::new();
+        let q = Queue::init(
+            Box::new(store.clone()),
+            "q",
+            &OpenOptions::new([1; 16]),
+            &format(),
+        )
+        .await
+        .unwrap();
+        for i in 1..=4u8 {
+            enqueue_job(&q, [i; 16]).await;
+        }
+        let reports = run_batch(
+            &q,
+            &DoorbellMsg::sweep(),
+            &Fixed(vec![ExecutorOutput {
+                name: "r".into(),
+                body: Bytes::from_static(b"done"),
+            }]),
+            60_000_000_000,
+            8,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reports.len(), 4, "all four jobs in one batch");
+        assert!(reports
+            .iter()
+            .all(|r| matches!(r, DeliveryReport::Delivered { .. })));
+        for i in 1..=4u8 {
+            let hex: String = [i; 16].iter().map(|b| format!("{b:02x}")).collect();
+            assert!(store
+                .head(&stowq_store::Key::new(format!("q/receipts/0000/{hex}")))
+                .await
+                .is_ok());
+        }
+    }
+
+    /// Executor that, while processing job 1 of the batch, ages store
+    /// time past every lease and lets a rival claim jobs 1 and 2 (scan
+    /// order; no acks). Job 2 then outlives one renewal tick, so its
+    /// turn observes the takeover: the honest LostLease-by-turn path.
+    struct StealQueued {
+        store: MemoryStore,
+    }
+
+    #[async_trait]
+    impl Executor for StealQueued {
+        async fn run(
+            &self,
+            job_id: [u8; 16],
+            _payload: Bytes,
+        ) -> Result<Vec<ExecutorOutput>, ExecutionFailure> {
+            if job_id == [1; 16] {
+                self.store.advance_clock_to(u64::MAX / 4);
+                let r = Queue::open(Box::new(self.store.clone()), "q", OpenOptions::new([1; 16]))
+                    .await
+                    .unwrap();
+                let mut b = OpBudget::new(256);
+                let floor = r.establish_floor(&mut b).await.unwrap();
+                for want in [1u8, 2u8] {
+                    let ClaimOutcome::Claimed(c) = r
+                        .claim(
+                            &ClaimOptions {
+                                shard: 0,
+                                floor_ns: floor,
+                                lease_duration_ns: 60_000_000_000,
+                            },
+                            &mut b,
+                        )
+                        .await
+                        .unwrap()
+                    else {
+                        panic!("rival claim")
+                    };
+                    assert_eq!(c.job_id, [want; 16], "scan order");
+                }
+            }
+            if job_id == [2; 16] {
+                // Outlive one renewal tick so the takeover is observed
+                // by OUR renewal, not swallowed by an instant finish.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            Ok(vec![ExecutorOutput {
+                name: "r".into(),
+                body: Bytes::from_static(b"out"),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn stolen_queued_claim_reports_lost_and_converges() {
+        let store = MemoryStore::new();
+        let q = Queue::init(
+            Box::new(store.clone()),
+            "q",
+            &OpenOptions::new([1; 16]),
+            &format(),
+        )
+        .await
+        .unwrap();
+        for i in 1..=3u8 {
+            enqueue_job(&q, [i; 16]).await;
+        }
+        // Wall lease 300ms (3e8 ns) -> renewal ticks at 100ms, before
+        // job 2's 150ms executor sleep; the store-time aging and the
+        // rival takeover happen inside job 1's executor.
+        let reports = run_batch(
+            &q,
+            &DoorbellMsg::sweep(),
+            &StealQueued {
+                store: store.clone(),
+            },
+            300_000_000,
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reports.len(), 3);
+        // Job 1: our zombie ack wrote the first-wins receipt (the rival
+        // claimed but never acked) — Delivered, exactly one receipt.
+        assert!(matches!(reports[0], DeliveryReport::Delivered { .. }));
+        // Job 2: our renewal observed the rival's generation-2 claim —
+        // no further action, the takeover owns the job.
+        assert!(
+            matches!(reports[1], DeliveryReport::LostLease),
+            "{:?}",
+            reports
+        );
+        // Job 3: untouched by the rival, delivered normally.
+        assert!(matches!(reports[2], DeliveryReport::Delivered { .. }));
+        for (i, expect) in [(1u8, 1usize), (2, 0), (3, 1)] {
+            let hex: String = [i; 16].iter().map(|b| format!("{b:02x}")).collect();
+            let n = store
+                .list(&format!("q/receipts/0000/{hex}"), None, 4)
+                .await
+                .unwrap()
+                .items
+                .len();
+            assert_eq!(
+                n, expect,
+                "job {i}: jobs 1 and 3 terminal; 2 is the rival's in flight"
+            );
         }
     }
 

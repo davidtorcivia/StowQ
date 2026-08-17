@@ -610,3 +610,65 @@ async fn clean_delivery_converges() {
     // The unused-arc pattern keeps the store alive across awaits.
     let _keep = Arc::new(());
 }
+
+/// Kill injection across run_batch: the delivery dies at op k with a
+/// batch of claims outstanding; restart delivers everything; every job
+/// converges (one receipt, first-wins bytes, clean repair).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_kill_corpus() {
+    const PAYLOAD: &[u8] = b"chaos-batch-payload";
+    const MAX_KILLS: usize = 48;
+    for k in 0..MAX_KILLS {
+        let store = init_store().await;
+        let mut job_ids = Vec::with_capacity(3);
+        for _ in 0..3 {
+            job_ids.push(enqueue(&store, PAYLOAD).await);
+        }
+
+        let killed_store = store.clone();
+        let handle = tokio::spawn(async move {
+            let q = Queue::open(Box::new(KillAt::new(killed_store, Some(k))), "q", opts())
+                .await
+                .unwrap();
+            stowq_worker::run_batch(&q, &DoorbellMsg::sweep(), &Deterministic, 60_000_000_000, 4)
+                .await
+        });
+        let killed = handle.await;
+
+        match killed {
+            Ok(Ok(_)) => {}
+            Err(_join_panic) => {
+                store.advance_clock_to(u64::MAX / 4);
+                let q = Queue::open(Box::new(store.clone()), "q", opts())
+                    .await
+                    .unwrap();
+                let reports = stowq_worker::run_batch(
+                    &q,
+                    &DoorbellMsg::sweep(),
+                    &Deterministic,
+                    60_000_000_000,
+                    4,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("kill {k}: restart failed: {e:?}"));
+                assert!(
+                    reports.iter().all(|r| matches!(
+                        r,
+                        stowq_worker::DeliveryReport::Delivered { .. }
+                            | stowq_worker::DeliveryReport::NoWork
+                    )),
+                    "kill {k}: unexpected reports {:?}",
+                    reports
+                );
+            }
+            Ok(Err(e)) => panic!("kill {k}: batch failed without dying: {e:?}"),
+        }
+        // Every job converges — the batch shape never changes the
+        // terminal guarantees.
+        let page = store.list("q/jobs/0000/", None, 64).await.unwrap();
+        assert_eq!(page.items.len(), 3, "kill {k}: three jobs enqueued");
+        for id in &job_ids {
+            assert_converged(&store, id, PAYLOAD).await;
+        }
+    }
+}
