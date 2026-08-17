@@ -18,8 +18,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
 use stowq_core::{
-    AckOutcome, ClaimOptions, ClaimOutcome, CommitOutcome, CommittedOutput, Error, OpBudget, Queue,
-    RenewOutcome,
+    AckOutcome, BuryOutcome, ClaimOptions, ClaimOutcome, CommitOutcome, CommittedOutput, Error,
+    OpBudget, Queue, RenewOutcome,
 };
 
 // ---------- Doorbell ----------
@@ -53,7 +53,8 @@ pub trait Doorbell: Send + Sync {
     async fn recv(&self) -> Option<DoorbellMsg>;
 }
 
-/// In-memory stub: one bounded FIFO of pending hints.
+/// In-memory stub: one FIFO of pending hints. Unbounded — a
+/// test and demo surface, not a production plane.
 #[derive(Default)]
 pub struct StubDoorbell {
     pending: Mutex<VecDeque<DoorbellMsg>>,
@@ -145,6 +146,11 @@ pub trait Executor: Send + Sync {
 
 /// Store ops allowed for one delivery: claim across hinted shards,
 /// floor establishment, execution renewals, output commits, ack.
+/// A sweep hint claims shard by shard, so a queue with more shards
+/// than the budget allows fails `Err(BudgetExhausted)` mid-scan —
+/// fail-safe: no partial delivery happens (the spend precedes every
+/// op), and the hint is simply not fully served. Retry it or let the
+/// sweeper find the work.
 pub const DELIVERY_BUDGET_OPS: usize = 1024;
 
 /// What one doorbell delivery came to.
@@ -168,9 +174,9 @@ pub enum DeliveryReport {
 }
 
 /// Turns one doorbell delivery into at most one delivery of one job.
-/// The floor is established once per delivery and reused (the harness
-/// floor session; nack's `retry_not_before` derives from it, and the
-/// core watermark raise already applies at establishment).
+/// A floor session backs the claim; nack re-establishes (a cache hit
+/// within the staleness window, a fresh beacon past it) so the backoff
+/// never derives from a floor older than the window.
 pub async fn run_delivery(
     q: &Queue,
     msg: &DoorbellMsg,
@@ -217,7 +223,7 @@ pub async fn run_delivery(
     loop {
         tokio::select! {
             out = &mut exec_fut => {
-                return finish_delivery(q, &claim, out, floor, &mut budget).await;
+                return finish_delivery(q, &claim, out, &mut budget).await;
             }
             _ = tokio::time::sleep(interval) => {
                 match q.renew(&claim, &mut budget).await? {
@@ -235,7 +241,6 @@ async fn finish_delivery(
     q: &Queue,
     claim: &stowq_core::Claim,
     executed: Result<Vec<ExecutorOutput>, ExecutionFailure>,
-    floor: u64,
     budget: &mut OpBudget,
 ) -> Result<DeliveryReport, Error> {
     match executed {
@@ -262,6 +267,13 @@ async fn finish_delivery(
         Err(failure) => {
             match &failure {
                 ExecutionFailure::Retryable { reason } => {
+                    // Re-establish rather than reuse the session floor:
+                    // within the staleness window this is a cache hit
+                    // (zero ops, the sanctioned reuse), past it a fresh
+                    // beacon, so `retry_not_before` never derives from
+                    // a floor older than the window (spec records.md,
+                    // Renewal).
+                    let floor = q.establish_floor(budget).await?;
                     q.nack(claim, *reason, floor, budget).await?;
                     Ok(DeliveryReport::Failed {
                         failure,
@@ -269,13 +281,19 @@ async fn finish_delivery(
                     })
                 }
                 ExecutionFailure::Permanent { reason } => {
-                    // SupersededByReceipt means the job completed via
-                    // another path; our failure stands either way.
-                    let _ = q.bury(claim, *reason, budget).await?;
-                    Ok(DeliveryReport::Failed {
-                        failure,
-                        buried: true,
-                    })
+                    match q.bury(claim, *reason, budget).await? {
+                        BuryOutcome::Buried => Ok(DeliveryReport::Failed {
+                            failure,
+                            buried: true,
+                        }),
+                        // SupersededByReceipt: the job completed via
+                        // another path; no dead record exists, and our
+                        // failure report still stands.
+                        BuryOutcome::SupersededByReceipt => Ok(DeliveryReport::Failed {
+                            failure,
+                            buried: false,
+                        }),
+                    }
                 }
             }
         }
@@ -594,6 +612,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permanent_failure_after_foreign_ack_reports_unburied() {
+        let (q, store, job_id) = queue_with_job().await;
+        let report = run_delivery(
+            &q,
+            &DoorbellMsg::sweep(),
+            &AckThenPermanent {
+                store: store.clone(),
+            },
+            60_000_000_000,
+        )
+        .await
+        .unwrap();
+        match report {
+            DeliveryReport::Failed {
+                failure: ExecutionFailure::Permanent { .. },
+                buried: false,
+            } => {}
+            other => panic!("expected Failed/unburied, got {other:?}"),
+        }
+        // The receipt from the second worker is the terminal record;
+        // no dead record exists.
+        assert!(store
+            .head(&stowq_store::Key::new(format!(
+                "q/receipts/0000/{}",
+                jhex(&job_id)
+            )))
+            .await
+            .is_ok());
+        assert!(
+            store
+                .head(&stowq_store::Key::new(format!(
+                    "q/dead/0000/{}",
+                    jhex(&job_id)
+                )))
+                .await
+                .unwrap_err()
+                == StoreError::NotFound
+        );
+    }
+
+    #[tokio::test]
     async fn takeover_during_execution_stops_all_action() {
         tokio::time::pause();
         let (q, store, job_id) = queue_with_job().await;
@@ -641,6 +700,48 @@ mod tests {
             .await
             .unwrap();
         assert!(page.items.len() >= 2, "claim chain advanced by takeover");
+    }
+
+    /// Acknowledges the job as a second worker mid-execution, then
+    /// fails permanently: the bury must be refused by the receipt.
+    struct AckThenPermanent {
+        store: MemoryStore,
+    }
+
+    #[async_trait]
+    impl Executor for AckThenPermanent {
+        async fn run(
+            &self,
+            job_id: [u8; 16],
+            _payload: Bytes,
+        ) -> Result<Vec<ExecutorOutput>, ExecutionFailure> {
+            // Expire the harness's lease in store time, then take the
+            // job over and ack it as a second worker.
+            self.store.advance_clock_to(u64::MAX / 4);
+            let q2 = queue(&self.store).await;
+            let mut b = OpBudget::new(256);
+            let ClaimOutcome::Claimed(c2) = q2
+                .claim(
+                    &ClaimOptions {
+                        shard: 0,
+                        floor_ns: q2.establish_floor(&mut b).await.unwrap(),
+                        lease_duration_ns: 60_000_000_000,
+                    },
+                    &mut b,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("second claim for the acking worker")
+            };
+            assert_eq!(
+                q2.ack(&c2, &mut b).await.unwrap(),
+                AckOutcome::Acked,
+                "second worker acks"
+            );
+            let _ = job_id;
+            Err(ExecutionFailure::Permanent { reason: 0x0003 })
+        }
     }
 
     /// Stalls past two renewal ticks, then succeeds.
