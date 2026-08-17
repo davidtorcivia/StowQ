@@ -1211,6 +1211,10 @@ impl Queue {
                 self.memoize_terminal(shard, job_id, jobs_version.clone());
                 return Ok(None);
             }
+            // Receipt absent: the dead probe's error class must
+            // propagate verbatim — a transient transport failure on it
+            // is not the receipt's NotFound.
+            (Err(StoreError::NotFound), Err(e)) => return Err(e.into()),
             (Err(e), _) => return Err(e.into()),
         }
         let tail = tail?;
