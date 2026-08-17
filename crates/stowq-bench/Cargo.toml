@@ -22,5 +22,6 @@ stowq-format.workspace = true
 stowq-keys.workspace = true
 stowq-store.workspace = true
 stowq-store-s3.workspace = true
+stowq-worker.workspace = true
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "default-https-client"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

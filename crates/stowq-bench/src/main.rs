@@ -19,13 +19,16 @@ use bytes::Bytes;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use stowq_core::{
     AckOutcome, BuryOutcome, ClaimOptions, ClaimOutcome, CommitOutcome, EnqueueInput,
     EnqueueOutcome, OpBudget, OpenOptions, Queue, RenewOutcome,
 };
 use stowq_format::FormatRecord;
-use stowq_store::{Key, MemoryStore, Object, ObjectStore, Page, PutOutcome, StoreResult, Version};
+use stowq_store::{
+    Key, MemoryStore, Object, ObjectStore, Page, PutOutcome, StoreError, StoreResult, Version,
+};
+use stowq_worker::{DoorbellMsg, Executor};
 
 // ---------- counting store ----------
 
@@ -656,37 +659,532 @@ async fn live_mode(cycles: usize) -> Result<(), String> {
     Ok(())
 }
 
+// ---------- soak ----------
+
+/// Rate-based flaky transport: each store op independently faults
+/// pre-transmit (safe retry) with probability `p_pre` or
+/// post-transmit-ambiguous (outcome unknown, present-or-absent) with
+/// probability `p_post`, from a seeded PRNG. The core paths resolve
+/// both classes internally — the soak proves sustained correctness
+/// under sustained transport chaos.
+struct FlakyStore<S> {
+    inner: S,
+    state: std::sync::Mutex<u64>,                   // rng state
+    faults: std::sync::Arc<(AtomicU64, AtomicU64)>, // (pre, post) counts
+    p_pre: u64,
+    p_post: u64,
+}
+
+impl<S> FlakyStore<S> {
+    fn new(
+        inner: S,
+        seed: u64,
+        fault_percent: u64,
+        faults: std::sync::Arc<(AtomicU64, AtomicU64)>,
+    ) -> Self {
+        // fault_percent splits 60/40 pre/post; probabilities in
+        // per-million for granularity.
+        let pm = fault_percent * 10_000;
+        FlakyStore {
+            inner,
+            state: std::sync::Mutex::new(seed),
+            p_pre: pm * 6 / 10,
+            p_post: pm * 4 / 10,
+            faults,
+        }
+    }
+
+    /// Returns (pre_fault, post_fault) for this op, advancing the RNG.
+    fn draw(&self) -> (bool, bool) {
+        let mut st = self.state.lock().unwrap();
+        // splitmix64 step
+        *st = st.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = *st;
+        drop(st);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^= z >> 31;
+        let v = z % 1_000_000;
+        let pre = v < self.p_pre;
+        let post = !pre && v < self.p_pre + self.p_post;
+        if pre {
+            self.faults.0.fetch_add(1, Ordering::Relaxed);
+        }
+        if post {
+            self.faults.1.fetch_add(1, Ordering::Relaxed);
+        }
+        (pre, post)
+    }
+}
+
+#[async_trait]
+impl<S: ObjectStore + Send + Sync> ObjectStore for FlakyStore<S> {
+    async fn put_if_absent(
+        &self,
+        key: &Key,
+        body: Bytes,
+        sha256: [u8; 32],
+    ) -> StoreResult<stowq_store::PutOutcome> {
+        match self.draw() {
+            (true, _) => Err(StoreError::Transport(
+                stowq_store::TransportClass::PreTransmit,
+            )),
+            (false, false) => self.inner.put_if_absent(key, body, sha256).await,
+            (false, true) => {
+                let r = self.inner.put_if_absent(key, body, sha256).await;
+                r.map(|_| {
+                    stowq_store::PutOutcome::Rejected // hidden outcome shape
+                })
+            }
+        }
+    }
+    async fn cas(
+        &self,
+        key: &Key,
+        body: Bytes,
+        sha256: [u8; 32],
+        if_match: &Version,
+    ) -> StoreResult<stowq_store::PutOutcome> {
+        match self.draw() {
+            (true, _) => Err(StoreError::Transport(
+                stowq_store::TransportClass::PreTransmit,
+            )),
+            (false, false) => self.inner.cas(key, body, sha256, if_match).await,
+            (false, true) => self
+                .inner
+                .cas(key, body, sha256, if_match)
+                .await
+                .map(|_| stowq_store::PutOutcome::Rejected),
+        }
+    }
+    async fn get(&self, key: &Key, range: Option<Range<u64>>) -> StoreResult<stowq_store::Object> {
+        match self.draw() {
+            (true, _) => Err(StoreError::Transport(
+                stowq_store::TransportClass::PreTransmit,
+            )),
+            (false, false) => self.inner.get(key, range).await,
+            (false, true) => Err(StoreError::OutcomeUnknown(
+                stowq_store::Ambiguity::ConnectionLost,
+            )),
+        }
+    }
+    async fn head(&self, key: &Key) -> StoreResult<stowq_store::Meta> {
+        match self.draw() {
+            (true, _) => Err(StoreError::Transport(
+                stowq_store::TransportClass::PreTransmit,
+            )),
+            (false, false) => self.inner.head(key).await,
+            (false, true) => Err(StoreError::OutcomeUnknown(
+                stowq_store::Ambiguity::ConnectionLost,
+            )),
+        }
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+        after: Option<&Key>,
+        limit: usize,
+    ) -> StoreResult<stowq_store::Page> {
+        match self.draw() {
+            (true, _) => Err(StoreError::Transport(
+                stowq_store::TransportClass::PreTransmit,
+            )),
+            (false, false) => self.inner.list(prefix, after, limit).await,
+            (false, true) => Err(StoreError::OutcomeUnknown(
+                stowq_store::Ambiguity::ConnectionLost,
+            )),
+        }
+    }
+    async fn delete(&self, key: &Key) -> StoreResult<()> {
+        match self.draw() {
+            (true, _) => Err(StoreError::Transport(
+                stowq_store::TransportClass::PreTransmit,
+            )),
+            (false, _) => self.inner.delete(key).await,
+        }
+    }
+}
+
+/// A realistic executor mix: most jobs succeed with deterministic
+/// output, a fraction fails retryably (nack+backoff), a small
+/// fraction permanently (bury). Simulates think time well under the
+/// lease so renewals are rare but nonzero on slow paths.
+struct SoakExecutor {
+    fail_retryable_pct: u64,
+    fail_permanent_pct: u64,
+    counter: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait]
+impl Executor for SoakExecutor {
+    async fn run(
+        &self,
+        _job_id: [u8; 16],
+        payload: Bytes,
+    ) -> Result<Vec<stowq_worker::ExecutorOutput>, stowq_worker::ExecutionFailure> {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        let v = n % 100;
+        if v < self.fail_permanent_pct {
+            return Err(stowq_worker::ExecutionFailure::Permanent { reason: 0x0003 });
+        }
+        if v < self.fail_permanent_pct + self.fail_retryable_pct {
+            return Err(stowq_worker::ExecutionFailure::Retryable { reason: 0x0001 });
+        }
+        let mut body = payload.to_vec();
+        body.extend_from_slice(b"-soaked");
+        Ok(vec![stowq_worker::ExecutorOutput {
+            name: "result".into(),
+            body: Bytes::from(body),
+        }])
+    }
+}
+
+/// The soak: producers enqueue at a target depth; workers deliver
+/// through faulting transport; a sweeper runs periodically; metrics
+/// print per window; the run ends with drain + convergence + drift
+/// assertions. Exit nonzero on any violation.
+async fn soak_mode(
+    minutes: u64,
+    workers: usize,
+    fault_percent: u64,
+    seed: u64,
+) -> Result<(), String> {
+    use stowq_worker::Metrics;
+    let t0 = Instant::now();
+    let mem = MemoryStore::new();
+    // Single shard: the soak targets sustained correctness under
+    // transport chaos, not shard fan-out, and one shard keeps the
+    // depth/terminal probes complete (one prefix to count).
+    let soak_format = FormatRecord {
+        shard_count: 1,
+        ..format()
+    };
+    // Init through a clean store: initialization is not under soak.
+    let _q = Queue::init(Box::new(mem.clone()), "q", &opts("soak-init"), &soak_format)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let metrics = std::sync::Arc::new(Metrics::default());
+    let faults = std::sync::Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (producer_stop_flag, producer_stop_rx) = tokio::sync::watch::channel(false);
+
+    // Producer: keep depth around `target` (10) jobs.
+    let target: u64 = 10;
+    let producer_q = Queue::open(
+        Box::new(FlakyStore::new(
+            mem.clone(),
+            seed ^ 0x1,
+            fault_percent,
+            faults.clone(),
+        )),
+        "q",
+        opts("soak-producer"),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let producer_stop = producer_stop_rx;
+    let producer = tokio::spawn(async move {
+        let mut i: u64 = 0;
+        loop {
+            if *producer_stop.borrow() {
+                break;
+            }
+            let mut b = OpBudget::new(1024);
+            let d = producer_q.depth(0, &mut b).await.unwrap_or_default();
+            // In-flight = non-terminal jobs (job records persist
+            // until GC; raw jobs would fill once and stop).
+            let inflight = d.jobs.saturating_sub(d.receipts + d.dead);
+            while inflight < target && i < 100_000 {
+                let r = producer_q
+                    .enqueue(
+                        EnqueueInput {
+                            job_id: Some((i as u128).to_be_bytes()),
+                            payload: b"soak-payload",
+                            content_type: "text/plain".into(),
+                            maximum_attempts: 10,
+                            not_before_ns: None,
+                        },
+                        &mut b,
+                    )
+                    .await;
+                i += 1;
+                if r.is_err() {
+                    break; // budget/transport: the next poll retries
+                }
+                if i.is_multiple_of(target) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        i
+    });
+
+    // Workers: batched deliveries through faulting transport.
+    let exec = std::sync::Arc::new(SoakExecutor {
+        fail_retryable_pct: 10,
+        fail_permanent_pct: 2,
+        counter: std::sync::atomic::AtomicU64::new(0),
+    });
+    let mut handles = Vec::new();
+    for w in 0..workers {
+        let store = FlakyStore::new(
+            mem.clone(),
+            seed ^ (w as u64 + 2),
+            fault_percent,
+            faults.clone(),
+        );
+        let m = metrics.clone();
+        let exec = exec.clone();
+        let rx = stop_rx.clone();
+        handles.push(tokio::spawn(async move {
+            let q = Queue::open(Box::new(store), "q", opts(&format!("soak-w{w}")))
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut nowork = 0u32;
+            loop {
+                if *rx.borrow() {
+                    return Ok(()) as Result<(), String>;
+                }
+                match stowq_worker::run_batch_with(
+                    &q,
+                    &DoorbellMsg::sweep(),
+                    exec.as_ref(),
+                    2_000_000_000, // 2s leases: renewals occasionally matter
+                    4,
+                    Some(&m),
+                )
+                .await
+                {
+                    Ok(reports) => {
+                        if reports.is_empty() {
+                            nowork += 1;
+                            if nowork > 8 {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                            }
+                        } else {
+                            nowork = 0;
+                        }
+                    }
+                    Err(_) => {
+                        // Transport exhaustion under soak: brief pause.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        nowork = 0;
+                    }
+                }
+            }
+        }));
+    }
+
+    // Clock driver: the memory store's clock advances only on
+    // writes, but backoffs and lease expiries are wall-clock-scale;
+    // without driving it, nacked jobs freeze in backoff forever.
+    // Advance store time at wall rate (a real store's clock ticks).
+    let clock_mem = mem.clone();
+    let clock_stop = stop_rx.clone();
+    let clock_driver = tokio::spawn(async move {
+        let mut sim_ns: u64 = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if *clock_stop.borrow() {
+                return;
+            }
+            sim_ns += 250_000_000;
+            clock_mem.advance_clock_to(sim_ns);
+        }
+    });
+
+    // Sweeper: every 5s.
+    let sweep_q = Queue::open(
+        Box::new(FlakyStore::new(
+            mem.clone(),
+            seed ^ 0xff,
+            fault_percent,
+            faults.clone(),
+        )),
+        "q",
+        opts("soak-sweeper"),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let sweeper_stop = stop_rx.clone();
+    let sweeper = tokio::spawn(async move {
+        loop {
+            if *sweeper_stop.borrow() {
+                return;
+            }
+            let mut b = OpBudget::new(8192);
+            let _ = stowq_worker::sweep_once(&sweep_q, &mut b).await;
+            // GC past the terminal horizon keeps the jobs prefix
+            // bounded for long soaks (retention 0: collect now).
+            let floor = sweep_q.establish_floor(&mut b).await.unwrap_or(0);
+            let _ = sweep_q.gc(floor, 0, 0, &mut b).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+    // Periodic reporting.
+    let report_metrics = metrics.clone();
+    let reporter_stop = stop_rx.clone();
+    let reporter = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            if *reporter_stop.borrow() {
+                return;
+            }
+            eprintln!(
+                "[soak +{:>4}s] {}",
+                t0.elapsed().as_secs(),
+                report_metrics.snapshot()
+            );
+        }
+    });
+
+    // Run the soak duration (a 0-minute smoke floor of 5s).
+    let duration_s = if minutes == 0 { 5 } else { minutes * 60 };
+    tokio::time::sleep(Duration::from_secs(duration_s)).await;
+
+    // Drain order matters: stop the PRODUCER first, let the workers
+    // consume the remaining backlog to quiescence (NoWork streak),
+    // then stop them. The reporter and sweeper run through the drain.
+    let _drain_rx = stop_rx.clone();
+    producer_stop_flag.send(true).map_err(|e| e.to_string())?;
+    let total_enqueued = producer.await.map_err(|e| e.to_string())?;
+
+    // Quiescence: metrics quiet for 2s AND every enqueued job
+    // terminal (backoff retries keep jobs mid-flight with quiet
+    // metrics between their attempts). Metric quiet alone drains too
+    // early; terminal completeness alone never fires if a worker is
+    // stuck. Require both, with a deadline.
+    let probe = Queue::open(Box::new(mem.clone()), "q", opts("soak-probe"))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut last_done = 0u64;
+    let mut stable = 0u8;
+    let drain_deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let done = metrics.delivered.load(Ordering::Relaxed)
+            + metrics.failed_permanent.load(Ordering::Relaxed);
+        let mut pb = OpBudget::new(256);
+        let d = probe.depth(0, &mut pb).await.unwrap_or_default();
+        let all_terminal = d.jobs == d.receipts + d.dead;
+        if done == last_done && all_terminal {
+            stable += 1;
+        } else {
+            stable = 0;
+            last_done = done;
+        }
+        if stable >= 2 || Instant::now() > drain_deadline {
+            break;
+        }
+    }
+    stop_tx.send(true).map_err(|e| e.to_string())?;
+    let _ = reporter.await;
+    let _ = sweeper.await;
+    let _ = clock_driver.await;
+    for h in handles {
+        let _ = h.await;
+    }
+
+    // Final assertions on a clean handle.
+    let verify = Queue::open(Box::new(mem.clone()), "q", opts("soak-verify"))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut b = OpBudget::new(8192);
+    // One final gc pass collects any last-window race artifact
+    // before the repair scan sees it (structural close, not timing).
+    let floor = verify.establish_floor(&mut b).await.unwrap_or(0);
+    let _ = verify.gc(floor, 0, 0, &mut b).await;
+    let d = verify.depth(0, &mut b).await.map_err(|e| e.to_string())?;
+    let (report, _) = verify
+        .repair_scan(0, &mut b)
+        .await
+        .map_err(|e| e.to_string())?;
+    let final_metrics = metrics.snapshot();
+
+    println!(
+        "soak complete: {} min, {} fault% (seed {seed}), workers {workers}",
+        minutes, fault_percent
+    );
+    println!("enqueued: {total_enqueued}");
+    println!(
+        "final depth: jobs {} claims {} receipts {} dead {}",
+        d.jobs, d.claims, d.receipts, d.dead
+    );
+    println!("final metrics: {}", final_metrics);
+    println!(
+        "faults drawn: pre {} post {}",
+        faults.0.load(Ordering::Relaxed),
+        faults.1.load(Ordering::Relaxed)
+    );
+
+    // Assertions.
+    let mut failures = Vec::new();
+    if !report.findings.is_empty() {
+        failures.push(format!("repair findings: {:?}", report.findings));
+    }
+    // Every enqueued job must be terminal: jobs == receipts + dead.
+    if d.jobs != d.receipts + d.dead {
+        failures.push(format!(
+            "non-terminal jobs: jobs {} vs receipts {} + dead {}",
+            d.jobs, d.receipts, d.dead
+        ));
+    }
+    // Delivered + permanently failed should account for every job
+    // (retryable failures eventually succeed within 10 attempts).
+    let accounted = final_metrics.delivered + final_metrics.failed_permanent;
+    if accounted < total_enqueued {
+        failures.push(format!(
+            "accounting gap: delivered {} + permanent {} < enqueued {}",
+            final_metrics.delivered, final_metrics.failed_permanent, total_enqueued
+        ));
+    }
+    if !failures.is_empty() {
+        for f in &failures {
+            eprintln!("SOAK VIOLATION: {f}");
+        }
+        return Err(format!("{} soak violations", failures.len()));
+    }
+    println!("SOAK CLEAN");
+    Ok(())
+}
+
 // ---------- main ----------
 
-fn parse() -> Result<(String, usize, usize), String> {
+fn parse() -> Result<(String, Vec<String>), String> {
     let mut it = std::env::args().skip(1);
     let mode = it
         .next()
-        .ok_or("usage: stowq-bench ops|mem|live|live-batch [cycles] [batch]")?;
-    let cycles: usize = it
-        .next()
-        .map(|s| s.parse().map_err(|_| "cycles".to_string()))
-        .transpose()?
-        .unwrap_or(1000);
-    let batch: usize = it
-        .next()
-        .map(|s| s.parse().map_err(|_| "batch".to_string()))
-        .transpose()?
-        .unwrap_or(5);
-    Ok((mode, cycles, batch))
+        .ok_or("usage: stowq-bench ops|mem|live|live-batch|soak [args...]")?;
+    let rest: Vec<String> = it.collect();
+    Ok((mode, rest))
 }
 
 #[tokio::main]
 async fn main() {
-    let (mode, cycles, batch) = parse().unwrap_or_else(|e| {
+    let (mode, rest) = parse().unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(2);
     });
+    let num =
+        |i: usize, d: usize| -> usize { rest.get(i).and_then(|s| s.parse().ok()).unwrap_or(d) };
     let r = match mode.as_str() {
         "ops" => ops_mode().await,
-        "mem" => mem_mode(cycles).await,
-        "live" => live_mode(cycles.min(500)).await,
-        "live-batch" => live_batch_mode(cycles.min(200), batch.clamp(1, 64)).await,
+        "mem" => mem_mode(num(0, 1000)).await,
+        "live" => live_mode(num(0, 500).min(500)).await,
+        "live-batch" => live_batch_mode(num(0, 100).min(200), num(1, 5).clamp(1, 64)).await,
+        "soak" => {
+            // soak [minutes] [workers] [fault-percent] [seed]
+            soak_mode(
+                num(0, 2) as u64,
+                num(1, 4).clamp(1, 16),
+                num(2, 1).min(20) as u64,
+                num(3, 42) as u64,
+            )
+            .await
+        }
         m => Err(format!("unknown mode {m}")),
     };
     if let Err(e) = r {

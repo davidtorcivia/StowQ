@@ -721,6 +721,37 @@ impl Queue {
         Ok(floor_ns)
     }
 
+    /// Shard depth: object counts per plane prefix. A monitoring
+    /// probe, not a protocol operation — four bounded listings.
+    pub async fn depth(&self, shard: u16, budget: &mut OpBudget) -> Result<DepthReport, Error> {
+        let mut report = DepthReport::default();
+        for (prefix, slot) in [
+            ("jobs", 0usize),
+            ("claims", 1),
+            ("receipts", 2),
+            ("dead", 3),
+        ] {
+            let p = format!("{}{}/{shard:04x}/", self.root, prefix);
+            let mut after: Option<Key> = None;
+            loop {
+                budget.spend()?;
+                let page = self.store.list(&p, after.as_ref(), 1024).await?;
+                let n = page.items.len() as u64;
+                match slot {
+                    0 => report.jobs += n,
+                    1 => report.claims += n,
+                    2 => report.receipts += n,
+                    _ => report.dead += n,
+                }
+                match page.next_after {
+                    Some(k) => after = Some(k),
+                    None => break,
+                }
+            }
+        }
+        Ok(report)
+    }
+
     /// Reads and verifies the watermark record, if present.
     pub async fn watermark(
         &self,
@@ -2305,10 +2336,21 @@ pub struct SweepReport {
 pub struct GcReport {
     /// Terminal job graphs fully deleted.
     pub jobs_deleted: usize,
+    /// Orphan claim records collected (GC-vs-claim race artifacts).
+    pub claim_orphans_deleted: usize,
     /// Clock beacons deleted.
     pub beacons_deleted: usize,
     /// Orphan payloads deleted past the enqueue horizon.
     pub orphans_deleted: usize,
+}
+
+/// Shard depth: object counts per plane (monitoring probe).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DepthReport {
+    pub jobs: u64,
+    pub claims: u64,
+    pub receipts: u64,
+    pub dead: u64,
 }
 
 /// One repair-scan finding: a violation with its quarantine reason
@@ -2688,9 +2730,85 @@ impl Queue {
                 {
                     Ok(_) => {}
                     Err(StoreError::NotFound) => {
+                        // Re-head the payload: same ABA discipline as
+                        // the claims pass (a re-enqueue with the same
+                        // content recreates the content-addressed key).
                         budget.spend()?;
-                        let _ = self.store.delete(&item.key).await;
-                        report.orphans_deleted += 1;
+                        match self.store.head(&item.key).await {
+                            Ok(now) if now.store_time_ns == item.meta.store_time_ns => {
+                                budget.spend()?;
+                                let _ = self.store.delete(&item.key).await;
+                                report.orphans_deleted += 1;
+                            }
+                            Ok(_) => {}
+                            Err(StoreError::NotFound) => {
+                                report.orphans_deleted += 1;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            match page.next_after {
+                Some(k) => after = Some(k),
+                None => break,
+            }
+        }
+
+        // Orphan claims: a claimant can pass every check and commit a
+        // claim while GC concurrently deletes the terminal graph (the
+        // race window is job-read to claim-put); the surviving claim
+        // references a deleted job and nothing else would collect it.
+        // Same horizon discipline as payloads: old enough to predate
+        // any in-flight enqueue, and the job record is absent NOW.
+        let claims_prefix = format!("{}claims/", self.root);
+        let mut after: Option<Key> = None;
+        loop {
+            budget.spend()?;
+            let page = self.store.list(&claims_prefix, after.as_ref(), 64).await?;
+            if page.items.is_empty() {
+                break;
+            }
+            for item in &page.items {
+                if item.meta.store_time_ns >= orphan_cutoff {
+                    continue;
+                }
+                let rel = item
+                    .key
+                    .as_str()
+                    .strip_prefix(&self.root)
+                    .and_then(|s| s.parse().ok());
+                let Some(RelKey::Claim { shard, job_id, .. }) = rel else {
+                    continue; // repair owns quarantine findings
+                };
+                budget.spend()?;
+                match self
+                    .store
+                    .head(&self.absolute(&RelKey::Job { shard, job_id }))
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(StoreError::NotFound) => {
+                        // Re-head the claim itself: the listing was
+                        // check-then-act, and a concurrent re-enqueue
+                        // at a colliding generation can recreate the
+                        // exact key between the listing and this
+                        // delete. The store time distinguishes them
+                        // (a fresh claim writes a later time).
+                        budget.spend()?;
+                        match self.store.head(&item.key).await {
+                            Ok(now) if now.store_time_ns == item.meta.store_time_ns => {
+                                budget.spend()?;
+                                let _ = self.store.delete(&item.key).await;
+                                report.claim_orphans_deleted += 1;
+                            }
+                            Ok(_) => {} // recreated: a live claim now
+                            Err(StoreError::NotFound) => {
+                                report.claim_orphans_deleted += 1;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
                     }
                     Err(e) => return Err(e.into()),
                 }
