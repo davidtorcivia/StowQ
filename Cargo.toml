@@ -9,6 +9,7 @@ members = [
     "crates/stowq-testkit",
     "crates/stowq-cli",
     "crates/stowq-store-s3",
+    "crates/stowq-worker",
 ]
 
 [workspace.package]
