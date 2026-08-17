@@ -248,6 +248,13 @@ fn parse_fields(t: u64, r: &mut cbor::Reader<'_>) -> Result<Record, RecordError>
                 let v = read_uint(r)?;
                 match key {
                     "shard_count" => {
+                        // Range-checked on the wire value BEFORE the
+                        // cast: a u64 ≥ 2^32 whose low bits fit u16
+                        // space must not truncate into acceptance
+                        // (the value path rejects on the raw value).
+                        if v > 65_536 {
+                            return Err(RecordError::Field("shard_count"));
+                        }
                         f.shard_count = v as u32;
                         seen[0] = true;
                         Ok(())
@@ -284,11 +291,6 @@ fn parse_fields(t: u64, r: &mut cbor::Reader<'_>) -> Result<Record, RecordError>
                 if !seen[i] {
                     return Err(RecordError::MissingField(k));
                 }
-            }
-            // The shard field is 4 hex digits; reject rather than
-            // silently truncate a wider value.
-            if f.shard_count as u64 > 65_536 {
-                return Err(RecordError::Field("shard_count"));
             }
             Ok(Record::Format(f))
         }
@@ -533,7 +535,10 @@ fn parse_fields(t: u64, r: &mut cbor::Reader<'_>) -> Result<Record, RecordError>
                         // explicit empty array is non-canonical.
                         return Err(RecordError::Field("output_digests"));
                     }
-                    let mut out = Vec::with_capacity(n as usize);
+                    // Capacity capped like the value decoder's hostile-
+                    // length guard: the wire-declared count is untrusted;
+                    // the Vec grows as items actually decode.
+                    let mut out = Vec::with_capacity(n.min(1024) as usize);
                     for _ in 0..n {
                         out.push(fixed::<32>(read_borrowed_bytes(r)?)?);
                     }

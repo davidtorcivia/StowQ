@@ -964,6 +964,110 @@ mod direct_encode_tests {
         assert_eq!(&decode(&a, &qid, &tag).unwrap(), record);
     }
 
+    /// A digest-valid FORMAT with a shard_count ≥ 2^32 whose low
+    /// bits fit u16 space: truncating-before-checking would accept it
+    /// as the truncated value (0, 65536, 4...); both paths must
+    /// reject on the raw wire value.
+    #[test]
+    fn huge_shard_count_rejects_not_truncates() {
+        let qid = [7u8; 16];
+        let tag = [9u8; 8];
+        for v in [0x1_0000_0000u64, 0x1_0001_0000, 0x2_0000_0004] {
+            let body = Value::Array(vec![
+                Value::Uint(MAGIC),
+                Value::Uint(MAJOR),
+                Value::Uint(MINOR),
+                Value::Bytes(qid.to_vec()),
+                Value::Bytes(tag.to_vec()),
+                Value::Uint(1),
+                Value::Map(vec![
+                    (Value::Text("shard_count".into()), Value::Uint(v)),
+                    (Value::Text("inline_limit".into()), Value::Uint(1)),
+                    (Value::Text("lease_bucket_width_ns".into()), Value::Uint(1)),
+                    (Value::Text("required_feature_bits".into()), Value::Uint(0)),
+                    (
+                        Value::Text("delayed_bucket_width_ns".into()),
+                        Value::Uint(1),
+                    ),
+                    (
+                        Value::Text("terminal_bucket_width_ns".into()),
+                        Value::Uint(1),
+                    ),
+                ]),
+            ]);
+            let mut bytes = cbor::encode(&body);
+            let digest = record_digest("format", &bytes);
+            bytes.push(0x58);
+            bytes.push(32);
+            bytes.extend_from_slice(&digest);
+            for (name, r) in [
+                ("direct", decode(&bytes, &qid, &tag)),
+                ("value", value_decode(&bytes, &qid, &tag)),
+            ] {
+                match r {
+                    Err(RecordError::Field("shard_count")) => {}
+                    other => {
+                        panic!("{name} path: v={v:#x}: expected Field(shard_count), got {other:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    /// A digest-valid receipt whose output_digests array declares
+    /// 2^40 items but contains four: the decoder must reject cleanly
+    /// (EOF after capped pre-allocation), never pre-allocate the
+    /// wire-declared count (capacity-overflow abort).
+    #[test]
+    fn hostile_output_digests_length_rejects_without_huge_alloc() {
+        let qid = [7u8; 16];
+        let tag = [9u8; 8];
+        let body = Value::Array(vec![
+            Value::Uint(MAGIC),
+            Value::Uint(MAJOR),
+            Value::Uint(MINOR),
+            Value::Bytes(qid.to_vec()),
+            Value::Bytes(tag.to_vec()),
+            Value::Uint(5),
+            Value::Map(vec![
+                (Value::Text("job_id".into()), Value::Bytes(vec![1; 16])),
+                (Value::Text("attempt".into()), Value::Uint(1)),
+                (Value::Text("generation".into()), Value::Uint(1)),
+                (Value::Text("worker_id".into()), Value::Text("w".into())),
+                (
+                    Value::Text("worker_token".into()),
+                    Value::Bytes(vec![2; 16]),
+                ),
+                (
+                    Value::Text("output_digests".into()),
+                    Value::Array(vec![Value::Bytes(vec![3; 32]); 4]),
+                ),
+                (
+                    Value::Text("payload_digest".into()),
+                    Value::Bytes(vec![4; 32]),
+                ),
+            ]),
+        ]);
+        let bytes = cbor::encode(&body);
+        // Locate the output_digests array head (4-item canonical form
+        // is 0x84) and replace with the 2^40 indefinite-free form:
+        // 0x9B + 8-byte big-endian length.
+        let pos = bytes
+            .windows(1)
+            .position(|w| w[0] == 0x84)
+            .expect("4-item array head present");
+        let mut patched = bytes[..pos].to_vec();
+        patched.push(0x9b);
+        patched.extend_from_slice(&(1u64 << 40).to_be_bytes());
+        patched.extend_from_slice(&bytes[pos + 1..]);
+        let digest = record_digest("receipt", &patched);
+        patched.push(0x58);
+        patched.push(32);
+        patched.extend_from_slice(&digest);
+        assert!(decode(&patched, &qid, &tag).is_err(), "direct rejects");
+        assert!(value_decode(&patched, &qid, &tag).is_err(), "value rejects");
+    }
+
     #[test]
     fn direct_decode_matches_the_value_path_for_every_shape() {
         let qid = [7u8; 16];
