@@ -689,14 +689,12 @@ pub fn encode(record: &Record, queue_id: &[u8; 16], key_tag: &[u8; 8]) -> Vec<u8
     ]);
     let body_bytes = cbor::encode(&body);
     let digest = record_digest(type_name(record.type_number()).unwrap(), &body_bytes);
-    let mut out = body_bytes.clone();
+    let mut out = body_bytes;
     // The digest is appended as a trailing byte string, outside the digested
     // body: appending keeps the digest input a valid standalone CBOR value.
-    let mut digest_enc = Vec::with_capacity(33);
-    digest_enc.push(0x58);
-    digest_enc.push(32);
-    digest_enc.extend_from_slice(&digest);
-    out.extend_from_slice(&digest_enc);
+    out.push(0x58);
+    out.push(32);
+    out.extend_from_slice(&digest);
     out
 }
 

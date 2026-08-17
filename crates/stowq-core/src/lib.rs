@@ -356,7 +356,15 @@ fn fresh_token() -> [u8; 16] {
 }
 
 fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    // One allocation, no per-byte intermediates: this runs for every
+    // claim scan, output key, and terminal probe.
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push(HEX[(x >> 4) as usize] as char);
+        s.push(HEX[(x & 0x0f) as usize] as char);
+    }
+    s
 }
 
 // ---------- Queue ----------
