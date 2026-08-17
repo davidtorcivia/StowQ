@@ -3627,3 +3627,93 @@ async fn depth_counts_each_plane() {
     // GC owns deletion); nack's gen-1 also. Total: 2 claim records.
     assert_eq!(d.claims, 2, "gen-1 records for both claimed jobs");
 }
+
+#[tokio::test]
+async fn gc_collects_orphan_claims_from_the_claim_gc_race() {
+    let (q, mem) = make_shared().await;
+    let mut b = OpBudget::new(1024);
+    // Job A: live (claimed, lease held) — its claims survive GC.
+    let EnqueueOutcome::Committed { .. } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([0x11; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let ClaimOutcome::Claimed(ca) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    // Job B: the race artifact — claim record exists, job record
+    // foreign-deleted (simulating GC winning the race).
+    let EnqueueOutcome::Committed { .. } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([0x22; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let ClaimOutcome::Claimed(cb) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let hexb: String = [0x22u8; 16].iter().map(|x| format!("{x:02x}")).collect();
+    q.store()
+        .delete(&Key::new(format!("q/jobs/0000/{hexb}")))
+        .await
+        .unwrap();
+
+    // GC with the horizon past the claims' store times.
+    mem.advance_clock_to(cb.claim_store_time_ns + 10_000);
+    let floor = q.establish_floor(&mut b).await.unwrap();
+    let report = q.gc(floor, 0, 1, &mut b).await.unwrap();
+    assert_eq!(
+        report.claim_orphans_deleted, 1,
+        "the race artifact collected"
+    );
+    // The live job's claim survives.
+    let hexa: String = [0x11u8; 16].iter().map(|x| format!("{x:02x}")).collect();
+    assert!(q
+        .store()
+        .head(&Key::new(format!(
+            "q/claims/0000/{hexa}/{:08x}",
+            ca.generation
+        )))
+        .await
+        .is_ok());
+    // The orphan is gone.
+    assert_eq!(
+        q.store()
+            .head(&Key::new(format!(
+                "q/claims/0000/{hexb}/{:08x}",
+                cb.generation
+            )))
+            .await
+            .unwrap_err(),
+        StoreError::NotFound
+    );
+}

@@ -2336,6 +2336,8 @@ pub struct SweepReport {
 pub struct GcReport {
     /// Terminal job graphs fully deleted.
     pub jobs_deleted: usize,
+    /// Orphan claim records collected (GC-vs-claim race artifacts).
+    pub claim_orphans_deleted: usize,
     /// Clock beacons deleted.
     pub beacons_deleted: usize,
     /// Orphan payloads deleted past the enqueue horizon.
@@ -2731,6 +2733,53 @@ impl Queue {
                         budget.spend()?;
                         let _ = self.store.delete(&item.key).await;
                         report.orphans_deleted += 1;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            match page.next_after {
+                Some(k) => after = Some(k),
+                None => break,
+            }
+        }
+
+        // Orphan claims: a claimant can pass every check and commit a
+        // claim while GC concurrently deletes the terminal graph (the
+        // race window is job-read to claim-put); the surviving claim
+        // references a deleted job and nothing else would collect it.
+        // Same horizon discipline as payloads: old enough to predate
+        // any in-flight enqueue, and the job record is absent NOW.
+        let claims_prefix = format!("{}claims/", self.root);
+        let mut after: Option<Key> = None;
+        loop {
+            budget.spend()?;
+            let page = self.store.list(&claims_prefix, after.as_ref(), 64).await?;
+            if page.items.is_empty() {
+                break;
+            }
+            for item in &page.items {
+                if item.meta.store_time_ns >= orphan_cutoff {
+                    continue;
+                }
+                let rel = item
+                    .key
+                    .as_str()
+                    .strip_prefix(&self.root)
+                    .and_then(|s| s.parse().ok());
+                let Some(RelKey::Claim { shard, job_id, .. }) = rel else {
+                    continue; // repair owns quarantine findings
+                };
+                budget.spend()?;
+                match self
+                    .store
+                    .head(&self.absolute(&RelKey::Job { shard, job_id }))
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(StoreError::NotFound) => {
+                        budget.spend()?;
+                        let _ = self.store.delete(&item.key).await;
+                        report.claim_orphans_deleted += 1;
                     }
                     Err(e) => return Err(e.into()),
                 }
