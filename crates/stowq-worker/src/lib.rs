@@ -147,10 +147,12 @@ pub trait Executor: Send + Sync {
 /// Store ops allowed for one delivery: claim across hinted shards,
 /// floor establishment, execution renewals, output commits, ack.
 /// A sweep hint claims shard by shard, so a queue with more shards
-/// than the budget allows fails `Err(BudgetExhausted)` mid-scan —
-/// fail-safe: no partial delivery happens (the spend precedes every
-/// op), and the hint is simply not fully served. Retry it or let the
-/// sweeper find the work.
+/// than the budget allows fails `Err(BudgetExhausted)` mid-scan with
+/// no claim held (the spend precedes every op) — the hint is simply
+/// not fully served; retry it or let the sweeper find the work.
+/// Exhaustion after a taken claim leaves that claim outstanding (it
+/// expires; the sweeper reclaims) beside any already-committed
+/// outputs, which are idempotent and converge on redelivery.
 pub const DELIVERY_BUDGET_OPS: usize = 1024;
 
 /// What one doorbell delivery came to.
