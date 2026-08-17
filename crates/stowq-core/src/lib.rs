@@ -1448,8 +1448,18 @@ impl Queue {
 
         // Commit rule: verify every recorded output exists with its
         // committed digest before the terminal write; a receipt
-        // implies its outputs exist and are final.
+        // implies its outputs exist and are final. Each output must
+        // live under THIS job's outputs prefix — a CommittedOutput
+        // from another job must never verify here.
+        let output_prefix = format!("{}outputs/{}/", self.root, hex(&claim.job_id));
         for out in outputs {
+            if !out.key.starts_with(&output_prefix) {
+                return Err(Error::Key(format!(
+                    "output {} is not job {}'s output",
+                    out.key,
+                    hex(&claim.job_id)
+                )));
+            }
             match self.read_retrying(&Key::new(out.key.clone()), budget).await {
                 Ok(obj) => {
                     let got: Digest = Sha256::digest(&obj.body).into();

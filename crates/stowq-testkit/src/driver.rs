@@ -95,6 +95,37 @@ fn output_content(job: usize) -> Vec<u8> {
     format!("stowq differential output for job {job}").into_bytes()
 }
 
+/// An output committed through the commit rule is durable first-wins
+/// state: whatever the job's terminal fate, once the oracle records an
+/// output the store must hold the deterministic bytes at the output
+/// key — with or without a receipt.
+#[allow(clippy::too_many_arguments)]
+async fn assert_output_persistence(
+    j: usize,
+    id: &[u8; 16],
+    hex_id: &str,
+    oracle: &Oracle,
+    store: &MemoryStore,
+    seed: u64,
+) {
+    let Some(d) = oracle.output_digest(id) else {
+        return;
+    };
+    let okey = format!("q/outputs/{hex_id}/result");
+    let oobj = store
+        .get(&stowq_store::Key::new(okey), None)
+        .await
+        .unwrap_or_else(|_| panic!("seed {seed} job {j}: committed output absent"));
+    let content = output_content(j);
+    assert_eq!(
+        &oobj.body[..],
+        &content[..],
+        "seed {seed} job {j}: output bytes are not the deterministic first-wins"
+    );
+    let got_d: [u8; 32] = Sha256::digest(&oobj.body).into();
+    assert_eq!(got_d, d, "seed {seed} job {j}: output digest drift");
+}
+
 fn job_index(id: &[u8; 16]) -> usize {
     let mut b = [0u8; 8];
     b.copy_from_slice(&id[..8]);
@@ -427,21 +458,7 @@ pub async fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64
                     }
                     other => panic!("seed {seed} job {j}: receipt undecodable: {other:?}"),
                 }
-                if let Some(d) = oracle.output_digest(&id) {
-                    let okey = format!("q/outputs/{hex_id}/result");
-                    let oobj = store
-                        .get(&stowq_store::Key::new(okey), None)
-                        .await
-                        .expect("seed {seed} job {j}: receipt records an output but none exists");
-                    let content = output_content(j);
-                    assert_eq!(
-                        &oobj.body[..],
-                        &content[..],
-                        "seed {seed} job {j}: output bytes are not the deterministic first-wins"
-                    );
-                    let got_d: [u8; 32] = Sha256::digest(&oobj.body).into();
-                    assert_eq!(got_d, d, "seed {seed} job {j}: output digest drift");
-                }
+                assert_output_persistence(j, &id, &hex_id, &oracle, &store, seed).await;
             }
             Some(Phase::Terminal(Terminal::Dead { .. })) => {
                 assert!(dead.is_ok(), "seed {seed} job {j}: oracle dead, store none");
@@ -449,12 +466,14 @@ pub async fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64
                     receipt.is_err(),
                     "seed {seed} job {j}: oracle dead but receipt exists"
                 );
+                assert_output_persistence(j, &id, &hex_id, &oracle, &store, seed).await;
             }
             _ => {
                 assert!(
                     receipt.is_err() && dead.is_err(),
                     "seed {seed} job {j}: oracle non-terminal but store has a terminal record"
                 );
+                assert_output_persistence(j, &id, &hex_id, &oracle, &store, seed).await;
             }
         }
     }
