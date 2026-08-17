@@ -624,6 +624,32 @@ impl Queue {
         }
     }
 
+    /// Reads and verifies this job's receipt, if present. For callers
+    /// (the consumer harness) comparing a foreign receipt's completed
+    /// state against their own delivery.
+    pub async fn receipt_for(
+        &self,
+        claim: &Claim,
+        budget: &mut OpBudget,
+    ) -> Result<Option<stowq_format::ReceiptRecord>, Error> {
+        let rel = RelKey::Receipt {
+            shard: claim.shard,
+            job_id: claim.job_id,
+        };
+        let abs = self.absolute(&rel);
+        let tag = self.tag_for(&rel);
+        match self.read_retrying(&abs, budget).await {
+            Ok(obj) => match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
+                Record::Receipt(r) => Ok(Some(r)),
+                _ => Err(Error::Record(
+                    "receipt key holds a non-receipt record".into(),
+                )),
+            },
+            Err(Error::Store(StoreError::NotFound)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Advances the watermark monotonically (spec time.md): If-Match CAS;
     /// a lost race means someone advanced it further — the stored value
     /// then already covers our bucket and the call proceeds. A bucket at
