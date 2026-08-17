@@ -594,12 +594,13 @@ impl Queue {
     }
 
     /// Records that this handle proved the job terminal while its jobs
-    /// index entry had this version. Keyed by version (unique per
-    /// write: ETag on S3, the monotone counter on the memory fake), so
-    /// a deleted-then-re-enqueued incarnation never matches and is
-    /// re-examined. Terminality is monotone (receipts and dead records
-    /// are never un-written; GC removes the whole graph including the
-    /// jobs entry), so an entry never needs invalidation.
+    /// index entry had this version. Terminality is monotone (receipts
+    /// and dead records are never un-written; GC removes the whole
+    /// graph including the jobs entry), and a version mismatch always
+    /// re-examines — but a version match is not an incarnation proof
+    /// on content-addressed backends (identical-input re-enqueues
+    /// repeat etags), so entries carry a staleness deadline and are
+    /// re-proven once per window.
     fn memoize_terminal(&self, shard: u16, job_id: [u8; 16], version: Version) {
         let mut memo = self.terminal_memo.lock().unwrap();
         if memo.len() >= TERMINAL_MEMO_CAP {
