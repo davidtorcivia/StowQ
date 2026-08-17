@@ -1093,6 +1093,10 @@ async fn soak_mode(
         .await
         .map_err(|e| e.to_string())?;
     let mut b = OpBudget::new(8192);
+    // One final gc pass collects any last-window race artifact
+    // before the repair scan sees it (structural close, not timing).
+    let floor = verify.establish_floor(&mut b).await.unwrap_or(0);
+    let _ = verify.gc(floor, 0, 0, &mut b).await;
     let d = verify.depth(0, &mut b).await.map_err(|e| e.to_string())?;
     let (report, _) = verify
         .repair_scan(0, &mut b)

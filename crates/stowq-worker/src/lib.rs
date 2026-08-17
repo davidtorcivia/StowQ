@@ -454,7 +454,15 @@ pub async fn run_batch_with(
     if let Some(m) = metrics {
         m.hints.fetch_add(1, Ordering::Relaxed);
     }
-    run_batch_inner(q, msg, exec, lease_duration_ns, batch, metrics).await
+    match run_batch_inner(q, msg, exec, lease_duration_ns, batch, metrics).await {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            if let Some(m) = metrics {
+                m.store_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e)
+        }
+    }
 }
 
 async fn run_batch_inner(

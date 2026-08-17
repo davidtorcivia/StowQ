@@ -2730,9 +2730,22 @@ impl Queue {
                 {
                     Ok(_) => {}
                     Err(StoreError::NotFound) => {
+                        // Re-head the payload: same ABA discipline as
+                        // the claims pass (a re-enqueue with the same
+                        // content recreates the content-addressed key).
                         budget.spend()?;
-                        let _ = self.store.delete(&item.key).await;
-                        report.orphans_deleted += 1;
+                        match self.store.head(&item.key).await {
+                            Ok(now) if now.store_time_ns == item.meta.store_time_ns => {
+                                budget.spend()?;
+                                let _ = self.store.delete(&item.key).await;
+                                report.orphans_deleted += 1;
+                            }
+                            Ok(_) => {}
+                            Err(StoreError::NotFound) => {
+                                report.orphans_deleted += 1;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -2777,9 +2790,25 @@ impl Queue {
                 {
                     Ok(_) => {}
                     Err(StoreError::NotFound) => {
+                        // Re-head the claim itself: the listing was
+                        // check-then-act, and a concurrent re-enqueue
+                        // at a colliding generation can recreate the
+                        // exact key between the listing and this
+                        // delete. The store time distinguishes them
+                        // (a fresh claim writes a later time).
                         budget.spend()?;
-                        let _ = self.store.delete(&item.key).await;
-                        report.claim_orphans_deleted += 1;
+                        match self.store.head(&item.key).await {
+                            Ok(now) if now.store_time_ns == item.meta.store_time_ns => {
+                                budget.spend()?;
+                                let _ = self.store.delete(&item.key).await;
+                                report.claim_orphans_deleted += 1;
+                            }
+                            Ok(_) => {} // recreated: a live claim now
+                            Err(StoreError::NotFound) => {
+                                report.claim_orphans_deleted += 1;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
                     }
                     Err(e) => return Err(e.into()),
                 }
