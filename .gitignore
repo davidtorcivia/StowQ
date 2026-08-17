@@ -22,3 +22,4 @@ stowq-decisions.md
 
 # TLA+ model checker output
 model/*/states/
+stowq-perf-report.md
