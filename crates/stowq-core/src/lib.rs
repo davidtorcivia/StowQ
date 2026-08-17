@@ -1422,12 +1422,19 @@ impl Queue {
         budget.spend()?;
         match self.store.get(&abs, None).await {
             Ok(obj) => {
-                let arr: [u8; 8] = obj
-                    .body
-                    .as_ref()
-                    .try_into()
-                    .map_err(|_| Error::Record("tail hint body width".into()))?;
-                Ok(Some((obj.meta.version, u64::from_be_bytes(arr))))
+                // A body that is not exactly 8 bytes, or a generation
+                // outside the protocol's u32 space, is corrupt-hint
+                // garbage: the generation-0 sentinel routes the caller
+                // to the listing fallback and marks the hint for
+                // overwrite at commit (a range-valid body must never
+                // alias a real generation through truncation).
+                if let Ok(arr) = obj.body.as_ref().try_into() {
+                    let gen = u64::from_be_bytes(arr);
+                    if (1..=u32::MAX as u64).contains(&gen) {
+                        return Ok(Some((obj.meta.version, gen)));
+                    }
+                }
+                Ok(Some((obj.meta.version, 0)))
             }
             Err(StoreError::NotFound) => Ok(None),
             Err(e) => Err(e.into()),
@@ -1476,7 +1483,7 @@ impl Queue {
                     return self.list_tail(claims_prefix.as_str(), budget).await;
                 }
                 match self.read_tail_hint(shard, job_id, budget).await? {
-                    Some((version, gen)) if gen > 0 => {
+                    Some((version, gen)) if gen > 0 && gen <= u32::MAX as u64 => {
                         let rel = RelKey::Claim {
                             shard,
                             job_id,
@@ -1514,9 +1521,16 @@ impl Queue {
                             Err(e) => Err(e.into()),
                         }
                     }
-                    // Absent hint (or generation 0): fresh-job shape,
-                    // discover by listing.
-                    _ => self.list_tail(claims_prefix.as_str(), budget).await,
+                    // Corrupt hint (generation-0 sentinel from
+                    // read_tail_hint, or an out-of-range body if that
+                    // clamp ever changes): fall back to the listing
+                    // and mark for overwrite at commit.
+                    Some((version, _)) => {
+                        hint_state = Some((version, 0));
+                        self.list_tail(claims_prefix.as_str(), budget).await
+                    }
+                    // Absent hint: fresh-job shape, discover by listing.
+                    None => self.list_tail(claims_prefix.as_str(), budget).await,
                 }
             });
         match (receipt, dead) {
@@ -1626,6 +1640,39 @@ impl Queue {
             }
 
             if attempt > job.maximum_attempts {
+                // The exhaustion-dead writes a TERMINAL record before
+                // any put-if-absent could fence the evidence — a
+                // stale hint must not kill a live delivery here.
+                // Re-verify on the authoritative tail; the retried
+                // pass (hint_used now false) writes the dead only on
+                // verified evidence.
+                if hint_used {
+                    let t = self
+                        .list_tail(
+                            &format!("{}claims/{shard:04x}/{}/", self.root, hex(&job_id)),
+                            budget,
+                        )
+                        .await?;
+                    let (g, m) = t.unwrap_or((
+                        0,
+                        Meta {
+                            version: Version("0".into()),
+                            store_time_ns: 0,
+                            size: 0,
+                        },
+                    ));
+                    tail_gen = g;
+                    tail_meta = m;
+                    let (a, d) = if tail_gen == 0 {
+                        (0, 0)
+                    } else {
+                        self.tail_record(shard, job_id, tail_gen, budget).await?
+                    };
+                    tail_attempt = a;
+                    tail_duration = d;
+                    hint_used = false;
+                    continue;
+                }
                 let dead = Record::Dead(DeadRecord {
                     job_id,
                     generation: tail_gen,

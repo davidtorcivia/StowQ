@@ -3450,3 +3450,126 @@ async fn deep_chain_takeover_hint_vs_listing() {
         "listing path paginates past 64 generations (got {plain_lists})"
     );
 }
+
+/// F1 regression: the exhaustion-dead must never fire on unfenced
+/// hint evidence. A stale hint on a job whose authoritative tail is
+/// UNexpired, with maximum_attempts exhausted per the stale
+/// evidence's attempt count — the claim returns Empty (no dead), and
+/// the live holder still acks.
+#[tokio::test]
+async fn stale_hint_cannot_write_premature_dead() {
+    let (q, store) = hinted_queue().await;
+    let mut b = OpBudget::new(2048);
+    let EnqueueOutcome::Committed { .. } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([0xA1; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 1,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let ClaimOutcome::Claimed(c1) = q.claim(&claim_opts(0, 5_000), &mut b).await.unwrap() else {
+        panic!()
+    };
+    // Renewals deepen the chain while the gen-1 evidence would read
+    // as expired.
+    let gen1_store_time = c1.claim_store_time_ns;
+    let mut c = c1;
+    for _ in 0..3 {
+        match q.renew(&c, &mut b).await.unwrap() {
+            stowq_core::RenewOutcome::Renewed(nc) => c = nc,
+            _ => panic!("renew"),
+        }
+    }
+    // Stale the hint to generation 1.
+    let jhex: String = c.job_id.iter().map(|x| format!("{x:02x}")).collect();
+    let key = Key::new(format!("q/tails/0000/{jhex}"));
+    let obj = store.get(&key, None).await.unwrap();
+    store
+        .cas(
+            &key,
+            bytes::Bytes::copy_from_slice(&1u64.to_be_bytes()),
+            sha2::Sha256::digest(1u64.to_be_bytes()).into(),
+            &obj.meta.version,
+        )
+        .await
+        .unwrap();
+    // A floor past gen-1's expiry but before gen-4's: the stale
+    // evidence reads expired+exhausted, the authoritative tail is live.
+    let qf = Queue::open(Box::new(store.clone()), "q", OpenOptions::new([1; 16]))
+        .await
+        .unwrap();
+    let mut b2 = OpBudget::new(1024);
+    store.advance_clock_to(gen1_store_time + 5_001);
+    let floor = qf.establish_floor(&mut b2).await.unwrap();
+    match qf.claim(&claim_opts(floor, 5_000), &mut b2).await.unwrap() {
+        ClaimOutcome::Empty => {}
+        ClaimOutcome::Claimed(_) => panic!("live tail must not be claimable"),
+    }
+    assert!(
+        store
+            .head(&Key::new(format!("q/dead/0000/{jhex}")))
+            .await
+            .is_err(),
+        "no premature dead from stale hint evidence"
+    );
+    // The live holder acks: the delivery survives.
+    assert_eq!(
+        q.ack(&c, &mut b).await.unwrap(),
+        stowq_core::AckOutcome::Acked
+    );
+}
+
+/// F2/F3 regression: corrupt hint bodies (wrong width; out-of-range
+/// generation) fall back to the listing, claim succeeds, and the
+/// commit repairs the hint.
+#[tokio::test]
+async fn corrupt_hint_bodies_fall_back_and_repair() {
+    for body in [
+        bytes::Bytes::from_static(b"short"), // width
+        bytes::Bytes::copy_from_slice(&(0x1_0000_0001u64).to_be_bytes()), // > u32::MAX
+    ] {
+        let (q, store) = hinted_queue().await;
+        let mut b = OpBudget::new(2048);
+        let EnqueueOutcome::Committed { .. } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([0xB2; 16]),
+                    payload: b"x",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut b,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        // Plant the corrupt hint at the deterministic key.
+        let jhex: String = [0xB2u8; 16].iter().map(|x| format!("{x:02x}")).collect();
+        let key = Key::new(format!("q/tails/0000/{jhex}"));
+        let digest = sha2::Sha256::digest(body.as_ref()).into();
+        store.put_if_absent(&key, body, digest).await.unwrap();
+        // Claim succeeds through the listing fallback.
+        let ClaimOutcome::Claimed(c) = q
+            .claim(&claim_opts(0, 60_000_000_000), &mut b)
+            .await
+            .unwrap()
+        else {
+            panic!("claim through corrupt hint")
+        };
+        assert_eq!(c.generation, 1);
+        // The commit repaired the hint.
+        assert_eq!(hint_body(&store, &c.job_id).await, Some(1));
+    }
+}
