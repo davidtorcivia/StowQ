@@ -7,7 +7,9 @@
 //! trusted and rejects unknown fields in v1.
 
 pub mod cbor;
+mod direct;
 
+#[cfg(test)]
 use cbor::Value;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -68,6 +70,7 @@ fn record_digest(type_str: &str, body: &[u8]) -> [u8; 32] {
 
 // ---------- Field helpers ----------
 
+#[cfg(test)]
 fn get_u64(map: &[(Value, Value)], key: &'static str) -> Result<u64, RecordError> {
     match map.iter().find(|(k, _)| k == &Value::Text(key.into())) {
         Some((_, Value::Uint(n))) => Ok(*n),
@@ -76,6 +79,7 @@ fn get_u64(map: &[(Value, Value)], key: &'static str) -> Result<u64, RecordError
     }
 }
 
+#[cfg(test)]
 fn get_opt_u64(map: &[(Value, Value)], key: &str) -> Result<Option<u64>, RecordError> {
     match map.iter().find(|(k, _)| k == &Value::Text(key.into())) {
         Some((_, Value::Uint(n))) => Ok(Some(*n)),
@@ -84,6 +88,7 @@ fn get_opt_u64(map: &[(Value, Value)], key: &str) -> Result<Option<u64>, RecordE
     }
 }
 
+#[cfg(test)]
 fn get_bytes<const N: usize>(
     map: &[(Value, Value)],
     key: &'static str,
@@ -103,6 +108,7 @@ fn get_bytes<const N: usize>(
     }
 }
 
+#[cfg(test)]
 fn get_text(map: &[(Value, Value)], key: &'static str) -> Result<String, RecordError> {
     match map.iter().find(|(k, _)| k == &Value::Text(key.into())) {
         Some((_, Value::Text(t))) => Ok(t.clone()),
@@ -111,6 +117,7 @@ fn get_text(map: &[(Value, Value)], key: &'static str) -> Result<String, RecordE
     }
 }
 
+#[cfg(test)]
 fn get_bool(map: &[(Value, Value)], key: &'static str) -> Result<bool, RecordError> {
     match map.iter().find(|(k, _)| k == &Value::Text(key.into())) {
         Some((_, Value::Bool(b))) => Ok(*b),
@@ -119,6 +126,7 @@ fn get_bool(map: &[(Value, Value)], key: &'static str) -> Result<bool, RecordErr
     }
 }
 
+#[cfg(test)]
 fn expect_keys(map: &[(Value, Value)], allowed: &[&str]) -> Result<(), RecordError> {
     for (k, _) in map {
         if let Value::Text(t) = k {
@@ -413,6 +421,7 @@ impl Record {
         m
     }
 
+    #[cfg(test)]
     fn from_fields(t: u64, map: &[(Value, Value)]) -> Result<Record, RecordError> {
         let m = map;
         Ok(match t {
@@ -857,6 +866,15 @@ fn write_fields(record: &Record, out: &mut Vec<u8>) {
 /// Decodes and fully verifies a record: envelope shape, version, digest,
 /// and field-level strictness. Unknown fields are rejected.
 pub fn decode(data: &[u8], queue_id: &[u8; 16], key_tag: &[u8; 8]) -> Result<Record, RecordError> {
+    direct::decode_record(data, queue_id, key_tag)
+}
+
+#[cfg(test)]
+fn value_decode(
+    data: &[u8],
+    queue_id: &[u8; 16],
+    key_tag: &[u8; 8],
+) -> Result<Record, RecordError> {
     // Split the trailing 34-byte digest (2-byte head + 32 bytes).
     if data.len() < 34 {
         return Err(RecordError::Envelope);
@@ -944,6 +962,131 @@ mod direct_encode_tests {
         assert_eq!(a, b, "direct encode diverged for {record:?}");
         // And it round-trips through the unchanged decoder.
         assert_eq!(&decode(&a, &qid, &tag).unwrap(), record);
+    }
+
+    #[test]
+    fn direct_decode_matches_the_value_path_for_every_shape() {
+        let qid = [7u8; 16];
+        let tag = [9u8; 8];
+        let fixtures: Vec<Record> = vec![
+            Record::Format(FormatRecord {
+                shard_count: 4,
+                lease_bucket_width_ns: 1_000,
+                delayed_bucket_width_ns: 1_000,
+                terminal_bucket_width_ns: 1_000,
+                inline_limit: 4_096,
+                required_feature_bits: 1,
+            }),
+            Record::Job(JobRecord {
+                job_id: [1; 16],
+                maximum_attempts: 5,
+                content_type: "application/octet-stream".into(),
+                created_store_time_ns: 0,
+                not_before_ns: Some(456),
+                payload_digest: [3; 32],
+                payload_length: 1 << 20,
+                payload_inline: None,
+                payload_key: Some("payloads/aa/digest".into()),
+            }),
+            Record::Job(JobRecord {
+                job_id: [2; 16],
+                maximum_attempts: 1,
+                content_type: "t".into(),
+                created_store_time_ns: 9,
+                not_before_ns: None,
+                payload_digest: [4; 32],
+                payload_length: 64,
+                payload_inline: Some(vec![0xA5; 64]),
+                payload_key: None,
+            }),
+            Record::Claim(ClaimRecord {
+                job_id: [4; 16],
+                generation: 2,
+                attempt: 2,
+                worker_id: "worker-1".into(),
+                worker_token: [5; 16],
+                lease_duration_ns: 60_000_000_000,
+                continuation: false,
+                basis: Some(ClaimBasis {
+                    prev_store_time_ns: 100,
+                    prev_duration_ns: 200,
+                    observed_watermark_ns: 300,
+                }),
+                prev_token: None,
+            }),
+            Record::Claim(ClaimRecord {
+                job_id: [5; 16],
+                generation: 3,
+                attempt: 1,
+                worker_id: "w".into(),
+                worker_token: [7; 16],
+                lease_duration_ns: 1,
+                continuation: true,
+                basis: None,
+                prev_token: Some([6; 16]),
+            }),
+            Record::Fail(FailRecord {
+                job_id: [6; 16],
+                generation: 1,
+                reason: 0x0001,
+                attempt: 1,
+                retry_not_before_ns: u64::MAX,
+            }),
+            Record::Receipt(ReceiptRecord {
+                job_id: [7; 16],
+                generation: 3,
+                attempt: 3,
+                worker_id: "worker-2".into(),
+                worker_token: [8; 16],
+                payload_digest: [3; 32],
+                output_digests: vec![[9; 32], [10; 32]],
+            }),
+            Record::Dead(DeadRecord {
+                job_id: [9; 16],
+                generation: 2,
+                attempt: 2,
+                reason: 0x0004,
+            }),
+            Record::Watermark(WatermarkRecord {
+                highest_observed_wall_bucket: 1 << 40,
+                sequence: 77,
+            }),
+            Record::Quarantine(QuarantineRecord {
+                qid: [2; 16],
+                source_key: "jobs/0000/aa".into(),
+                reason: 0x0014,
+                observed_store_ns: 424,
+                detail: Some(2),
+            }),
+        ];
+        for record in &fixtures {
+            let bytes = encode(record, &qid, &tag);
+            assert_eq!(&decode(&bytes, &qid, &tag).unwrap(), record);
+            assert_eq!(&value_decode(&bytes, &qid, &tag).unwrap(), record);
+        }
+        // Mutation rejection-parity: every single-byte mutation must
+        // be accepted by both paths or rejected by both. Exact error
+        // VARIANTS may differ on arbitrary corruption (the value
+        // path's variant for a mangled envelope header is a parse-
+        // order accident, e.g. TrailingBytes for a six-item array);
+        // no consumer branches on which malformed-error it got — both
+        // map to the corruption/quarantine class. Valid inputs are
+        // pinned to identical records above; the invalid-record suite
+        // pins the exact variants it asserts.
+        let base = encode(&fixtures[1], &qid, &tag);
+        for i in 0..base.len() {
+            for flip in [0x01u8, 0x80] {
+                let mut m = base.clone();
+                m[i] ^= flip;
+                let a = decode(&m, &qid, &tag);
+                let b = value_decode(&m, &qid, &tag);
+                assert_eq!(
+                    a.is_ok(),
+                    b.is_ok(),
+                    "mutation at {i} (^{flip:#x}) accepted by only one path"
+                );
+            }
+        }
     }
 
     #[test]

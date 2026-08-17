@@ -131,7 +131,7 @@ pub fn encode(v: &Value) -> Vec<u8> {
 
 // ---------- Decoding ----------
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
     depth: u32,
@@ -143,7 +143,15 @@ struct Reader<'a> {
 const MAX_DEPTH: u32 = 64;
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
+        Reader {
+            data,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         // Subtraction form: `pos + n` can overflow usize on hostile
         // length fields before the comparison runs.
         if n > self.data.len() - self.pos {
@@ -154,7 +162,11 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 
-    fn head(&mut self) -> Result<(u8, u64), Error> {
+    pub(crate) fn done(&self) -> bool {
+        self.pos == self.data.len()
+    }
+
+    pub(crate) fn head(&mut self) -> Result<(u8, u64), Error> {
         let b = self.take(1)?[0];
         let major = b >> 5;
         let info = b & 0x1f;
@@ -193,7 +205,7 @@ impl<'a> Reader<'a> {
         Ok((major, value))
     }
 
-    fn value(&mut self) -> Result<Value, Error> {
+    pub(crate) fn value(&mut self) -> Result<Value, Error> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             self.depth -= 1;
