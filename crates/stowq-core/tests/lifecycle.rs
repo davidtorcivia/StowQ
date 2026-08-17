@@ -8,7 +8,7 @@ use stowq_core::{
     ClaimOptions, ClaimOutcome, EnqueueInput, EnqueueOutcome, Error, OpBudget, OpenOptions, Queue,
 };
 use stowq_format::FormatRecord;
-use stowq_store::{Key, MemoryStore, StoreError};
+use stowq_store::{Key, MemoryStore, ObjectStore as _, StoreError};
 
 fn format() -> FormatRecord {
     FormatRecord {
@@ -935,8 +935,9 @@ async fn open_rejects_format_with_unknown_required_features() {
 
     let store = MemoryStore::new();
     let mut f = format();
-    // Bit 1 is known as of v1.1 (quarantine); bit 2 is not.
-    f.required_feature_bits = 2;
+    // Bits 1 (v1.1 quarantine) and 2 (v1.2 tail hints) are known;
+    // bit 4 is not.
+    f.required_feature_bits = 4;
     // Write the record directly, bypassing init's validation: open must
     // reject a v1.1 store whose FORMAT demands unknown features.
     let tag = stowq_keys::key_tag(&[1; 16], "meta/FORMAT");
@@ -3010,5 +3011,565 @@ async fn claim_many_spreads_thin_budgets_across_the_wave() {
     {
         Err(Error::BudgetExhausted) => {}
         other => panic!("expected BudgetExhausted from the spread, got {other:?}"),
+    }
+}
+
+// ---------- tail hints (feature bit 2) ----------
+
+fn hints_format() -> FormatRecord {
+    FormatRecord {
+        required_feature_bits: 2,
+        ..format()
+    }
+}
+
+/// Counts LIST calls on claims/ prefixes — the op the tail hint
+/// exists to avoid.
+struct CountClaimLists {
+    inner: MemoryStore,
+    lists: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl stowq_store::ObjectStore for CountClaimLists {
+    async fn put_if_absent(
+        &self,
+        key: &Key,
+        body: bytes::Bytes,
+        sha256: [u8; 32],
+    ) -> stowq_store::StoreResult<stowq_store::PutOutcome> {
+        self.inner.put_if_absent(key, body, sha256).await
+    }
+    async fn cas(
+        &self,
+        key: &Key,
+        body: bytes::Bytes,
+        sha256: [u8; 32],
+        if_match: &stowq_store::Version,
+    ) -> stowq_store::StoreResult<stowq_store::PutOutcome> {
+        self.inner.cas(key, body, sha256, if_match).await
+    }
+    async fn get(
+        &self,
+        key: &Key,
+        range: Option<std::ops::Range<u64>>,
+    ) -> stowq_store::StoreResult<stowq_store::Object> {
+        self.inner.get(key, range).await
+    }
+    async fn head(&self, key: &Key) -> stowq_store::StoreResult<stowq_store::Meta> {
+        self.inner.head(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+        after: Option<&Key>,
+        limit: usize,
+    ) -> stowq_store::StoreResult<stowq_store::Page> {
+        if prefix.contains("/claims/") {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.list(prefix, after, limit).await
+    }
+    async fn delete(&self, key: &Key) -> stowq_store::StoreResult<()> {
+        self.inner.delete(key).await
+    }
+}
+
+async fn hinted_queue() -> (Queue, MemoryStore) {
+    let store = MemoryStore::new();
+    let q = Queue::init(
+        Box::new(store.clone()),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &hints_format(),
+    )
+    .await
+    .unwrap();
+    (q, store)
+}
+
+async fn hint_body(store: &MemoryStore, job_id: &[u8; 16]) -> Option<u64> {
+    let hex: String = job_id.iter().map(|b| format!("{b:02x}")).collect();
+    let obj = store
+        .get(&Key::new(format!("q/tails/0000/{hex}")), None)
+        .await
+        .ok()?;
+    Some(u64::from_be_bytes(obj.body.as_ref().try_into().ok()?))
+}
+
+/// A takeover claim on a deep chain uses the hint: zero claims-prefix
+/// LISTs, and the claim lands on the hinted generation + 1.
+#[tokio::test]
+async fn hinted_takeover_skips_the_chain_listing() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let (q, store) = hinted_queue().await;
+    let mut b = OpBudget::new(2048);
+    let out = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([3; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 50,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap();
+    let EnqueueOutcome::Committed { job_id } = out else {
+        panic!()
+    };
+    let ClaimOutcome::Claimed(c1) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    // Deepen the chain: three renewals.
+    let mut c = c1;
+    for _ in 0..3 {
+        match q.renew(&c, &mut b).await.unwrap() {
+            stowq_core::RenewOutcome::Renewed(nc) => c = nc,
+            _ => panic!("renew"),
+        }
+    }
+    assert_eq!(
+        hint_body(&store, &job_id).await,
+        Some(4),
+        "renewals advance the hint"
+    );
+
+    // Expire and take over through a fresh counting handle.
+    store.advance_clock_to(c.claim_store_time_ns + 3_600_000_000_000);
+    let lists = Arc::new(AtomicU64::new(0));
+    let q2 = Queue::open(
+        Box::new(CountClaimLists {
+            inner: store.clone(),
+            lists: lists.clone(),
+        }),
+        "q",
+        OpenOptions::new([1; 16]),
+    )
+    .await
+    .unwrap();
+    let mut b2 = OpBudget::new(1024);
+    let floor = q2.establish_floor(&mut b2).await.unwrap();
+    let ClaimOutcome::Claimed(c2) = q2
+        .claim(&claim_opts(floor, 60_000_000_000), &mut b2)
+        .await
+        .unwrap()
+    else {
+        panic!("takeover")
+    };
+    assert_eq!(c2.generation, 5, "continues past the hinted tail 4");
+    assert_eq!(
+        lists.load(Ordering::SeqCst),
+        0,
+        "the hint replaced the chain listing entirely"
+    );
+    assert_eq!(hint_body(&store, &job_id).await, Some(5));
+}
+
+/// A stale-backward hint (renewals outran it) makes the claim put
+/// reject; the fallback listing recovers and the claim lands on the
+/// authoritative tail + 1, refreshing the hint.
+#[tokio::test]
+async fn stale_backward_hint_falls_back_and_recovers() {
+    let (q, store) = hinted_queue().await;
+    let mut b = OpBudget::new(2048);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([4; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 50,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let ClaimOutcome::Claimed(c1) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let mut c = c1;
+    for _ in 0..3 {
+        match q.renew(&c, &mut b).await.unwrap() {
+            stowq_core::RenewOutcome::Renewed(nc) => c = nc,
+            _ => panic!("renew"),
+        }
+    }
+    // Regress the hint to generation 1 (a lost write's stand-in).
+    let hex: String = job_id.iter().map(|x| format!("{x:02x}")).collect();
+    let key = Key::new(format!("q/tails/0000/{hex}"));
+    let obj = store.get(&key, None).await.unwrap();
+    store
+        .cas(
+            &key,
+            bytes::Bytes::copy_from_slice(&1u64.to_be_bytes()),
+            sha2::Sha256::digest(1u64.to_be_bytes()).into(),
+            &obj.meta.version,
+        )
+        .await
+        .unwrap();
+    // Expire the real tail and take over.
+    store.advance_clock_to(c.claim_store_time_ns + 3_600_000_000_000);
+    // A fresh handle for the post-advance floor (the old handle's
+    // cached floor predates the clock jump).
+    let qf = Queue::open(Box::new(store.clone()), "q", OpenOptions::new([1; 16]))
+        .await
+        .unwrap();
+    let mut b2 = OpBudget::new(1024);
+    let floor = qf.establish_floor(&mut b2).await.unwrap();
+    let ClaimOutcome::Claimed(c2) = qf
+        .claim(&claim_opts(floor, 60_000_000_000), &mut b2)
+        .await
+        .unwrap()
+    else {
+        panic!("takeover")
+    };
+    assert_eq!(c2.generation, 5, "authoritative tail 4 + 1");
+    assert_eq!(hint_body(&store, &job_id).await, Some(5), "hint refreshed");
+}
+
+/// A stale-forward hint (points past the real chain) 404s at the
+/// hinted generation; the fallback listing recovers.
+#[tokio::test]
+async fn stale_forward_hint_falls_back() {
+    let (q, store) = hinted_queue().await;
+    let mut b = OpBudget::new(2048);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([5; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 50,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let ClaimOutcome::Claimed(c1) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    // Point the hint at a nonexistent generation 99.
+    let hex: String = job_id.iter().map(|x| format!("{x:02x}")).collect();
+    let key = Key::new(format!("q/tails/0000/{hex}"));
+    let obj = store.get(&key, None).await.unwrap();
+    store
+        .cas(
+            &key,
+            bytes::Bytes::copy_from_slice(&99u64.to_be_bytes()),
+            sha2::Sha256::digest(99u64.to_be_bytes()).into(),
+            &obj.meta.version,
+        )
+        .await
+        .unwrap();
+    store.advance_clock_to(c1.claim_store_time_ns + 3_600_000_000_000);
+    let qf = Queue::open(Box::new(store.clone()), "q", OpenOptions::new([1; 16]))
+        .await
+        .unwrap();
+    let mut b2 = OpBudget::new(1024);
+    let floor = qf.establish_floor(&mut b2).await.unwrap();
+    let ClaimOutcome::Claimed(c2) = qf
+        .claim(&claim_opts(floor, 60_000_000_000), &mut b2)
+        .await
+        .unwrap()
+    else {
+        panic!("takeover")
+    };
+    assert_eq!(c2.generation, 2);
+    assert_eq!(hint_body(&store, &job_id).await, Some(2));
+}
+
+/// GC removes the hint with the terminal graph; a disabled queue
+/// never writes one.
+#[tokio::test]
+async fn gc_cleans_hints_and_disabled_queues_write_none() {
+    let (q, store) = hinted_queue().await;
+    let mut b = OpBudget::new(2048);
+    let EnqueueOutcome::Committed { job_id } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([6; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let ClaimOutcome::Claimed(c) = q
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    q.ack(&c, &mut b).await.unwrap();
+    assert!(hint_body(&store, &job_id).await.is_some());
+    let floor = q.establish_floor(&mut b).await.unwrap();
+    q.gc(floor, 0, 0, &mut b).await.unwrap();
+    assert_eq!(
+        hint_body(&store, &job_id).await,
+        None,
+        "gc deletes the hint with the graph"
+    );
+
+    // Feature off: no hint keys ever.
+    let plain = make_queue().await;
+    let mut b = OpBudget::new(256);
+    let EnqueueOutcome::Committed { .. } = plain
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([7; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 3,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let ClaimOutcome::Claimed(c) = plain
+        .claim(&claim_opts(0, 60_000_000_000), &mut b)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    plain.ack(&c, &mut b).await.unwrap();
+    let page = plain.store().list("q/tails/", None, 8).await.unwrap();
+    assert!(page.items.is_empty(), "bit off: no hint keys");
+}
+
+/// The deep-chain measurement, deterministic: at 70 generations a
+/// bit-0 takeover LISTs 2 pages (70 > 64/page); a bit-2 takeover
+/// LISTs nothing — the hint replaces the listing entirely.
+#[tokio::test]
+async fn deep_chain_takeover_hint_vs_listing() {
+    use std::sync::atomic::Ordering;
+    async fn scenario(bits: u64) -> (u64, u64) {
+        let f = FormatRecord {
+            required_feature_bits: bits,
+            ..format()
+        };
+        let store = MemoryStore::new();
+        let q = Queue::init(Box::new(store.clone()), "q", &OpenOptions::new([1; 16]), &f)
+            .await
+            .unwrap();
+        let mut b = OpBudget::new(8192);
+        let EnqueueOutcome::Committed { job_id } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([9; 16]),
+                    payload: b"x",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 500,
+                    not_before_ns: None,
+                },
+                &mut b,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let mut c = match q
+            .claim(&claim_opts(0, 60_000_000_000), &mut b)
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Claimed(c) => c,
+            ClaimOutcome::Empty => panic!("initial claim"),
+        };
+        for _ in 0..69 {
+            match q.renew(&c, &mut b).await.unwrap() {
+                stowq_core::RenewOutcome::Renewed(nc) => c = nc,
+                _ => panic!("renewals"),
+            }
+        }
+        store.advance_clock_to(c.claim_store_time_ns + 3_600_000_000_000);
+        let lists = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let q2 = Queue::open(
+            Box::new(CountClaimLists {
+                inner: store.clone(),
+                lists: lists.clone(),
+            }),
+            "q",
+            OpenOptions::new([1; 16]),
+        )
+        .await
+        .unwrap();
+        let mut b2 = OpBudget::new(2048);
+        let floor = q2.establish_floor(&mut b2).await.unwrap();
+        let ClaimOutcome::Claimed(t) = q2
+            .claim(&claim_opts(floor, 60_000_000_000), &mut b2)
+            .await
+            .unwrap()
+        else {
+            panic!("takeover")
+        };
+        assert_eq!(t.generation, 71);
+        let _ = job_id;
+        (lists.load(Ordering::SeqCst), t.generation)
+    }
+    let (hint_lists, _) = scenario(2).await;
+    let (plain_lists, _) = scenario(0).await;
+    assert_eq!(hint_lists, 0, "hint path: no chain listing");
+    assert!(
+        plain_lists >= 2,
+        "listing path paginates past 64 generations (got {plain_lists})"
+    );
+}
+
+/// F1 regression: the exhaustion-dead must never fire on unfenced
+/// hint evidence. A stale hint on a job whose authoritative tail is
+/// UNexpired, with maximum_attempts exhausted per the stale
+/// evidence's attempt count — the claim returns Empty (no dead), and
+/// the live holder still acks.
+#[tokio::test]
+async fn stale_hint_cannot_write_premature_dead() {
+    let (q, store) = hinted_queue().await;
+    let mut b = OpBudget::new(2048);
+    let EnqueueOutcome::Committed { .. } = q
+        .enqueue(
+            EnqueueInput {
+                job_id: Some([0xA1; 16]),
+                payload: b"x",
+                content_type: "text/plain".into(),
+                maximum_attempts: 1,
+                not_before_ns: None,
+            },
+            &mut b,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let ClaimOutcome::Claimed(c1) = q.claim(&claim_opts(0, 5_000), &mut b).await.unwrap() else {
+        panic!()
+    };
+    // Renewals deepen the chain while the gen-1 evidence would read
+    // as expired.
+    let gen1_store_time = c1.claim_store_time_ns;
+    let mut c = c1;
+    for _ in 0..3 {
+        match q.renew(&c, &mut b).await.unwrap() {
+            stowq_core::RenewOutcome::Renewed(nc) => c = nc,
+            _ => panic!("renew"),
+        }
+    }
+    // Stale the hint to generation 1.
+    let jhex: String = c.job_id.iter().map(|x| format!("{x:02x}")).collect();
+    let key = Key::new(format!("q/tails/0000/{jhex}"));
+    let obj = store.get(&key, None).await.unwrap();
+    store
+        .cas(
+            &key,
+            bytes::Bytes::copy_from_slice(&1u64.to_be_bytes()),
+            sha2::Sha256::digest(1u64.to_be_bytes()).into(),
+            &obj.meta.version,
+        )
+        .await
+        .unwrap();
+    // A floor past gen-1's expiry but before gen-4's: the stale
+    // evidence reads expired+exhausted, the authoritative tail is live.
+    let qf = Queue::open(Box::new(store.clone()), "q", OpenOptions::new([1; 16]))
+        .await
+        .unwrap();
+    let mut b2 = OpBudget::new(1024);
+    store.advance_clock_to(gen1_store_time + 5_001);
+    let floor = qf.establish_floor(&mut b2).await.unwrap();
+    match qf.claim(&claim_opts(floor, 5_000), &mut b2).await.unwrap() {
+        ClaimOutcome::Empty => {}
+        ClaimOutcome::Claimed(_) => panic!("live tail must not be claimable"),
+    }
+    assert!(
+        store
+            .head(&Key::new(format!("q/dead/0000/{jhex}")))
+            .await
+            .is_err(),
+        "no premature dead from stale hint evidence"
+    );
+    // The live holder acks: the delivery survives.
+    assert_eq!(
+        q.ack(&c, &mut b).await.unwrap(),
+        stowq_core::AckOutcome::Acked
+    );
+}
+
+/// F2/F3 regression: corrupt hint bodies (wrong width; out-of-range
+/// generation) fall back to the listing, claim succeeds, and the
+/// commit repairs the hint.
+#[tokio::test]
+async fn corrupt_hint_bodies_fall_back_and_repair() {
+    for body in [
+        bytes::Bytes::from_static(b"short"), // width
+        bytes::Bytes::copy_from_slice(&(0x1_0000_0001u64).to_be_bytes()), // > u32::MAX
+    ] {
+        let (q, store) = hinted_queue().await;
+        let mut b = OpBudget::new(2048);
+        let EnqueueOutcome::Committed { .. } = q
+            .enqueue(
+                EnqueueInput {
+                    job_id: Some([0xB2; 16]),
+                    payload: b"x",
+                    content_type: "text/plain".into(),
+                    maximum_attempts: 3,
+                    not_before_ns: None,
+                },
+                &mut b,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        // Plant the corrupt hint at the deterministic key.
+        let jhex: String = [0xB2u8; 16].iter().map(|x| format!("{x:02x}")).collect();
+        let key = Key::new(format!("q/tails/0000/{jhex}"));
+        let digest = sha2::Sha256::digest(body.as_ref()).into();
+        store.put_if_absent(&key, body, digest).await.unwrap();
+        // Claim succeeds through the listing fallback.
+        let ClaimOutcome::Claimed(c) = q
+            .claim(&claim_opts(0, 60_000_000_000), &mut b)
+            .await
+            .unwrap()
+        else {
+            panic!("claim through corrupt hint")
+        };
+        assert_eq!(c.generation, 1);
+        // The commit repaired the hint.
+        assert_eq!(hint_body(&store, &c.job_id).await, Some(1));
     }
 }

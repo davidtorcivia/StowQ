@@ -22,8 +22,9 @@ key_tag       = first_8_bytes(SHA256("StowQ-1-key\0" || queue_id || key))
 `queue_id` is a 16-byte string, `key_tag` an 8-byte string (see
 namespace.md). `record_type`: 1 format, 2 job, 3 claim, 4 fail, 5 receipt,
 6 dead, 7 watermark (v1); 8 quarantine (v1.1). Feature bits are
-numbered from the least significant: bit 1 is
-`required_feature_bits = 1`. `fields` is a map with text keys; absent optional
+numbered from the least significant: bit 1 (quarantine writes) and
+bit 2 (tail hints) are the defined bits; a FORMAT demanding any other
+bit is rejected. `fields` is a map with text keys; absent optional
 fields are omitted entirely. Unknown fields are rejected in v1;
 `required_feature_bits` gates evolution.
 

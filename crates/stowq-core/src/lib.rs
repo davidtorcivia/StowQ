@@ -1295,6 +1295,152 @@ impl Queue {
         }
     }
 
+    fn hints_enabled(&self) -> bool {
+        self.format.required_feature_bits & 2 != 0
+    }
+
+    /// Best-effort advisory tail-hint write (feature bit 2): body is
+    /// the 8-byte big-endian generation. `known` is the hint state
+    /// this handle last observed (from the claim gather): absent
+    /// becomes a put-if-absent, a stale generation a single CAS, a
+    /// current one a skip. Errors are swallowed — the hint is pure
+    /// optimization; absence or staleness falls back to the
+    /// authoritative chain listing.
+    async fn write_tail_hint(
+        &self,
+        shard: u16,
+        job_id: [u8; 16],
+        generation: u64,
+        known: &Option<(Version, u64)>,
+        budget: &mut OpBudget,
+    ) {
+        if !self.hints_enabled() {
+            return;
+        }
+        let rel = RelKey::Tail { shard, job_id };
+        let abs = self.absolute(&rel);
+        let body = Bytes::copy_from_slice(&generation.to_be_bytes());
+        let digest: Digest = Sha256::digest(&body).into();
+        match known {
+            None => {
+                if budget.spend().is_ok() {
+                    let _ = self.store.put_if_absent(&abs, body, digest).await;
+                }
+            }
+            Some((version, gen)) => {
+                if *gen >= generation {
+                    return; // already at least as new
+                }
+                if budget.spend().is_ok() {
+                    let _ = self.store.cas(&abs, body, digest, version).await;
+                }
+            }
+        }
+    }
+
+    /// Reads and decodes a generation's claim record: attempt and
+    /// lease-duration bookkeeping for the expiry basis.
+    async fn tail_record(
+        &self,
+        shard: u16,
+        job_id: [u8; 16],
+        generation: u64,
+        budget: &mut OpBudget,
+    ) -> Result<(u64, u64), Error> {
+        budget.spend()?;
+        let rel = RelKey::Claim {
+            shard,
+            job_id,
+            generation: generation as u32,
+        };
+        let abs = self.absolute(&rel);
+        let tag = self.tag_for(&rel);
+        let obj = self.store.get(&abs, None).await?;
+        match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
+            Record::Claim(c) => Ok((c.attempt, c.lease_duration_ns)),
+            _ => Err(Error::Record("claim key holds a non-claim record".into())),
+        }
+    }
+
+    /// The authoritative chain-tail discovery: pages the claims
+    /// prefix and keeps the highest generation. O(pages) in chain
+    /// depth — what the tail hint exists to avoid on deep chains.
+    async fn list_tail(
+        &self,
+        claims_prefix: &str,
+        budget: &mut OpBudget,
+    ) -> Result<Option<(u64, Meta)>, Error> {
+        let mut tail: Option<(u64, Meta)> = None;
+        let mut after: Option<Key> = None;
+        loop {
+            budget.spend()?;
+            let page = self.store.list(claims_prefix, after.as_ref(), 64).await?;
+            for item in page.items {
+                // Grammar violations in the chain are skipped; the
+                // repair scan owns quarantine.
+                if let Some(g) = parse_generation(&item.key) {
+                    tail = Some((g, item.meta));
+                }
+            }
+            match page.next_after {
+                Some(k) => after = Some(k),
+                None => return Ok(tail),
+            }
+        }
+    }
+
+    /// Renewal's hint refresh: observe then write (the renewal did
+    /// not gather the hint state). Two ops, best-effort.
+    async fn update_tail_hint(
+        &self,
+        shard: u16,
+        job_id: [u8; 16],
+        generation: u64,
+        budget: &mut OpBudget,
+    ) {
+        if !self.hints_enabled() {
+            return;
+        }
+        // Advisory: a failed observation just skips the refresh.
+        if let Ok(known) = self.read_tail_hint(shard, job_id, budget).await {
+            self.write_tail_hint(shard, job_id, generation, &known, budget)
+                .await;
+        }
+    }
+
+    /// Reads the advisory tail hint: the generation, or None when
+    /// absent (fresh job, feature off on the writer, or lost write —
+    /// every case falls back to the chain listing).
+    async fn read_tail_hint(
+        &self,
+        shard: u16,
+        job_id: [u8; 16],
+        budget: &mut OpBudget,
+    ) -> Result<Option<(Version, u64)>, Error> {
+        let rel = RelKey::Tail { shard, job_id };
+        let abs = self.absolute(&rel);
+        budget.spend()?;
+        match self.store.get(&abs, None).await {
+            Ok(obj) => {
+                // A body that is not exactly 8 bytes, or a generation
+                // outside the protocol's u32 space, is corrupt-hint
+                // garbage: the generation-0 sentinel routes the caller
+                // to the listing fallback and marks the hint for
+                // overwrite at commit (a range-valid body must never
+                // alias a real generation through truncation).
+                if let Ok(arr) = obj.body.as_ref().try_into() {
+                    let gen = u64::from_be_bytes(arr);
+                    if (1..=u32::MAX as u64).contains(&gen) {
+                        return Ok(Some((obj.meta.version, gen)));
+                    }
+                }
+                Ok(Some((obj.meta.version, 0)))
+            }
+            Err(StoreError::NotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn try_claim(
         &self,
@@ -1321,24 +1467,70 @@ impl Queue {
         let store = self.store.as_ref();
         let receipt_abs = self.absolute(&receipt_rel);
         let dead_abs = self.absolute(&dead_rel);
+        // With tail hints enabled (feature bit 2) the chain listing is
+        // replaced by the hint read: one GET of tails/<shard>/<job>
+        // plus one GET of the hinted generation — O(1) in chain depth
+        // where the listing is O(pages). A missing or stale hint
+        // falls back to the authoritative listing inside the branch;
+        // the put-if-absent claim fence catches anything the hint
+        // missed, and that arm retries once on the listing's
+        // evidence.
+        let mut hint_state: Option<(Version, u64)> = None;
+        let mut hint_rec: Option<Record> = None;
         let (receipt, dead, tail) =
             tokio::join!(store.head(&receipt_abs), store.head(&dead_abs), async {
-                let mut tail: Option<(u64, Meta)> = None;
-                let mut after: Option<Key> = None;
-                loop {
-                    budget.spend()?;
-                    let page = store.list(&claims_prefix, after.as_ref(), 64).await?;
-                    for item in page.items {
-                        // Grammar violations in the chain are skipped;
-                        // the repair scan owns quarantine.
-                        if let Some(g) = parse_generation(&item.key) {
-                            tail = Some((g, item.meta));
+                if !self.hints_enabled() {
+                    return self.list_tail(claims_prefix.as_str(), budget).await;
+                }
+                match self.read_tail_hint(shard, job_id, budget).await? {
+                    Some((version, gen)) if gen > 0 && gen <= u32::MAX as u64 => {
+                        let rel = RelKey::Claim {
+                            shard,
+                            job_id,
+                            generation: gen as u32,
+                        };
+                        let abs = self.absolute(&rel);
+                        let tag = self.tag_for(&rel);
+                        budget.spend()?;
+                        match store.get(&abs, None).await {
+                            Ok(obj) => {
+                                match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag) {
+                                    Ok(r @ Record::Claim(_)) => {
+                                        hint_state = Some((version, gen));
+                                        hint_rec = Some(r);
+                                        Ok(Some((gen, obj.meta)))
+                                    }
+                                    // A corrupt hint is advisory
+                                    // garbage: fall back to the listing and
+                                    // mark for overwrite.
+                                    _ => {
+                                        hint_state = Some((version, 0));
+                                        self.list_tail(claims_prefix.as_str(), budget).await
+                                    }
+                                }
+                            }
+                            // Stale-forward (hint past the real tail):
+                            // fall back to the listing. The hint is
+                            // PROVEN garbage — mark it (gen 0) so the
+                            // commit-time write overwrites rather than
+                            // skipping as "current".
+                            Err(StoreError::NotFound) => {
+                                hint_state = Some((version, 0));
+                                self.list_tail(claims_prefix.as_str(), budget).await
+                            }
+                            Err(e) => Err(e.into()),
                         }
                     }
-                    match page.next_after {
-                        Some(k) => after = Some(k),
-                        None => return Ok::<_, Error>(tail),
+                    // Corrupt hint (generation-0 sentinel from
+                    // read_tail_hint, or an out-of-range body if that
+                    // clamp ever changes): fall back to the listing
+                    // and mark for overwrite at commit.
+                    Some((version, _)) => {
+                        hint_state = Some((version, 0));
+                        self.list_tail(claims_prefix.as_str(), budget).await
                     }
+                    // Absent hint: fresh-job shape, discover by listing.
+                    None => self.list_tail(claims_prefix.as_str(), budget).await,
                 }
             });
         match (receipt, dead) {
@@ -1355,7 +1547,7 @@ impl Queue {
         }
         let tail = tail?;
 
-        let (tail_gen, tail_meta) = tail.unwrap_or((
+        let (mut tail_gen, mut tail_meta) = tail.unwrap_or((
             0,
             Meta {
                 version: Version("0".into()),
@@ -1365,185 +1557,254 @@ impl Queue {
         ));
 
         // Tail claim record for attempt bookkeeping and expiry basis.
-        let (tail_attempt, tail_duration) = if tail_gen == 0 {
+        let (mut tail_attempt, mut tail_duration) = if tail_gen == 0 {
             (0, 0)
+        } else if let Some(Record::Claim(c)) = &hint_rec {
+            (c.attempt, c.lease_duration_ns)
         } else {
-            budget.spend()?;
-            let rel = RelKey::Claim {
-                shard,
-                job_id,
-                generation: tail_gen as u32,
-            };
-            let abs = self.absolute(&rel);
-            let tag = self.tag_for(&rel);
-            let obj = self.store.get(&abs, None).await?;
-            match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
-                Record::Claim(c) => (c.attempt, c.lease_duration_ns),
-                _ => return Err(Error::Record("claim key holds a non-claim record".into())),
-            }
+            self.tail_record(shard, job_id, tail_gen, budget).await?
         };
 
-        let expired = tail_gen == 0
-            || opts.floor_ns
-                >= tail_meta
-                    .store_time_ns
-                    .saturating_add(tail_duration)
-                    .saturating_add(self.opts.skew_guard_ns);
+        // A stale-backward hint surfaces here as a rejected claim put
+        // (the hinted G+1 already exists): re-discover the tail
+        // authoritatively and retry once. The put-if-absent remains
+        // the linearization point either way.
+        let mut hint_used = hint_rec.is_some();
+        loop {
+            let expired = tail_gen == 0
+                || opts.floor_ns
+                    >= tail_meta
+                        .store_time_ns
+                        .saturating_add(tail_duration)
+                        .saturating_add(self.opts.skew_guard_ns);
 
-        // Backoff: the newest fail record for the tail generation gates
-        // readiness.
-        if tail_gen > 0 {
-            budget.spend()?;
-            let rel = RelKey::Fail {
-                shard,
-                job_id,
-                generation: tail_gen as u32,
-            };
-            let fail = match self.store.get(&self.absolute(&rel), None).await {
-                Ok(obj) => {
-                    let tag = self.tag_for(&rel);
-                    match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
-                        Record::Fail(f) => Some(f),
-                        _ => return Err(Error::Record("fail key holds a non-fail record".into())),
+            // Backoff: the newest fail record for the tail generation gates
+            // readiness.
+            if tail_gen > 0 {
+                budget.spend()?;
+                let rel = RelKey::Fail {
+                    shard,
+                    job_id,
+                    generation: tail_gen as u32,
+                };
+                let fail = match self.store.get(&self.absolute(&rel), None).await {
+                    Ok(obj) => {
+                        let tag = self.tag_for(&rel);
+                        match stowq_format::decode(&obj.body, &self.opts.queue_id, &tag)? {
+                            Record::Fail(f) => Some(f),
+                            _ => {
+                                return Err(Error::Record(
+                                    "fail key holds a non-fail record".into(),
+                                ))
+                            }
+                        }
+                    }
+                    Err(StoreError::NotFound) => None,
+                    Err(e) => return Err(e.into()),
+                };
+                if let Some(f) = fail {
+                    if opts.floor_ns < f.retry_not_before_ns {
+                        return Ok(None);
                     }
                 }
-                Err(StoreError::NotFound) => None,
+            }
+
+            if !expired {
+                return Ok(None);
+            }
+
+            // Attempt accounting: a takeover increments the tail's attempt,
+            // whether the tail was itself a takeover or a continuation.
+            let attempt = tail_attempt + 1;
+
+            // Job record for maximum_attempts and payload reference.
+            budget.spend()?;
+            let job_rel = RelKey::Job { shard, job_id };
+            let job_abs = self.absolute(&job_rel);
+            let job_tag = self.tag_for(&job_rel);
+            let job_obj = match self.store.get(&job_abs, None).await {
+                Ok(obj) => obj,
+                // GC may remove a terminal job between listing and read;
+                // the candidate is gone, not errored.
+                Err(StoreError::NotFound) => return Ok(None),
                 Err(e) => return Err(e.into()),
             };
-            if let Some(f) = fail {
-                if opts.floor_ns < f.retry_not_before_ns {
+            let job = match stowq_format::decode(&job_obj.body, &self.opts.queue_id, &job_tag)? {
+                Record::Job(j) => j,
+                _ => return Err(Error::Record("job key holds a non-job record".into())),
+            };
+            if let Some(nb) = job.not_before_ns {
+                if opts.floor_ns < nb {
                     return Ok(None);
                 }
             }
-        }
 
-        if !expired {
-            return Ok(None);
-        }
-
-        // Attempt accounting: a takeover increments the tail's attempt,
-        // whether the tail was itself a takeover or a continuation.
-        let attempt = tail_attempt + 1;
-
-        // Job record for maximum_attempts and payload reference.
-        budget.spend()?;
-        let job_rel = RelKey::Job { shard, job_id };
-        let job_abs = self.absolute(&job_rel);
-        let job_tag = self.tag_for(&job_rel);
-        let job_obj = match self.store.get(&job_abs, None).await {
-            Ok(obj) => obj,
-            // GC may remove a terminal job between listing and read;
-            // the candidate is gone, not errored.
-            Err(StoreError::NotFound) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let job = match stowq_format::decode(&job_obj.body, &self.opts.queue_id, &job_tag)? {
-            Record::Job(j) => j,
-            _ => return Err(Error::Record("job key holds a non-job record".into())),
-        };
-        if let Some(nb) = job.not_before_ns {
-            if opts.floor_ns < nb {
-                return Ok(None);
-            }
-        }
-
-        if attempt > job.maximum_attempts {
-            let dead = Record::Dead(DeadRecord {
-                job_id,
-                generation: tail_gen,
-                attempt: tail_attempt,
-                reason: 0x0004, // attempts_exhausted
-            });
-            let rel = RelKey::Dead { shard, job_id };
-            let abs = self.absolute(&rel);
-            let tag = self.tag_for(&rel);
-            let body = Bytes::from(stowq_format::encode(&dead, &self.opts.queue_id, &tag));
-            budget.spend()?;
-            let body_digest: Digest = Sha256::digest(&body).into();
-            if let Resolved::Committed = self
-                .put_resolving(&abs, body, body_digest, &dead, &rel, budget)
-                .await?
-            {
-                self.write_termidx(stowq_keys::TermKind::Dead, shard, job_id, budget)
-                    .await;
-            }
-            return Ok(None);
-        }
-
-        if tail_gen >= u32::MAX as u64 {
-            return Err(Error::Internal("generation space exhausted".into()));
-        }
-        let worker_token = fresh_token();
-        let record = Record::Claim(ClaimRecord {
-            job_id,
-            generation: tail_gen + 1,
-            attempt,
-            worker_id: self.opts.worker_id.clone(),
-            worker_token,
-            lease_duration_ns: opts.lease_duration_ns,
-            continuation: false,
-            basis: Some(ClaimBasis {
-                prev_store_time_ns: tail_meta.store_time_ns,
-                prev_duration_ns: tail_duration,
-                observed_watermark_ns: opts.floor_ns,
-            }),
-            prev_token: None,
-        });
-        let rel = RelKey::Claim {
-            shard,
-            job_id,
-            generation: (tail_gen + 1) as u32,
-        };
-        let abs = self.absolute(&rel);
-        let tag = self.tag_for(&rel);
-        let body = Bytes::from(stowq_format::encode(&record, &self.opts.queue_id, &tag));
-        let digest: Digest = Sha256::digest(&body).into();
-        budget.spend()?;
-        match self
-            .put_resolving(&abs, body, digest, &record, &rel, budget)
-            .await?
-        {
-            Resolved::Committed => {
+            if attempt > job.maximum_attempts {
+                // The exhaustion-dead writes a TERMINAL record before
+                // any put-if-absent could fence the evidence — a
+                // stale hint must not kill a live delivery here.
+                // Re-verify on the authoritative tail; the retried
+                // pass (hint_used now false) writes the dead only on
+                // verified evidence.
+                if hint_used {
+                    let t = self
+                        .list_tail(
+                            &format!("{}claims/{shard:04x}/{}/", self.root, hex(&job_id)),
+                            budget,
+                        )
+                        .await?;
+                    let (g, m) = t.unwrap_or((
+                        0,
+                        Meta {
+                            version: Version("0".into()),
+                            store_time_ns: 0,
+                            size: 0,
+                        },
+                    ));
+                    tail_gen = g;
+                    tail_meta = m;
+                    let (a, d) = if tail_gen == 0 {
+                        (0, 0)
+                    } else {
+                        self.tail_record(shard, job_id, tail_gen, budget).await?
+                    };
+                    tail_attempt = a;
+                    tail_duration = d;
+                    hint_used = false;
+                    continue;
+                }
+                let dead = Record::Dead(DeadRecord {
+                    job_id,
+                    generation: tail_gen,
+                    attempt: tail_attempt,
+                    reason: 0x0004, // attempts_exhausted
+                });
+                let rel = RelKey::Dead { shard, job_id };
+                let abs = self.absolute(&rel);
+                let tag = self.tag_for(&rel);
+                let body = Bytes::from(stowq_format::encode(&dead, &self.opts.queue_id, &tag));
                 budget.spend()?;
-                let meta = self.store.head(&abs).await?;
-                let payload = match (&job.payload_inline, &job.payload_key) {
-                    (Some(b), _) => PayloadRef::Inline(Bytes::from(b.clone())),
-                    (None, Some(k)) => PayloadRef::Detached {
-                        key: Key::new(format!("{}{}", self.root, k)),
-                        digest: job.payload_digest,
-                        length: job.payload_length,
-                    },
-                    _ => return Err(Error::Record("job payload reference invalid".into())),
-                };
-                // Best-effort lease index.
-                let expiry = meta.store_time_ns.saturating_add(opts.lease_duration_ns);
-                if let Some(bucket) =
-                    stowq_math::bucket_number(expiry, self.format.lease_bucket_width_ns)
+                let body_digest: Digest = Sha256::digest(&body).into();
+                if let Resolved::Committed = self
+                    .put_resolving(&abs, body, body_digest, &dead, &rel, budget)
+                    .await?
                 {
-                    let idx = self.absolute(&RelKey::LeaseIndex {
-                        bucket,
-                        shard,
-                        job_id,
-                        generation: (tail_gen + 1) as u32,
-                    });
-                    budget.spend()?;
-                    let _ = self
-                        .store
-                        .put_if_absent(&idx, Bytes::new(), Sha256::digest([]).into())
+                    self.write_termidx(stowq_keys::TermKind::Dead, shard, job_id, budget)
                         .await;
                 }
-                Ok(Some(Claim {
-                    job_id,
-                    shard,
-                    generation: tail_gen + 1,
-                    attempt,
-                    worker_token,
-                    lease_duration_ns: opts.lease_duration_ns,
-                    claim_store_time_ns: meta.store_time_ns,
-                    payload,
-                }))
+                return Ok(None);
             }
-            Resolved::Lost | Resolved::NotCommitted => Ok(None),
+
+            if tail_gen >= u32::MAX as u64 {
+                return Err(Error::Internal("generation space exhausted".into()));
+            }
+            let worker_token = fresh_token();
+            let record = Record::Claim(ClaimRecord {
+                job_id,
+                generation: tail_gen + 1,
+                attempt,
+                worker_id: self.opts.worker_id.clone(),
+                worker_token,
+                lease_duration_ns: opts.lease_duration_ns,
+                continuation: false,
+                basis: Some(ClaimBasis {
+                    prev_store_time_ns: tail_meta.store_time_ns,
+                    prev_duration_ns: tail_duration,
+                    observed_watermark_ns: opts.floor_ns,
+                }),
+                prev_token: None,
+            });
+            let rel = RelKey::Claim {
+                shard,
+                job_id,
+                generation: (tail_gen + 1) as u32,
+            };
+            let abs = self.absolute(&rel);
+            let tag = self.tag_for(&rel);
+            let body = Bytes::from(stowq_format::encode(&record, &self.opts.queue_id, &tag));
+            let digest: Digest = Sha256::digest(&body).into();
+            budget.spend()?;
+            match self
+                .put_resolving(&abs, body, digest, &record, &rel, budget)
+                .await?
+            {
+                Resolved::Committed => {
+                    budget.spend()?;
+                    let meta = self.store.head(&abs).await?;
+                    let payload = match (&job.payload_inline, &job.payload_key) {
+                        (Some(b), _) => PayloadRef::Inline(Bytes::from(b.clone())),
+                        (None, Some(k)) => PayloadRef::Detached {
+                            key: Key::new(format!("{}{}", self.root, k)),
+                            digest: job.payload_digest,
+                            length: job.payload_length,
+                        },
+                        _ => return Err(Error::Record("job payload reference invalid".into())),
+                    };
+                    // Best-effort tail hint (feature bit 2): the gather's
+                    // hint state makes this one op (put-if-absent when the
+                    // hint was missing, a single CAS when stale, a skip
+                    // when current).
+                    self.write_tail_hint(shard, job_id, tail_gen + 1, &hint_state, budget)
+                        .await;
+                    // Best-effort lease index.
+                    let expiry = meta.store_time_ns.saturating_add(opts.lease_duration_ns);
+                    if let Some(bucket) =
+                        stowq_math::bucket_number(expiry, self.format.lease_bucket_width_ns)
+                    {
+                        let idx = self.absolute(&RelKey::LeaseIndex {
+                            bucket,
+                            shard,
+                            job_id,
+                            generation: (tail_gen + 1) as u32,
+                        });
+                        budget.spend()?;
+                        let _ = self
+                            .store
+                            .put_if_absent(&idx, Bytes::new(), Sha256::digest([]).into())
+                            .await;
+                    }
+                    return Ok(Some(Claim {
+                        job_id,
+                        shard,
+                        generation: tail_gen + 1,
+                        attempt,
+                        worker_token,
+                        lease_duration_ns: opts.lease_duration_ns,
+                        claim_store_time_ns: meta.store_time_ns,
+                        payload,
+                    }));
+                }
+                Resolved::Lost | Resolved::NotCommitted if hint_used => {
+                    // The hint was stale-backward: the authoritative chain
+                    // is longer than it said. Re-discover and retry once.
+                    let t = self
+                        .list_tail(
+                            &format!("{}claims/{shard:04x}/{}/", self.root, hex(&job_id)),
+                            budget,
+                        )
+                        .await?;
+                    let (g, m) = t.unwrap_or((
+                        0,
+                        Meta {
+                            version: Version("0".into()),
+                            store_time_ns: 0,
+                            size: 0,
+                        },
+                    ));
+                    tail_gen = g;
+                    tail_meta = m;
+                    let (a, d) = if tail_gen == 0 {
+                        (0, 0)
+                    } else {
+                        self.tail_record(shard, job_id, tail_gen, budget).await?
+                    };
+                    tail_attempt = a;
+                    tail_duration = d;
+                    hint_used = false;
+                    continue;
+                }
+                Resolved::Lost | Resolved::NotCommitted => return Ok(None),
+            }
         }
     }
 
@@ -1601,6 +1862,8 @@ impl Queue {
             Resolved::Committed => {
                 budget.spend()?;
                 let meta = self.store.head(&abs).await?;
+                self.update_tail_hint(claim.shard, claim.job_id, claim.generation + 1, budget)
+                    .await;
                 Ok(RenewOutcome::Renewed(Claim {
                     job_id: claim.job_id,
                     shard: claim.shard,
@@ -2562,6 +2825,12 @@ impl Queue {
         // termidx entry.
         budget.spend()?;
         let _ = self.store.delete(index_key).await;
+        // Tail hint (feature bit 2): addressed directly, best-effort.
+        budget.spend()?;
+        let _ = self
+            .store
+            .delete(&self.absolute(&RelKey::Tail { shard, job_id }))
+            .await;
         // Fails, claims.
         for prefix in [
             format!("{}fails/{shard:04x}/{jhex}/", self.root),

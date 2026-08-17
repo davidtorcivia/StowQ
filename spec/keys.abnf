@@ -20,6 +20,7 @@ delay-index  = "delayed/" bucket "/" shard "/" job-id
 receipt-key  = "receipts/" shard "/" job-id
 dead-key     = "dead/" shard "/" job-id
 termidx-key  = "termidx/" bucket "/" kind "/" shard "/" job-id
+tail-key     = "tails/" shard "/" job-id
 qkey         = "quarantine/" bucket "/" qid
 beacon-key   = "meta/clock/" nonce
 format-key   = "meta/FORMAT"
