@@ -496,3 +496,40 @@ async fn unknown_committed_on_commit_output_resolves_to_converged() {
         stowq_core::AckOutcome::Acked
     );
 }
+
+#[tokio::test]
+async fn transport_on_dead_probe_in_gather_propagates_not_notfound() {
+    // Under the concurrent gather the receipt and dead probes always
+    // both run. With the receipt absent (live job), a pre-transmit
+    // fault on the DEAD probe (Head call 1; the receipt is Head 0)
+    // must surface as Transport — never as the receipt's NotFound.
+    let injector = Injector::new(
+        MemoryStore::new(),
+        vec![FaultPlan::new(Op::Head, Fault::PreTransmit, [1])],
+    );
+    let q = Queue::init(
+        Box::new(injector),
+        "q",
+        &OpenOptions::new([1; 16]),
+        &format(),
+    )
+    .await
+    .unwrap();
+    let mut budget = OpBudget::new(64);
+    q.enqueue(
+        EnqueueInput {
+            job_id: Some([5; 16]),
+            payload: b"x",
+            content_type: "text/plain".into(),
+            maximum_attempts: 3,
+            not_before_ns: None,
+        },
+        &mut budget,
+    )
+    .await
+    .unwrap();
+    match q.claim(&claim_opts(0), &mut budget).await {
+        Err(stowq_core::Error::Store(stowq_store::StoreError::Transport(_))) => {}
+        other => panic!("expected Transport from the dead probe, got {other:?}"),
+    }
+}

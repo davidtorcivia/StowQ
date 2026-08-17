@@ -325,7 +325,19 @@ pub async fn run_with_stats(seed: u64, cfg: &DriverConfig, faults: bool) -> (u64
                         (CommitOutcome::Converged(c), false) => {
                             assert_eq!(c.digest, d, "seed {seed} op {i}");
                         }
-                        (o, f) => panic!("seed {seed} op {i}: outcome {o:?} but first-write={f}"),
+                        // Converged on the first write is legitimate under
+                        // fault injection: a committed-but-lost response
+                        // on the very first output put resolves by
+                        // read-back with identical bytes. Digest
+                        // equality is the invariant; the store holds
+                        // ours either way.
+                        (CommitOutcome::Converged(c), true) => {
+                            assert_eq!(c.digest, d, "seed {seed} op {i}");
+                            out_keys[job] = Some(c.key.clone());
+                        }
+                        (CommitOutcome::Committed(_), false) => {
+                            panic!("seed {seed} op {i}: committed over an existing output")
+                        }
                     }
                 } else {
                     assert!(
