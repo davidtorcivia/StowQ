@@ -152,6 +152,25 @@ async fn worker(root: &str, lease_s: u64) -> Result<(), String> {
 
 // ---------- driver mode ----------
 
+/// Total claim records under the root (every generation of every
+/// job): the observable "did the worker get into the pipeline" signal.
+async fn claim_count(q: &Queue, root: &str) -> Result<usize, String> {
+    let mut after: Option<Key> = None;
+    let mut n = 0usize;
+    loop {
+        let page = q
+            .store()
+            .list(&format!("{root}/claims/"), after.as_ref(), 1024)
+            .await
+            .map_err(|e| e.to_string())?;
+        n += page.items.len();
+        match page.next_after {
+            Some(k) => after = Some(k),
+            None => return Ok(n),
+        }
+    }
+}
+
 /// splitmix64 — the testkit driver's PRNG shape.
 struct Rng(u64);
 
@@ -229,34 +248,73 @@ async fn driver(jobs_n: usize, kills: usize, lease_s: u64) -> Result<(), String>
             .spawn()
     };
 
-    // Kill rounds: the child dies mid-pipeline at a random moment.
+    // Kill rounds: the child dies mid-pipeline at a random moment. A
+    // kill landing before the worker's first claim is ineffective —
+    // observed via the claim-record delta across the round, and the
+    // run's success is conditioned on at least one effective kill
+    // (with kills requested), so a chaos-free pass cannot pose as a
+    // chaos-surviving one.
+    let mut effective_kills = 0usize;
+    let observe_q = Queue::open(Box::new(store().await?), &root, opts())
+        .await
+        .map_err(|e| e.to_string())?;
     for k in 0..kills {
+        let before = claim_count(&observe_q, &root).await?;
         let mut child = spawn().map_err(|e| e.to_string())?;
         let wait = rng.range(1000, 5000);
         println!("kill round {k}: SIGKILL worker {} in {wait}ms", child.id());
         tokio::time::sleep(Duration::from_millis(wait)).await;
         child.kill().map_err(|e| e.to_string())?;
         let _ = child.wait();
+        let after_k = claim_count(&observe_q, &root).await?;
+        let grew = after_k > before;
+        if grew {
+            effective_kills += 1;
+        }
+        println!(
+            "kill round {k}: {} (claims {} -> {})",
+            if grew {
+                "landed mid-pipeline"
+            } else {
+                "ineffective (pre-claim)"
+            },
+            before,
+            after_k
+        );
     }
+    assert!(
+        kills == 0 || effective_kills > 0,
+        "no kill landed mid-pipeline — the run demonstrated nothing"
+    );
 
-    // Final worker runs to completion (bounded).
-    let mut child = spawn().map_err(|e| e.to_string())?;
+    // Final worker runs to completion (bounded, one respawn on a
+    // transient child failure: the store state is idempotent, so a
+    // blip that kills the child costs a restart, not the run).
     let deadline = Duration::from_secs(600);
-    let start = Instant::now();
+    let mut attempt = 0;
     loop {
-        if start.elapsed() > deadline {
-            let _ = child.kill();
-            return Err("final worker exceeded 600s".into());
-        }
-        match child.try_wait().map_err(|e| e.to_string())? {
-            Some(status) => {
-                if !status.success() {
-                    return Err(format!("final worker exited {status}"));
-                }
-                break;
+        let mut child = spawn().map_err(|e| e.to_string())?;
+        let start = Instant::now();
+        let status = loop {
+            if start.elapsed() > deadline {
+                // F3: reap even on the deadline path.
+                child.kill().map_err(|e| e.to_string())?;
+                let _ = child.wait();
+                return Err("final worker exceeded 600s".into());
             }
-            None => tokio::time::sleep(Duration::from_millis(500)).await,
+            match child.try_wait().map_err(|e| e.to_string())? {
+                Some(status) => break status,
+                None => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        };
+        if status.success() {
+            break;
         }
+        attempt += 1;
+        if attempt > 1 {
+            return Err(format!("final worker exited {status} twice"));
+        }
+        println!("final worker exited {status}; respawning once");
     }
     println!(
         "workers done after {} kill rounds; wall {}s",
@@ -396,6 +454,24 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn executor_is_deterministic_across_attempts() {
+        let p = artifact(5);
+        let a = SlowTransform {
+            think: Duration::ZERO,
+        }
+        .run([0; 16], Bytes::from(p.clone()))
+        .await
+        .unwrap();
+        let b = SlowTransform {
+            think: Duration::ZERO,
+        }
+        .run([0; 16], Bytes::from(p))
+        .await
+        .unwrap();
+        assert_eq!(a, b, "duplicate attempts converge on identical outputs");
+    }
 
     #[test]
     fn transform_is_an_involutive_content_function() {
