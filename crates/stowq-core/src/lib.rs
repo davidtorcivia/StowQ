@@ -369,8 +369,16 @@ pub struct Queue {
     /// Cached wall floor (store time) and when it was established; see
     /// establish_floor.
     floor: std::sync::Mutex<FloorCache>,
+    /// Scan-proven terminal jobs, keyed by the jobs index entry's
+    /// version; see memoize_terminal.
+    terminal_memo: std::sync::Mutex<std::collections::HashMap<(u16, [u8; 16]), Version>>,
     clock: std::sync::Arc<dyn ElapsedClock>,
 }
+
+/// The terminality memo's entry cap: on overflow it is cleared
+/// wholesale and the scan re-proves lazily. Bounded memory; the worst
+/// case is one full re-scan per cap-overflow, never a wrong skip.
+const TERMINAL_MEMO_CAP: usize = 65_536;
 
 /// Elapsed time since an arbitrary fixed anchor, monotone. The floor
 /// cache trusts local time only for its staleness deadline, never for
@@ -445,6 +453,7 @@ impl Queue {
                 floor_ns: 0,
                 established_at_ns: 0,
             }),
+            terminal_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
             clock: std::sync::Arc::new(NativeElapsedClock::new()),
         };
         let key = q.absolute(&RelKey::Format);
@@ -517,6 +526,29 @@ impl Queue {
     /// The underlying store, for inspection and audit tooling.
     pub fn store(&self) -> &dyn ObjectStore {
         self.store.as_ref()
+    }
+
+    fn is_memoized_terminal(&self, shard: u16, job_id: [u8; 16], version: &Version) -> bool {
+        self.terminal_memo
+            .lock()
+            .unwrap()
+            .get(&(shard, job_id))
+            .is_some_and(|v| v == version)
+    }
+
+    /// Records that this handle proved the job terminal while its jobs
+    /// index entry had this version. Keyed by version (unique per
+    /// write: ETag on S3, the monotone counter on the memory fake), so
+    /// a deleted-then-re-enqueued incarnation never matches and is
+    /// re-examined. Terminality is monotone (receipts and dead records
+    /// are never un-written; GC removes the whole graph including the
+    /// jobs entry), so an entry never needs invalidation.
+    fn memoize_terminal(&self, shard: u16, job_id: [u8; 16], version: Version) {
+        let mut memo = self.terminal_memo.lock().unwrap();
+        if memo.len() >= TERMINAL_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert((shard, job_id), version);
     }
 
     /// Establishes a wall floor (spec time.md): PUT a beacon, read it
@@ -1023,7 +1055,7 @@ impl Queue {
         let mut after: Option<Key> = None;
         loop {
             budget.spend()?;
-            let page = self.store.list(&shard_prefix, after.as_ref(), 32).await?;
+            let page = self.store.list(&shard_prefix, after.as_ref(), 1024).await?;
             if page.items.is_empty() {
                 return Ok(ClaimOutcome::Empty);
             }
@@ -1038,7 +1070,16 @@ impl Queue {
                 else {
                     continue;
                 };
-                if let Some(claim) = self.try_claim(job_id, shard, opts, budget).await? {
+                // Skip jobs this handle already proved terminal (same
+                // jobs-entry version): the receipt/dead heads would
+                // only re-confirm. A fresh handle pays the full scan.
+                if self.is_memoized_terminal(shard, job_id, &listing.meta.version) {
+                    continue;
+                }
+                if let Some(claim) = self
+                    .try_claim(job_id, shard, &listing.meta.version, opts, budget)
+                    .await?
+                {
                     return Ok(ClaimOutcome::Claimed(claim));
                 }
                 if budget.max_ops == 0 {
@@ -1057,6 +1098,7 @@ impl Queue {
         &self,
         job_id: [u8; 16],
         shard: u16,
+        jobs_version: &Version,
         opts: &ClaimOptions,
         budget: &mut OpBudget,
     ) -> Result<Option<Claim>, Error> {
@@ -1069,7 +1111,10 @@ impl Queue {
         ] {
             budget.spend()?;
             match self.store.head(&self.absolute(&rel)).await {
-                Ok(_) => return Ok(None),
+                Ok(_) => {
+                    self.memoize_terminal(shard, job_id, jobs_version.clone());
+                    return Ok(None);
+                }
                 Err(StoreError::NotFound) => {}
                 Err(e) => return Err(e.into()),
             }
