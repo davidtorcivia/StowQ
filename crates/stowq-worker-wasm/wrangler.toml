@@ -16,11 +16,11 @@ STOWQ_QUEUE_ROOT = "q"
 [triggers]
 crons = ["*/5 * * * *"]
 
-[[queues.producers]]
-binding = "STOWQ_DOORBELL"
-queue = "stowq-doorbells"
-
+# Doorbell hints are lossy by rule: a poison message drops after 3
+# retries (no DLQ — dropping IS the doorbell semantic; cron covers it).
 [[queues.consumers]]
 queue = "stowq-doorbells"
 max_batch_size = 10
 max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = ""

@@ -66,9 +66,7 @@ mod tests {
 #[cfg(target_family = "wasm")]
 mod wasm {
     use crate::{parse_doorbell, transport_marker};
-    use stowq_store::ObjectStore;
     use stowq_store_http::{HttpRequest, HttpResponse, HttpTransport, SigningClock};
-    use stowq_worker::DeliveryReport;
     use worker::*;
 
     // ----- Fetch transport -----
@@ -109,15 +107,18 @@ mod wasm {
                 ("Content-Length".to_string(), h("Content-Length")),
                 ("Content-Range".to_string(), h("Content-Range")),
             ];
-            // Text: the bodies are small (records, XML pages).
+            // Bytes, never text: record bodies are CBOR with
+            // arbitrary high bytes, and text() is strict UTF-8 — a
+            // lossy or erroring text read corrupts every non-ASCII
+            // record. bytes() is the raw body.
             let body = resp
-                .text()
+                .bytes()
                 .await
                 .map_err(|e| "[unknown] ".to_string() + &e.to_string())?;
             Ok(HttpResponse {
                 status,
                 headers,
-                body: body.into_bytes(),
+                body,
             })
         }
     }
