@@ -156,7 +156,8 @@ impl<S: ObjectStore> Injector<S> {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl<S: ObjectStore> ObjectStore for Injector<S> {
     async fn put_if_absent(
         &self,

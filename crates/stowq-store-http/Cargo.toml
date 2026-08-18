@@ -1,0 +1,33 @@
+[package]
+name = "stowq-store-http"
+description = "Fetch-based S3-family ObjectStore with hand-rolled SigV4 (wasm-portable)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+hmac = "0.12"
+sha2.workspace = true
+stowq-store.workspace = true
+thiserror.workspace = true
+
+[features]
+# Native transport for conformance testing; the wasm path supplies its
+# own HttpTransport and never enables this.
+native = ["dep:reqwest"]
+
+[dependencies.reqwest]
+version = "0.12"
+default-features = false
+features = ["rustls-tls", "blocking"]
+optional = true
+
+[dev-dependencies]
+stowq-core.workspace = true
+stowq-format.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
