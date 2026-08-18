@@ -118,10 +118,23 @@ A store enters `spec/store-profiles.md` after a passing run.
 - `soak` — sustained operation under injected transport faults with
   terminal-state and accounting assertions
 
-Reference figures (single worker, Cloudflare R2, well-hinted shard): a
-delivery costs 14 store operations; roughly 13 KB of gross allocations per
-enqueue-claim-acknowledge cycle; batched claiming sustains 2.4 jobs/s per
-worker single-shard, and worker throughput scales near-linearly.
+Reference figures (single worker, batch of 5, well-hinted shard):
+
+| Store | Round trip | Cycle | Per worker | Ops per job |
+| --- | --- | --- | --- | --- |
+| In-process memory | — | ~0.2 ms | 5,000+/s | 0 |
+| MinIO, same host | <1 ms | ~70 ms | 72/s | 14.2 |
+| Cloudflare R2 over WAN | ~65 ms | ~2.8 s | 1.8-2.4/s | 14.2 |
+| Cloudflare R2, Worker at the edge | ~1-5 ms (est.) | — | ~30-50/s (est.) | 14.2 |
+
+Per-delivery cost is dominated by store round trips, not protocol
+work: the same 14 operations run 30-40x faster from a host adjacent
+to the store. Worker throughput scales near-linearly (8 measured
+workers, 8.6 jobs/s aggregate on R2 over WAN); batch size 10 captures
+most of the batching gain (2.3/s remote, 82/s local).
+
+Allocation cost is independent of placement: roughly 13 KB gross per
+enqueue-claim-acknowledge cycle across all setups.
 
 ## License
 
