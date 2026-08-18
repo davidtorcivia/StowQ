@@ -69,7 +69,8 @@ impl StubDoorbell {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl Doorbell for StubDoorbell {
     async fn ring(&self, msg: DoorbellMsg) {
         self.pending.lock().unwrap().push_back(msg);
@@ -96,7 +97,8 @@ impl LogDoorbell {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl Doorbell for LogDoorbell {
     async fn ring(&self, msg: DoorbellMsg) {
         eprintln!("[doorbell {}] ring {:?}", self.label, msg.shards);
@@ -499,9 +501,15 @@ async fn run_batch_inner(
     // renewal heartbeats, overlapping round trips — the batch's wall
     // time is the slowest delivery, not the sum. Reports preserve
     // claim (scan) order.
+    // Send on native (the callers spawn); ?Send mirroring the
+    // ObjectStore cfg on wasm.
+    #[cfg(not(target_family = "wasm"))]
     type DeliveryFut<'a> = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<DeliveryReport, Error>> + Send + 'a>,
     >;
+    #[cfg(target_family = "wasm")]
+    type DeliveryFut<'a> =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<DeliveryReport, Error>> + 'a>>;
     let futs: Vec<DeliveryFut> = claims
         .into_iter()
         .map(|claim| {

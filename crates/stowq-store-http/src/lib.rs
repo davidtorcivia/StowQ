@@ -72,8 +72,10 @@ impl SigningClock for SystemSigningClock {
 }
 
 /// Civil-from-days (Howard Hinnant's algorithm) — no chrono
-/// dependency for a stamp we only need to day precision.
-fn stamps_from_unix(secs: u64) -> (String, String) {
+/// dependency for a stamp we only need to day precision. Public so
+/// injected SigningClock implementations (the Worker's Date) share
+/// one derivation.
+pub fn stamps_from_unix(secs: u64) -> (String, String) {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (y, m, d) = civil_from_days(days);

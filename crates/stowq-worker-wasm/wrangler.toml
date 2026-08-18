@@ -1,0 +1,26 @@
+name = "stowq-worker"
+main = "../../target/wasm32-unknown-unknown/debug/stowq_worker_wasm.wasm"
+compatibility_date = "2025-01-01"
+
+# The Worker is a doorbell relay and sweeper (the decision-memo
+# shape): queue consumers run sweep passes, the cron trigger sweeps
+# on a schedule, executors stay native. Environment comes from the
+# R2 bindings and STOWQ_* vars (secrets: wrangler secret put).
+
+[vars]
+STOWQ_QUEUE_ROOT = "q"
+
+# [[r2_buckets]]
+# binding = "STOWQ_BUCKET_OBJ"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[queues.producers]]
+binding = "STOWQ_DOORBELL"
+queue = "stowq-doorbells"
+
+[[queues.consumers]]
+queue = "stowq-doorbells"
+max_batch_size = 10
+max_batch_timeout = 5

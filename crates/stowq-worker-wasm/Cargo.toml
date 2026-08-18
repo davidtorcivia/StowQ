@@ -1,0 +1,33 @@
+[package]
+name = "stowq-worker-wasm"
+description = "Cloudflare Worker wiring: Fetch transport, Queues doorbell, cron sweeper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Protocol + harness crates are target-independent; the Fetch
+# transport, the clock, and the entry points are wasm-only.
+stowq-core.workspace = true
+stowq-store-http.workspace = true
+stowq-worker.workspace = true
+stowq-format.workspace = true
+stowq-store.workspace = true
+bytes.workspace = true
+
+# wasm-only: the workers runtime bindings.
+[target.'cfg(target_family = "wasm")'.dependencies]
+worker = { version = "0.4", features = ["queue"] }
+
+[features]
+# The reqwest-based transport and SystemSigningClock, for
+# certifying the Fetch-shaped code paths natively (the transport
+# itself is wasm-only; conformance of the underlying store is already
+# certified in stowq-store-http's own suite).
+native = ["stowq-store-http/native"]
