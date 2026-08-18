@@ -9,6 +9,7 @@ members = [
     "crates/stowq-testkit",
     "crates/stowq-cli",
     "crates/stowq-store-s3",
+    "crates/stowq-store-http",
     "crates/stowq-worker",
     "crates/stowq-demo",
     "crates/stowq-bench",
@@ -36,6 +37,7 @@ stowq-math = { path = "crates/stowq-math" }
 stowq-store = { path = "crates/stowq-store" }
 stowq-core = { path = "crates/stowq-core" }
 stowq-store-s3 = { path = "crates/stowq-store-s3" }
+stowq-store-http = { path = "crates/stowq-store-http" }
 stowq-worker = { path = "crates/stowq-worker" }
 stowq-demo = { path = "crates/stowq-demo" }
 stowq-testkit = { path = "crates/stowq-testkit" }

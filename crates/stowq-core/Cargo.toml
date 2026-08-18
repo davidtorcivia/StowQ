@@ -20,6 +20,11 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 
+[target.'cfg(target_family = "wasm")'.dependencies]
+# Merged with the entry above: the js feature is wasm-only, never
+# activated on native targets.
+getrandom = { workspace = true, features = ["wasm_js"] }
+
 [dev-dependencies]
 async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

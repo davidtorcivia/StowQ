@@ -192,7 +192,8 @@ impl S3Store {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl ObjectStore for S3Store {
     async fn put_if_absent(
         &self,
