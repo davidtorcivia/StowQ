@@ -9,6 +9,10 @@
 //! matching the S3-family profile (G = 1s). The conditional-write
 //! primitives map identically to the SDK backend: `If-None-Match: *`
 //! (P1) and `If-Match` (P2).
+//!
+//! wasm build: cargo build -p stowq-store-http --target
+//! wasm32-unknown-unknown (getrandom wasm_js is target-gated in
+//! stowq-core; no RUSTFLAGS needed).
 
 #[cfg(feature = "native")]
 pub mod native;
@@ -50,9 +54,13 @@ pub trait SigningClock: Send + Sync {
     fn amz_stamps(&self) -> (String, String);
 }
 
-/// Native signing clock from `SystemTime::now()`.
+/// Native signing clock from `SystemTime::now()`. Not compiled on
+/// wasm targets (SystemTime stubs panic there); wasm callers inject
+/// the runtime's clock.
+#[cfg(not(target_family = "wasm"))]
 pub struct SystemSigningClock;
 
+#[cfg(not(target_family = "wasm"))]
 impl SigningClock for SystemSigningClock {
     fn amz_stamps(&self) -> (String, String) {
         let secs = std::time::SystemTime::now()
@@ -380,9 +388,12 @@ impl<T: HttpTransport + Send> HttpStore<T> {
     /// (the transport reports a human string; connect-phase failures
     /// are pre-transmit, everything else outcome-unknown).
     fn transport_err(e: String) -> StoreError {
-        if e.contains("connect") || e.contains("dns") {
+        // Marker prefixes come from the transport's typed error
+        // classification; arbitrary text is never substring-matched
+        // (post-transmit errors frequently contain "connection").
+        if e.starts_with("[pretransmit]") {
             StoreError::Transport(TransportClass::PreTransmit)
-        } else if e.contains("timed out") || e.contains("timeout") {
+        } else if e.starts_with("[timeout]") {
             StoreError::OutcomeUnknown(Ambiguity::Timeout)
         } else {
             StoreError::OutcomeUnknown(Ambiguity::ConnectionLost)
@@ -515,11 +526,7 @@ impl<T: HttpTransport + Send> HttpStore<T> {
                 stowq_store::IntegrityKind::DigestMismatch,
             ));
         }
-        let mut headers = vec![(
-            "Content-MD5".to_string(),
-            String::new(), // replaced below; not sent — R2 does not require it
-        )];
-        headers.clear();
+        let mut headers = Vec::new();
         match if_match {
             Some(v) => headers.push(("If-Match".into(), v.0.clone())),
             None => headers.push(("If-None-Match".into(), "*".into())),

@@ -12,7 +12,11 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     pub fn new() -> Self {
         ReqwestTransport {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("reqwest client"),
         }
     }
 }
@@ -46,15 +50,16 @@ impl HttpTransport for ReqwestTransport {
         r = r.body(req.body.clone());
         let resp = r.send().await.map_err(|e| {
             // The contract: Err means no HTTP response was received.
-            // Classify connect/DNS-phase failures for the store's
-            // pre-transmit mapping.
+            // Marker prefixes drive the store's class mapping; the
+            // error text itself is never classified (post-transmit
+            // failures often contain "connection" — substring
+            // matching would misclassify them as pre-transmit).
             if e.is_connect() {
-                "connect-phase failure".to_string()
-            } else if e.is_request() && e.url().is_some() {
-                // Request-phase errors after transmit: outcome unknown.
-                format!("request error: {e}")
+                "[pretransmit]".to_string()
+            } else if e.is_timeout() {
+                "[timeout]".to_string()
             } else {
-                format!("{e}")
+                "[unknown]".to_string()
             }
         })?;
         let status = resp.status().as_u16();
